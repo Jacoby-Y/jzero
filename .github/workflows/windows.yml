@@ -1,0 +1,19 @@
+# Runs the Windows build on a real Windows machine: self-checks, the PowerShell scripts, and a
+# live pane driven with `jzero --ctl`. The build under test is the zip on the `ci` release
+# (cross-built on Linux; `tools/ci/upload.sh` puts it there).
+name: windows
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: pwsh -File tools/ci/windows.ps1
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-logs
+          path: ci-out/
