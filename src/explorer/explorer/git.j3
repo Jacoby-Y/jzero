@@ -8,13 +8,16 @@ extend Explorer {
         this.gitTop.clear();
         this.gitPaths.len = 0;
         this.gitKinds.len = 0;
-        let top: [5]string = ["git", "-C", this.root.str(), "rev-parse", "--show-toplevel"];
-        match proc.run(top[:], "", this.tree) {  // ponytail: blocks the frame for git; a worker if repos get huge
+        // The top as `root` spells it (git's own spelling can differ: symlinks, Windows short
+        // names), found by walking up once per `../` of `--show-cdup`.
+        let up: [5]string = ["git", "-C", this.root.str(), "rev-parse", "--show-cdup"];
+        match proc.run(up[:], "", this.tree) {  // ponytail: blocks the frame for git; a worker if repos get huge
             Result.Ok(o) {
                 if o.code != 0 { return; }
-                let t = o.outStr();
-                while t.len > 0 && t[t.len - 1] == 10 { t = t[0..t.len - 1]; }
-                this.gitTop.pushStr(t);
+                let top = this.root.str();
+                let ups = o.outStr();
+                for k in 0..ups.len { if ups[k] == 47 { top = os.parent(top); } }
+                this.gitTop.pushStr(top);
             }
             Result.Err(_) { return; }
         }

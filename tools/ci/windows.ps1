@@ -72,7 +72,7 @@ Step 'default shell pane (PowerShell)' {
     Need ($cwd -match '[A-Za-z]:/|~') "no cwd in ls: $cwd"
 }
 Step 'cmd pane' {
-    $id = Ctl new island -- cmd.exe
+    $id = Ctl new island '--' cmd.exe  # quoted: PowerShell eats a bare --
     Need ($LASTEXITCODE -eq 0) 'new island failed'
     Start-Sleep 3
     Ctl send $id 'echo cmd-says-%OS%' --enter | Out-Null
