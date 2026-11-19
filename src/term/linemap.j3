@@ -1,0 +1,84 @@
+module jzero.term.linemap;
+
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.term.grid.Grid;
+
+// Grid line numbers (prompt marks, output range) move when a resize reflows the screen and
+// scrollback. A logical line (rows joined by wrapping) survives a reflow and the cursor's line
+// stays the cursor's, so `save` turns each tracked line into "logical lines above the cursor's",
+// and `restore` turns that back into a line of the reflowed grid.
+// ponytail: a line keeps its logical line, not the row inside it (marks sit on row starts).
+
+pub const NONE = -1;          // "no line" in and out
+const GONE = -1000000000;     // saved form of NONE
+
+pub struct LineMap {
+    starts: List<int>;  // first virtual line of each logical line (scratch, reused)
+    cur: int = 0;       // the cursor's logical line, from `begin`
+
+    // Build `starts` for `g`; returns the logical line holding `line`.
+    fn build(this: &LineMap, g: &Grid, line: int): int {
+        this.starts.len = 0;
+        let at = 0;
+        let n = g.lineCount();
+        for i in 0..n {
+            if i == 0 || !g.wrapped(i - 1) { this.starts.push(i); }
+            if i == line { at = this.starts.len - 1; }
+        }
+        return at;
+    }
+
+    // Logical line holding virtual line `v` (`build` first): the last start at or before it.
+    fn logical(this: &LineMap, v: int): int {
+        let lo = 0;
+        let hi = this.starts.len - 1;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if this.starts.items[mid] <= v { lo = mid; } else { hi = mid - 1; }
+        }
+        return lo;
+    }
+
+    // Start a `save` (before the resize) or `restore` (after) pass over `g`.
+    fn begin(this: &LineMap, g: &Grid) { this.cur = this.build(g, g.scrollbackLen() + g.cursorY()); }
+
+    // Before the resize: line `v` becomes its distance in logical lines from the cursor's.
+    fn save(this: &LineMap, v: &int) {
+        if *v == NONE { *v = GONE; } else { *v = this.cur - this.logical(*v); }
+    }
+
+    // After the resize: back to a virtual line (NONE when the line was dropped).
+    fn restore(this: &LineMap, v: &int) {
+        if *v == GONE { *v = NONE; return; }
+        let l = this.cur - *v;
+        if l < 0 || l >= this.starts.len { *v = NONE; } else { *v = this.starts.items[l]; }
+    }
+}
+
+pub fn create(mem: &Arena): LineMap { return LineMap { starts: List<int>.new(mem) }; }
+
+// Self-check: a wrapped prompt line keeps its mark through narrow and wide resizes.
+pub fn selfTest(mem: &Arena) {
+    let g = Grid.new(mem, 10, 6, 100);
+    let m = create(mem);
+    // line 0: "$ a", line 1-2: 15 chars wrapped, line 3: "$ " (the cursor's)
+    for c in "$ a" { g.print(i32(c)); }
+    g.exec(13); g.exec(10);
+    for _ in 0..15 { g.print(120); }
+    g.exec(13); g.exec(10);
+    for c in "$ " { g.print(i32(c)); }
+    let a = 0;
+    let b = 3;
+    let none = NONE;
+    m.begin(&g); m.save(&a); m.save(&b); m.save(&none);
+    g.resize(20, 6);
+    m.begin(&g); m.restore(&a); m.restore(&b); m.restore(&none);
+    check(a == 0 && b == 2 && none == NONE, "wide");
+    m.begin(&g); m.save(&a); m.save(&b);
+    g.resize(5, 6);
+    m.begin(&g); m.restore(&a); m.restore(&b);
+    check(a == 0 && b == 4, "narrow");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`linemap selfTest: {what}`); } }

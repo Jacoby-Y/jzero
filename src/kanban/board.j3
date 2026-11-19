@@ -1,0 +1,152 @@
+module jzero.kanban.board;
+
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.text.Text;
+
+// One kanban board: named columns of cards (title + body). Saved as markdown-ish text:
+//   ## Column
+//   - Card title
+//     body line (two-space indent; blank body lines are a lone "  ")
+// Lines that fit none of these are skipped.
+
+pub struct Card {
+    title: Text;
+    body: Text;
+}
+
+pub struct Column {
+    name: Text;
+    cards: List<Card>;
+}
+
+pub struct Board {
+    mem: &Arena;
+    cols: List<Column>;
+
+    fn col(this: &Board, c: int): &Column { return &this.cols.items[c]; }
+
+    fn card(this: &Board, c: int, k: int): &Card { return &this.col(c).cards.items[k]; }
+
+    fn columns(this: &Board): []Column { return this.cols.items[0..this.cols.len]; }
+
+    fn addColumn(this: &Board, name: string): int {
+        let col = Column { name: Text.new(this.mem), cards: List<Card>.new(this.mem) };
+        col.name.pushStr(name);
+        this.cols.push(col);
+        return this.cols.len - 1;
+    }
+
+    fn addCard(this: &Board, c: int, title: string): int {
+        let card = Card { title: Text.new(this.mem), body: Text.new(this.mem) };
+        card.title.pushStr(title);
+        let col = this.col(c);
+        col.cards.push(card);
+        return col.cards.len - 1;
+    }
+
+    // Column `from` goes to index `to` (the others shift).
+    fn moveColumn(this: &Board, from: int, to: int) { moveItem(this.cols.items[0..this.cols.len], from, to); }
+
+    // Card `k` of column `c` goes to column `toC` before card `toK` (-1: the end).
+    fn moveCard(this: &Board, c: int, k: int, toC: int, toK: int) {
+        let card = this.col(c).cards.items[k];
+        this.col(c).cards.remove(k);
+        let dst = this.col(toC);
+        let at = toK;
+        if toC == c && toK > k { at -= 1; }  // the removal shifted the target up
+        if at < 0 || at > dst.cards.len { at = dst.cards.len; }
+        dst.cards.push(card);
+        moveItem(dst.cards.items[0..dst.cards.len], dst.cards.len - 1, at);
+    }
+
+    // The board as file text, into `out`.
+    fn encode(this: &Board, out: &Text) {
+        for c in 0..this.cols.len {
+            let col = this.col(c);
+            if c > 0 { out.push(10); }
+            out.add("## ").add(col.name.str()).push(10);
+            for k in 0..col.cards.len {
+                let card = col.cards.items[k];
+                out.add("- ").add(card.title.str()).push(10);
+                indented(card.body.str(), out);
+            }
+        }
+    }
+}
+
+// `body`'s lines into `out`, each after two spaces (nothing for an empty body).
+pub fn indented(body: string, out: &Text) {
+    if body.len == 0 { return; }
+    let start = 0;
+    for i in 0..body.len + 1 {
+        if i < body.len && body[i] != 10 { continue; }
+        out.add("  ").add(body[start..i]).push(10);
+        start = i + 1;
+    }
+}
+
+pub fn create(mem: &Arena): Board { return Board { mem: mem, cols: List<Column>.new(mem) }; }
+
+// A new board's columns.
+pub fn starter(b: &Board) {
+    b.addColumn("Back Burner");
+    b.addColumn("Front Burner");
+    b.addColumn("In Progress");
+    b.addColumn("Done");
+    b.addColumn("Canceled");
+}
+
+// Fill `b` from file text (copied into `b.mem`).
+pub fn decode(text: string, b: &Board) {
+    let start = 0;
+    for i in 0..text.len + 1 {
+        if i < text.len && text[i] != 10 { continue; }
+        line(text[start..i], b);
+        start = i + 1;
+    }
+}
+
+fn line(s: string, b: &Board) {
+    if starts(s, "## ") { b.addColumn(s[3..s.len]); return; }
+    if b.cols.len == 0 { return; }
+    let col = b.col(b.cols.len - 1);
+    if starts(s, "- ") { b.addCard(b.cols.len - 1, s[2..s.len]); return; }
+    if !starts(s, "  ") || col.cards.len == 0 { return; }
+    let body = &col.cards.items[col.cards.len - 1].body;
+    if body.len() > 0 { body.push(10); }
+    body.pushStr(s[2..s.len]);
+}
+
+fn starts(s: string, p: string): bool { return s.len >= p.len && s[0..p.len] == p; }
+
+// Move `xs[from]` to index `to`, shifting the ones between.
+fn moveItem<T>(xs: []T, from: int, to: int) {
+    if from < 0 || from >= xs.len || to < 0 || to >= xs.len { return; }
+    let v = xs[from];
+    let i = from;
+    while i < to { xs[i] = xs[i + 1]; i += 1; }
+    while i > to { xs[i] = xs[i - 1]; i -= 1; }
+    xs[to] = v;
+}
+
+pub fn selfTest(mem: &Arena) {
+    let b = create(mem);
+    decode("## A\n- one\n  x\n  \n  y\n- two\n\n## B\n", &b);
+    check(b.cols.len == 2 && b.col(0).cards.len == 2, "decode counts");
+    check(b.card(0, 0).body.str() == "x\n\ny", "decode body");
+    let t = Text.new(mem);
+    b.encode(&t);
+    check(t.str() == "## A\n- one\n  x\n  \n  y\n- two\n\n## B\n", "round trip");
+    b.moveCard(0, 0, 1, -1);
+    check(b.col(0).cards.len == 1 && b.card(1, 0).title.str() == "one", "move across");
+    b.addCard(1, "three");
+    b.moveCard(1, 1, 1, 0);
+    check(b.card(1, 0).title.str() == "three" && b.card(1, 1).title.str() == "one", "move up");
+    b.moveCard(1, 0, 1, 2);
+    check(b.card(1, 1).title.str() == "three", "move down to end");
+    b.moveColumn(1, 0);
+    check(b.col(0).name.str() == "B", "move column");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`board selfTest: {what}`); } }

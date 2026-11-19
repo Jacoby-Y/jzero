@@ -1,0 +1,415 @@
+module jzero.state;
+
+// Pane lifecycle: start and stop shells, keep each pane's files (`session/paths.j3`).
+
+extend State {
+    // A new shell of island `isl` for pane `id` in `cwd` ("" for $HOME), showing its saved
+    // scrollback if any.
+    fn openShell(this: &State, isl: &Island, id: int, cwdIn: string): Option<&Session> {
+        let none: [1]string = [""];
+        return this.openCommand(isl, id, cwdIn, none[0..0]);
+    }
+
+    // `openShell`, or `command` (an argv) instead of the shell when it is not empty.
+    fn openCommand(this: &State, isl: &Island, id: int, cwdIn: string, command: []string): Option<&Session> {
+        return this.openSession(isl, id, cwdIn, "", command);
+    }
+
+    // A pane's session: `command` when it is not empty, else shell `shell` ("" for the usual one).
+    fn openSession(this: &State, isl: &Island, id: int, cwdIn: string, shell: string, command: []string): Option<&Session> {
+        let cwd = os.slashes(cwdIn);
+        if cwd.len == 0 || !io.exists(cwd) { cwd = os.home(); }
+        let tmp = Arena.create(65536);  // what the session reads while it opens
+        let restore = "";
+        match io.readFile(paths.scroll(id), &tmp) {
+            Result.Ok(bytes) { restore = bytes as string; }
+            Result.Err(_) {}
+        }
+        let hist = Text.new(&tmp);
+        hist.pushStr(paths.hist(id));
+        // Who this pane is, for `jzctl` control commands run in it (`features/ctl.j3`).
+        let env: [2]string = [keep(&tmp, `JZERO_PANE={id}`), keep(&tmp, `JZERO_INSTANCE={this.ctlName.str()}`)];
+        let slot = this.slot();
+        let s = session.open(slot, cwd, this.fontFor(isl), &this.cfg, &this.zeroCmds, hist.str(), restore, shell, command, env[:]);
+        match s { Option.Some(_) {} Option.None { this.freeSlots.push(slot); } }
+        tmp.destroy();
+        return s;
+    }
+
+    // An arena header for a new pane's arena: a closed pane's, or a new one in State.mem.
+    fn slot(this: &State): &Arena {
+        if this.freeSlots.len == 0 { return &this.mem.alloc::<Arena>(1)[0]; }
+        this.freeSlots.len -= 1;
+        return this.freeSlots.items[this.freeSlots.len];
+    }
+
+    // Stop session `t` for good and keep its arena header for the next open.
+    fn closeSession(this: &State, t: &Session) {
+        let slot = t.mem;
+        this.ext.drop(t);
+        t.close();
+        this.freeSlots.push(slot);
+    }
+
+    fn newPaneId(this: &State): int {
+        this.nextPaneId += 1;
+        return this.nextPaneId - 1;
+    }
+
+    // Start a shell in every pane of `isl` (a fresh pane when it has none).
+    fn startPanes(this: &State, isl: &Island) {
+        let p = &isl.panes;
+        if p.empty() {
+            let id = this.newPaneId();
+            p.start(this.openShell(isl, id, ""), id);
+            return;
+        }
+        for j in 0..p.nodes.len {
+            if !p.isLeaf(j) { continue; }
+            let n = p.get(j);
+            if n.pane == split.EXPLORER { n.ex = this.openExplorer(n.cwd.str()); continue; }
+            if n.pane == split.EXT { n.term = this.openExt(isl, n.id, n.cwd.str()); continue; }
+            n.term = this.openShell(isl, n.id, n.cwd.str());
+            match n.term {
+                Option.Some(t) { t.tap.loadCmds(n.cmds.str()); }
+                Option.None {}
+            }
+        }
+    }
+
+    // Stop every shell of `isl`, saving its cwd and scrollback.
+    fn stopPanes(this: &State, isl: &Island) {
+        for phase in 0..STOP_PHASES { this.stopPanesPhase(isl, phase); }
+    }
+
+    // One `stopShell` phase on every leaf of `isl` (explorers stop in the first).
+    fn stopPanesPhase(this: &State, isl: &Island, phase: int) {
+        let p = &isl.panes;
+        for j in 0..p.nodes.len {
+            if !p.isLeaf(j) { continue; }
+            let n = p.get(j);
+            if phase == 0 { this.stopExplorer(n); }
+            this.stopShellPhase(n, phase);
+        }
+    }
+
+    // Stop `n`'s shell, saving its cwd, commands and scrollback.
+    fn stopShell(this: &State, n: &Node) {
+        for phase in 0..STOP_PHASES { this.stopShellPhase(n, phase); }
+    }
+
+    // 0: read cwd (shell still alive), ask the reader to stop. 1: join it, hang up.
+    // 2: save, reap, free. Run each phase over many panes so their waits overlap.
+    fn stopShellPhase(this: &State, n: &Node, phase: int) {
+        match n.term {
+            Option.Some(t) {
+                if phase == 0 {
+                    this.syncPane(n, t);
+                    t.beginClose();
+                } else if phase == 1 {
+                    t.hangUp();
+                } else {
+                    if !t.ext {
+                        io.writeFile(paths.cmds(n.id), n.cmds.bytes[0..n.cmds.len()]);
+                        t.saveScrollback(paths.scroll(n.id));
+                    }
+                    this.closeSession(t);
+                    n.term = Option.None;
+                }
+            }
+            Option.None {}
+        }
+    }
+
+    // Delete every pane's files of `isl` and empty its tree (shells already stopped).
+    fn forgetPanes(this: &State, isl: &Island) {
+        let p = &isl.panes;
+        for j in 0..p.nodes.len { if p.isLeaf(j) { paths.removePane(p.get(j).id); } }
+        p.clear();
+    }
+
+    // An explorer at `root` ("" or missing: $HOME), listed. A file opens in its folder's
+    // explorer, in the editor (a note autosaves).
+    fn openExplorer(this: &State, rootIn: string): Option<&Explorer> {
+        let root = rootIn;
+        let file = "";
+        match io.stat(rootIn) {
+            Result.Ok(st) {
+                if !st.isDir {
+                    file = rootIn;
+                    root = os.parent(file);
+                }
+            }
+            Result.Err(_) { root = os.home(); }
+        }
+        if root.len == 0 { root = os.home(); }
+        let e = explorer.open(this.slot(), root, this.cfg.explorerHidden);
+        e.notesDir.pushStr(this.notesDir());
+        e.refresh();
+        if file.len > 0 { e.openFile(file); }
+        return Option.Some(e);
+    }
+
+    fn stopExplorer(this: &State, n: &Node) {
+        match n.ex {
+            Option.Some(e) {
+                if e.isNote() { e.autosave(); }
+                n.cwd.clear();
+                n.cwd.pushStr(if e.mode != explorer.TREE { e.file.str() } else { e.root.str() });  // reopens there
+                let slot = e.mem;
+                explorer.close(e);
+                this.freeSlots.push(slot);
+            }
+            Option.None {}
+        }
+        n.ex = Option.None;
+    }
+
+    // Split right with `ssh host` (the pane closes when ssh exits).
+    fn splitSsh(this: &State, host: string) {
+        match this.current() {
+            Option.Some(isl) {
+                if isl.panes.focus < 0 { return; }
+                let argv: [2]string = ["ssh", host];
+                let id = this.newPaneId();
+                isl.panes.split(split.RIGHT, this.openCommand(isl, id, "", argv[:]), id);
+            }
+            Option.None {}
+        }
+    }
+
+    // Split right with detected shell `k` of the palette's list (`platform/shells.j3`).
+    fn splitShell(this: &State, k: int) {
+        match this.current() {
+            Option.Some(isl) {
+                if isl.panes.focus < 0 { return; }
+                let f = this.palette.shells.items[k];
+                let cwd = Text.scratch();
+                cwd.pushStr(isl.panes.get(isl.panes.focus).cwd.str());
+                let id = this.newPaneId();
+                let none: [1]string = [""];
+                let s = if f.integrated { this.openSession(isl, id, cwd.str(), f.argv[0], none[0..0]) } else { this.openSession(isl, id, cwd.str(), "", f.argv) };
+                isl.panes.split(split.RIGHT, s, id);
+            }
+            Option.None {}
+        }
+    }
+
+    // Extension `name` running in a new pane session of `isl` (`ext/host.j3`).
+    fn openExt(this: &State, isl: &Island, id: int, name: string): Option<&Session> {
+        let s = session.openExt(this.slot(), this.fontFor(isl), &this.cfg, &this.zeroCmds);
+        this.ext.open(s, id, name);
+        return Option.Some(s);
+    }
+
+    // Extension `name` in the focused pane, replacing it; split right instead when that pane is
+    // busy (a program running, unsaved editor edits).
+    fn splitExt(this: &State, name: string) {
+        match this.current() {
+            Option.Some(isl) {
+                if isl.panes.focus < 0 { return; }
+                let cur = isl.panes.get(isl.panes.focus);
+                let busy = (cur.hasTerm() && cur.session().busy().len > 0) || (cur.hasExplorer() && cur.explorer().dirty());
+                if !busy { this.replaceWithExt(isl, cur, name); return; }
+                let id = this.newPaneId();
+                isl.panes.split(split.RIGHT, this.openExt(isl, id, name), id);
+                let n = isl.panes.get(isl.panes.focus);
+                n.pane = split.EXT;
+                n.cwd.pushStr(name);
+            }
+            Option.None {}
+        }
+    }
+
+    // Stop pane `n` (shell, explorer or extension), forget its files, and run extension `name`
+    // in it under a fresh id (so an old extension's `pane.saved` doesn't carry over).
+    fn replaceWithExt(this: &State, isl: &Island, n: &Node, name: string) {
+        this.stopExplorer(n);
+        this.stopShell(n);
+        paths.removePane(n.id);
+        n.id = this.newPaneId();
+        n.cmds.clear();
+        n.cwd.clear();
+        n.cwd.pushStr(name);
+        n.pane = split.EXT;
+        n.term = this.openExt(isl, n.id, name);
+    }
+
+    // Split right with an explorer on the extensions folder (made if missing).
+    fn openExtFolder(this: &State) {
+        let d = Text.scratch();
+        d.pushStr(host.dir());
+        io.makeDirs(d.str());
+        match this.current() {
+            Option.Some(isl) {
+                if isl.panes.focus < 0 { return; }
+                isl.panes.split(split.RIGHT, Option.None, this.newPaneId());
+                let n = isl.panes.get(isl.panes.focus);
+                n.pane = split.EXPLORER;
+                n.ex = this.openExplorer(d.str());
+            }
+            Option.None {}
+        }
+    }
+
+    // Turn leaf `leaf` of island `i` (a shell) into an explorer at the shell's directory.
+    // The shell stops (one-way).
+    fn explorerPane(this: &State, i: int, leaf: int) {
+        let n = this.islands.get(i).panes.get(leaf);
+        if !n.hasTerm() { return; }
+        this.stopShell(n);  // syncPane leaves the shell's cwd in n.cwd
+        n.pane = split.EXPLORER;
+        n.ex = this.openExplorer(n.cwd.str());
+    }
+
+    // Split the active island's focused pane (`split.RIGHT` / `split.DOWN`) with a new shell
+    // in the focused pane's directory.
+    fn splitFocused(this: &State, dir: int) {
+        match this.current() {
+            Option.Some(isl) {
+                if isl.panes.focus < 0 { return; }
+                let cwd = Text.scratch();
+                cwd.pushStr(isl.panes.get(isl.panes.focus).cwd.str());
+                match isl.panes.focusedTerm() {
+                    Option.Some(t) { cwd.clear(); t.cwd(cwd); }
+                    Option.None {}
+                }
+                let id = this.newPaneId();
+                isl.panes.split(dir, this.openShell(isl, id, cwd.str()), id);
+            }
+            Option.None {}
+        }
+    }
+
+    fn closeFocusedPane(this: &State) {
+        if this.active == OCEAN { return; }
+        let p = &this.islands.get(this.active).panes;
+        if p.focus < 0 { return; }
+        let n = p.get(p.focus);
+        // An editor with unsaved edits stays open. ponytail: closing the island or the app
+        // still drops them; ask there too if it bites.
+        if n.hasExplorer() && n.explorer().dirty() {
+            n.explorer().note("Unsaved changes: save or discard them first", "");
+            return;
+        }
+        this.requestClosePane(this.active, p.focus);
+    }
+
+    // Split the explorer pane `n` with `$EDITOR file` (its "Open in $EDITOR").
+    fn explorerRequests(this: &State, n: &Node) {
+        let e = n.explorer();
+        if e.editRequest.len() == 0 { return; }
+        let file = Text.scratch();
+        file.pushStr(e.editRequest.str());
+        e.editRequest.clear();
+        match this.current() {
+            Option.Some(isl) {
+                let tmp = Arena.create(4096);
+                let argv = List<string>.new(&tmp);
+                shells.editor(file.str(), &tmp, &argv);
+                let id = this.newPaneId();
+                isl.panes.split(split.RIGHT, this.openCommand(isl, id, os.parent(file.str()), argv.items[0..argv.len]), id);
+                tmp.destroy();
+            }
+            Option.None {}
+        }
+    }
+
+    // Swap the contents of panes `a` and `b` of the active island (their shells keep running).
+    fn swapPanes(this: &State, a: int, b: int) {
+        match this.current() {
+            Option.Some(isl) {
+                isl.panes.swap(a, b);
+                isl.panes.focus = b;
+            }
+            Option.None {}
+        }
+    }
+
+    // Move pane `leaf` of the active island to island `to` (opened if closed), beside its
+    // focused pane. The shell keeps running; an island left empty closes.
+    fn movePane(this: &State, leaf: int, to: int) {
+        let from = this.active;
+        if from == OCEAN || to == from || to < 0 || to >= this.islands.count() { return; }
+        let src = &this.islands.get(from).panes;
+        if !src.isLeaf(leaf) { return; }
+        let n = src.get(leaf);
+        let id = n.id;
+        let kind = n.pane;
+        let ex = n.ex;
+        let cwd = Text.scratch();
+        cwd.pushStr(n.cwd.str());
+        let cmds = Text.scratch();
+        cmds.pushStr(n.cmds.str());
+        let term = src.close(leaf);
+        this.openIsland(to);
+        let dst = &this.islands.get(to).panes;
+        if dst.empty() { dst.start(term, id); } else { dst.split(split.RIGHT, term, id); }
+        let m = dst.get(dst.focus);
+        m.pane = kind;
+        m.ex = ex;
+        m.cwd.pushStr(cwd.str());
+        m.cmds.pushStr(cmds.str());
+        match term {
+            Option.Some(t) { t.setFont(this.fontFor(this.islands.get(to)), this.cfg.lineHeight); }
+            Option.None {}
+        }
+        if src.empty() { this.closeIsland(from); }
+        this.active = to;
+    }
+
+    // Close leaf `leaf` of island `i` for good (its shell and files go too).
+    fn closePane(this: &State, i: int, leaf: int) {
+        let p = &this.islands.get(i).panes;
+        let id = p.get(leaf).id;
+        this.stopExplorer(p.get(leaf));
+        match p.close(leaf) {
+            Option.Some(t) { this.closeSession(t); }
+            Option.None {}
+        }
+        paths.removePane(id);
+    }
+
+    // A running pane's cwd and command list into its node (what the islands file and the
+    // ocean preview read).
+    fn syncPane(this: &State, n: &Node, t: &Session) {
+        if t.ext { return; }  // an extension pane's `cwd` is its name
+        n.cwd.clear();
+        t.cwd(&n.cwd);
+        if t.tap.changed {
+            t.tap.changed = false;
+            n.cmds.clear();
+            n.cmds.pushStr(t.tap.cmds.str());
+        }
+    }
+
+    // Read every pane's saved command list (after loading the islands file).
+    fn loadCmds(this: &State) {
+        for i in 0..this.islands.count() {
+            let p = &this.islands.get(i).panes;
+            for j in 0..p.nodes.len {
+                if !p.isLeaf(j) { continue; }
+                let n = p.get(j);
+                match io.readFile(paths.cmds(n.id), this.mem) {
+                    Result.Ok(bytes) { n.cmds.pushStr(bytes as string); }
+                    Result.Err(_) {}
+                }
+            }
+        }
+    }
+
+    // Running panes' cwds and commands into their nodes.
+    fn refreshCwds(this: &State) {
+        for i in 0..this.islands.count() {
+            let p = &this.islands.get(i).panes;
+            for j in 0..p.nodes.len {
+                if !p.isLeaf(j) { continue; }
+                let n = p.get(j);
+                match n.term {
+                    Option.Some(t) { this.syncPane(n, t); }
+                    Option.None {}
+                }
+            }
+        }
+    }
+}

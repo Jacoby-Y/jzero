@@ -1,0 +1,21 @@
+<script>
+    use jzero.config.draft.Draft;
+    props { dr: &Draft; }
+</script>
+<div class="tab">
+    <settings.Row name="Confirm close" note="Ask before closing a pane while a program runs.">
+        <input type="checkbox" bind:checked={dr.confirmClose} />
+    </settings.Row>
+    <settings.Row name="Visual bell">
+        <input type="checkbox" bind:checked={dr.visualBell} />
+    </settings.Row>
+    <settings.Row name="Desktop notifications" note="From programs (OSC 9 / 777) and for long commands.">
+        <input type="checkbox" bind:checked={dr.notifications} />
+    </settings.Row>
+    <settings.Row name="Notify after (s)" note="A command running longer that finishes out of sight notifies. 0 turns it off.">
+        <input type="text" bind:value={dr.notifyAfter} />
+    </settings.Row>
+    <settings.Row name="Clipboard write" note="Programs may set the clipboard (OSC 52).">
+        <input type="checkbox" bind:checked={dr.clipboardWrite} />
+    </settings.Row>
+</div>

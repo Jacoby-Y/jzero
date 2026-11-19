@@ -1,0 +1,134 @@
+module jzero.explorer.syntax.grammar;
+
+use j3.data.map.Map;
+use j3.memory.{ Arena, List };
+use jzero.config.parse;
+use jzero.theme.theme;
+
+// A `.syntax` file (`key = value` lines) read into a Grammar. Format: docs/syntax.md.
+
+// Token kinds, in this order everywhere (colors in `highlight.j3`, markdown uses the first five).
+pub const COMMENT = 0;
+pub const STRING = 1;
+pub const NUMBER = 2;
+pub const KEYWORD = 3;
+pub const TYPE = 4;
+pub const FUNCTION = 5;
+pub const CONSTANT = 6;
+pub const BUILTIN = 7;
+pub const KEY = 8;
+pub const SECTION = 9;
+pub const VARIABLE = 10;
+pub const ANNOTATION = 11;
+pub const CONTROL = 12;    // control flow (`if`, `return`); `keyword` is declarations
+pub const KINDS = 13;      // = theme.SYNTAX, names from `theme.syntaxName`
+
+// Text from `open` to `close` (`$`: the end of the line).
+pub struct Region {
+    kind: int;
+    open: string;
+    close: string;        // "" = end of line
+    escape: bool;         // `\` skips the next byte
+    multiline: bool;      // else a newline ends it
+    start: bool;          // only first on a line (after spaces)
+    alone: bool;          // only at a line start or after a space
+    char: bool;           // a short literal: closes within 12 bytes, no space inside ('a' but not 'a lifetimes)
+}
+
+// `prefix = <kind> <text>`: `<text>` and the word after it (`@decorator`, `$var`).
+pub struct Prefix { kind: int; text: string; }
+
+pub struct Grammar {
+    name: string;
+    exts: List<string>;
+    files: List<string>;         // exact file names (`Makefile`)
+    regions: List<Region>;
+    words: Map<string, int>;     // word -> kind
+    after: Map<string, int>;     // word -> kind of the next word (`fn` -> function)
+    prefixes: List<Prefix>;
+    wordChars: string = "";      // extra bytes inside words (`-` in CSS)
+    call: bool = false;          // a word right before `(` is a function
+    capitalized: int = -1;       // kind of Capitalized words
+    plain: int = -1;             // kind of every other word (`plain = variable`)
+    keySep: u8 = 0;              // first word or string on a line before this is a key
+    keyAnywhere: bool = false;   // ... or any of them (JSON, HTML attributes)
+    ignoreCase: bool = false;    // words compare lowercased (list them lowercase)
+
+    fn matches(this: &Grammar, ext: string, base: string): bool {
+        for i in 0..this.files.len { if this.files.items[i] == base { return true; } }
+        if ext.len == 0 { return false; }
+        for i in 0..this.exts.len { if this.exts.items[i] == ext { return true; } }
+        return false;
+    }
+}
+
+// The grammar of `.syntax` text `src` (kept as views: `src` must outlive it). Unknown keys and
+// kinds are skipped.
+pub fn read(src: string, mem: &Arena): Grammar {
+    let g = Grammar {
+        name: "", exts: List<string>.new(mem), files: List<string>.new(mem), regions: List<Region>.new(mem),
+        words: Map<string, int>.new(mem, 64), after: Map<string, int>.new(mem, 8), prefixes: List<Prefix>.new(mem),
+    };
+    let es = parse.parse(src, mem);
+    let ws = List<string>.new(mem);
+    for i in 0..es.len {
+        let k = es.items[i].key;
+        let v = es.items[i].value;
+        ws.len = 0;
+        split(v, &ws);
+        let w = ws.items[0..ws.len];
+        if k == "name" { g.name = v; }
+        else if k == "ext" { for x in w { g.exts.push(x); } }
+        else if k == "file" { for x in w { g.files.push(x); } }
+        else if k == "word-chars" { g.wordChars = v; }
+        else if k == "call" { g.call = v == "true"; }
+        else if k == "ignore-case" { g.ignoreCase = v == "true"; }
+        else if k == "capitalized" { g.capitalized = kindOf(v); }
+        else if k == "plain" { g.plain = kindOf(v); }
+        else if k == "key" && w.len > 0 && w[0].len == 1 { g.keySep = w[0][0]; g.keyAnywhere = w.len > 1 && w[1] == "anywhere"; }
+        else if k == "comment" && (w.len == 1 || isFlag(w[1])) { g.regions.push(region(COMMENT, w[0], "$", w[1..w.len])); }
+        else if k == "comment" && w.len >= 2 {
+            let r = region(COMMENT, w[0], w[1], w[2..w.len]);
+            r.multiline = true;
+            g.regions.push(r);
+        }
+        else if k == "string" && w.len >= 2 { g.regions.push(region(STRING, w[0], w[1], w[2..w.len])); }
+        else if k == "region" && w.len >= 3 && kindOf(w[0]) >= 0 { g.regions.push(region(kindOf(w[0]), w[1], w[2], w[3..w.len])); }
+        else if k == "prefix" && w.len == 2 && kindOf(w[0]) >= 0 { g.prefixes.push(Prefix { kind: kindOf(w[0]), text: w[1] }); }
+        else if k == "after" && w.len >= 2 && kindOf(w[0]) >= 0 { for j in 1..w.len { g.after.put(w[j], kindOf(w[0])); } }
+        else if kindOf(k) >= 0 { for x in w { g.words.put(x, kindOf(k)); } }
+    }
+    return g;
+}
+
+fn region(kind: int, open: string, close: string, flags: []string): Region {
+    let r = Region { kind: kind, open: open, close: close, escape: false, multiline: false, start: false, alone: false, char: false };
+    if close == "$" { r.close = ""; }
+    for f in flags {
+        if f == "escape" { r.escape = true; }
+        else if f == "multiline" { r.multiline = true; }
+        else if f == "start" { r.start = true; }
+        else if f == "alone" { r.alone = true; }
+        else if f == "char" { r.char = true; r.escape = true; }
+    }
+    return r;
+}
+
+fn isFlag(w: string): bool { return w == "escape" || w == "multiline" || w == "start" || w == "alone" || w == "char"; }
+
+pub fn kindOf(name: string): int {
+    for i in 0..KINDS { if theme.syntaxName(i) == name { return i; } }
+    return -1;
+}
+
+// Space-separated words of `s` (views).
+fn split(s: string, out: &List<string>) {
+    let i = 0;
+    while i < s.len {
+        while i < s.len && (s[i] == 32 || s[i] == 9) { i += 1; }
+        let j = i;
+        while j < s.len && s[j] != 32 && s[j] != 9 { j += 1; }
+        if j > i { out.push(s[i..j]); }
+        i = j;
+    }
+}

@@ -1,0 +1,168 @@
+module jzero.state;
+
+// State part: answers `jzctl` control commands from other processes (`features/ctl.j3` is the
+// client). Each reply is `ok|err|timeout|exit <code>\n<body>`. This file routes them and does
+// the ones that change something; `ctlinfo.j3` has the ones that print, `ctlwait.j3` the ones
+// answered on a later frame (wait, run, watch).
+
+extend State {
+    // A control request (main's `App.onRequest`).
+    fn request(this: &State, req: Request) {
+        let args = req.args();
+        let cmd = -1;
+        if args.len > 1 { cmd = ctl.command(args[1]); }
+        match cmd {
+            ctl.LS { this.ctlLs(req, args); }
+            ctl.NEW { this.ctlNew(req, args); }
+            ctl.NOTIFY { this.ctlNotify(req, args); }
+            ctl.SEARCH { this.ctlSearch(req, args); }
+            ctl.OPEN { this.ctlOpen(req, args); }
+            ctl.KANBAN { kanbanctl.request(&this.kanban, req, args); }
+            -1 { req.reply("err\nusage: jzctl <command> ... (jzctl help)\n"); }
+            _ { this.ctlPane(req, args, cmd); }
+        }
+    }
+
+    // `new split [--in <id>] [-- cmd...]` (default: the focused pane) or `new island [-- cmd...]`.
+    fn ctlNew(this: &State, req: Request, args: []string) {
+        let cmd = ctl.rest(args);
+        let kind = "";
+        if args.len > 2 { kind = args[2]; }
+        if kind == "island" {
+            let title = "";
+            if cmd.len > 0 { title = os.baseName(cmd[0]); }
+            replyId(req, this.commandIsland(title, "", cmd));
+            return;
+        }
+        if kind != "split" { req.reply("err\nusage: jzctl new split|island [--in <id>] [-- cmd...] (jzctl help new)\n"); return; }
+        let at = this.ctlTarget(args);
+        if at.island < 0 { req.reply("err\nno pane to split\n"); return; }
+        let cwd = Text.scratch();
+        paneCwd(this.islands.get(at.island).panes.get(at.leaf), cwd);
+        replyId(req, this.splitPane(at, cwd.str(), cmd));
+    }
+
+    // `open <path>[:line] [--in <id>]`: an explorer pane split beside `--in` (else the focused
+    // pane), on the file (at that line) or folder. The client made `path` absolute.
+    fn ctlOpen(this: &State, req: Request, args: []string) {
+        if args.len < 3 { req.reply("err\nusage: jzctl open <path>[:line] [--in <id>] (jzctl help open)\n"); return; }
+        let path = os.slashes(args[2]);
+        let line = 0;
+        let colon = path.len;
+        while colon > 0 && path[colon - 1] != 58 && path[colon - 1] != 47 { colon -= 1; }
+        if colon > 1 && path[colon - 1] == 58 && !io.exists(path) {
+            line = ctl.num(path[colon..path.len], 0);
+            if line > 0 { path = path[0..colon - 1]; }
+        }
+        if !io.exists(path) { req.reply(Text.scratch().add("err\nno such file: ").add(path).add("\n").str()); return; }
+        let at = this.ctlTarget(args);
+        if at.island < 0 { req.reply("err\nno pane to split (open an island first)\n"); return; }
+        let isl = this.islands.get(at.island);
+        isl.panes.focus = at.leaf;
+        let id = this.newPaneId();
+        isl.panes.split(split.RIGHT, Option.None, id);
+        let n = isl.panes.get(isl.panes.focus);
+        n.pane = split.EXPLORER;
+        n.ex = this.openExplorer(path);
+        if line > 0 { n.explorer().gotoLine(line); }
+        this.openIsland(at.island);
+        replyId(req, id);
+    }
+
+    // The pane `--in <id>` names, else the focused one (`island` -1 when neither is there).
+    fn ctlTarget(this: &State, args: []string): PaneAt {
+        let target = ctl.flag(args, "--in");
+        if target.len > 0 { return this.findPane(ctl.num(target, -1)); }
+        if this.active == OCEAN { return PaneAt {}; }
+        let focus = this.islands.get(this.active).panes.focus;
+        if focus < 0 { return PaneAt {}; }
+        return PaneAt { island: this.active, leaf: focus };
+    }
+
+    // `notify <text> [--title <title>]`: a desktop notification (off with `notifications`).
+    fn ctlNotify(this: &State, req: Request, args: []string) {
+        if args.len < 3 { req.reply("err\nusage: jzctl notify <text> [--title <title>] (jzctl help notify)\n"); return; }
+        let title = ctl.flag(args, "--title");
+        if title.len == 0 { title = "JZero"; }
+        if this.cfg.notifications { notify.send(title, args[2]); }
+        req.reply("ok\n");
+    }
+
+    // The commands on pane `args[2]`.
+    fn ctlPane(this: &State, req: Request, args: []string, cmd: int) {
+        let at = PaneAt {};
+        if args.len > 2 { at = this.findPane(ctl.num(args[2], -1)); }
+        if at.island < 0 { req.reply("err\nno such pane (see jzctl ls)\n"); return; }
+        let n = this.islands.get(at.island).panes.get(at.leaf);
+        if cmd != ctl.FOCUS && cmd != ctl.CLOSE && !n.hasTerm() { req.reply("err\nnot a terminal pane\n"); return; }
+        match cmd {
+            ctl.SEND { this.ctlSend(req, args, n.session()); }
+            ctl.KEY { this.ctlKey(req, args, n.session()); }
+            ctl.READ { this.ctlRead(req, args, n); }
+            ctl.WAIT { this.ctlWait(req, args, n.id); }
+            ctl.RUN { this.ctlRun(req, args, n.id); }
+            ctl.WATCH { this.ctlWatch(req, args, n); }
+            ctl.STATUS { this.ctlStatus(req, args, n); }
+            ctl.HISTORY { this.ctlHistory(req, args, n); }
+            ctl.BADGE { this.ctlBadge(req, args, at); }
+            ctl.FOCUS { this.openIsland(at.island); this.islands.get(at.island).panes.focus = at.leaf; req.reply("ok\n"); }
+            ctl.CLOSE { this.ctlClose(req, args, at); }
+            _ { req.reply("err\nunknown command\n"); }
+        }
+    }
+
+    // `send <id> <text> [--enter]`: `text` as a paste, then Enter as its own key.
+    fn ctlSend(this: &State, req: Request, args: []string, t: &Session) {
+        t.wants = false;
+        if args.len > 3 { t.pasteText(args[3]); }
+        if ctl.has(args, "--enter") { t.pressKey(input.KEY_ENTER, 0, i32(0)); }
+        req.reply("ok\n");
+    }
+
+    // `key <id> enter|tab|esc|...|ctrl+<letter>`.
+    fn ctlKey(this: &State, req: Request, args: []string, t: &Session) {
+        let k = ctl.key("");
+        if args.len > 3 { k = ctl.key(args[3]); }
+        if k.key == input.KEY_NONE { req.reply("err\nkeys: enter tab esc backspace up down left right delete ctrl+<letter> (jzctl help key)\n"); return; }
+        t.wants = false;
+        t.pressKey(k.key, k.mods, k.cp);
+        req.reply("ok\n");
+    }
+
+    // `badge <id> [text]`: show `text` on the pane (no text clears it); its island gets the
+    // unseen dot when another one shows.
+    fn ctlBadge(this: &State, req: Request, args: []string, at: PaneAt) {
+        let t = this.islands.get(at.island).panes.get(at.leaf).session();
+        t.badge.clear();
+        if args.len > 3 && args[3] != "--" { t.badge.pushStr(args[3]); }
+        if t.badge.len() > 0 && at.island != this.active { this.islands.get(at.island).unseen = true; }
+        req.reply("ok\n");
+    }
+
+    // `close <id> [--force]`: without `--force`, not while a program runs or an edit is unsaved.
+    fn ctlClose(this: &State, req: Request, args: []string, at: PaneAt) {
+        let n = this.islands.get(at.island).panes.get(at.leaf);
+        if !ctl.has(args, "--force") {
+            if n.hasExplorer() && n.explorer().dirty() { req.reply("err\nunsaved changes (--force closes)\n"); return; }
+            let what = this.paneBusy(n);
+            if what.len > 0 { req.reply(Text.scratch().add("err\n").add(what).add(" is running (--force closes)\n").str()); return; }
+        }
+        this.closePane(at.island, at.leaf);
+        req.reply("ok\n");
+    }
+}
+
+// `ok` with pane id `id`, or an error when it could not start (-1).
+fn replyId(req: Request, id: int) {
+    if id < 0 { req.reply("err\ncould not start\n"); return; }
+    req.reply(Text.scratch().add("ok\n").add(`{id}`).add("\n").str());
+}
+
+// Pane `n`'s directory: the shell's live one, else the last known.
+fn paneCwd(n: &Node, out: &Text) {
+    if n.hasTerm() { n.session().cwd(out); return; }
+    if n.hasExplorer() { out.pushStr(n.explorer().root.str()); return; }
+    out.pushStr(n.cwd.str());
+}
+
+fn maxInt(a: int, b: int): int { if a > b { return a; } return b; }

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# jzctl: control the running JZero (`jzctl help`). Runs the JZero binary with `--ctl`, which
+# makes it a control client instead of the app (`src/features/ctl.j3`).
+exec "${JZERO_EXE:-/opt/jzero/jzero}" --ctl "$@"

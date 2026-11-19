@@ -1,0 +1,17 @@
+module jzero.layout.icons;
+
+// Island icon set: bootstrap-icons names by icon number, as
+// ui/IslandIcon.j3ui maps them. Keep COUNT and that file in step.
+pub const COUNT = 24;
+const NAMES: [24]string = ["terminal", "code-slash", "hdd-stack", "journal-text", "globe", "database", "cpu", "git", "bug", "rocket-takeoff", "music-note-beamed", "house", "server", "cloud", "box-seam", "controller", "book", "pencil", "gear", "shield-lock", "graph-up", "chat-dots", "camera", "lightning"];
+
+pub fn name(i: int): string {
+    if i < 0 || i >= COUNT { return NAMES[0]; }
+    return NAMES[i];
+}
+
+// The icon number of a name (0, the terminal, when unknown).
+pub fn index(n: string): int {
+    for i in 0..COUNT { if NAMES[i] == n { return i; } }
+    return 0;
+}

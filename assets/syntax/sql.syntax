@@ -1,0 +1,12 @@
+name = SQL
+ext = sql
+comment = --
+comment = /* */
+string = ' ' escape
+region = string " "
+ignore-case = true
+keyword = select from where and or not insert into values update set delete create table drop alter add column index view join left right inner outer full on as group by order having limit offset union all distinct case when then else end is null in exists between like primary key foreign references default unique constraint begin commit rollback transaction with returning if replace
+type = int integer bigint smallint text varchar char boolean bool real float double numeric decimal date time timestamp blob json serial
+constant = true false
+builtin = count sum avg min max coalesce now lower upper length
+call = true

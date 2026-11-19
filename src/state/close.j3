@@ -1,0 +1,76 @@
+module jzero.state;
+
+// State part: closing panes, islands and the window, asking first while a program other than
+// an idle shell runs there (config `confirm-close`).
+
+extend State {
+    // Close leaf `leaf` of island `i`, or ask first.
+    fn requestClosePane(this: &State, i: int, leaf: int) {
+        let what = this.paneBusy(this.islands.get(i).panes.get(leaf));
+        if what.len == 0 { this.closePane(i, leaf); return; }
+        this.askAbout(ASK_PANE, i, leaf, what);
+    }
+
+    // Turn the active island's focused shell into an explorer, or ask first.
+    fn requestExplorer(this: &State) {
+        if this.active == OCEAN { return; }
+        let leaf = this.islands.get(this.active).panes.focus;
+        if leaf < 0 { return; }
+        let what = this.paneBusy(this.islands.get(this.active).panes.get(leaf));
+        if what.len == 0 { this.explorerPane(this.active, leaf); return; }
+        this.askAbout(ASK_EXPLORER, this.active, leaf, what);
+    }
+
+    // Close island `i` (its shells stop; the layout stays), or ask first.
+    fn requestCloseIsland(this: &State, i: int) {
+        let what = this.islandBusy(this.islands.get(i));
+        if what.len == 0 { this.closeIsland(i); return; }
+        this.askAbout(ASK_ISLAND, i, -1, what);
+    }
+
+    // Quit (the window's close button, Alt+F4), or ask first.
+    fn requestQuit(this: &State) {
+        for i in 0..this.islands.count() {
+            let isl = this.islands.get(i);
+            if !isl.open { continue; }
+            let what = this.islandBusy(isl);
+            if what.len > 0 { this.askAbout(ASK_QUIT, i, -1, what); return; }
+        }
+        game.requestQuit();
+    }
+
+    // The confirmation's "Close" button.
+    fn confirmAsk(this: &State) {
+        let kind = this.ask;
+        this.ask = ASK_NONE;
+        if kind == ASK_PANE { this.closePane(this.askIsland, this.askLeaf); }
+        else if kind == ASK_ISLAND { this.closeIsland(this.askIsland); }
+        else if kind == ASK_EXPLORER { this.explorerPane(this.askIsland, this.askLeaf); }
+        else if kind == ASK_NOTE { this.notePane(this.askIsland, this.askLeaf); }
+        else if kind == ASK_QUIT { game.requestQuit(); }
+    }
+
+    fn askAbout(this: &State, kind: int, i: int, leaf: int, what: string) {
+        this.ask = kind;
+        this.askIsland = i;
+        this.askLeaf = leaf;
+        this.askWhat.clear();
+        this.askWhat.pushStr(what);
+    }
+
+    // What runs in pane `n` that closing would stop ("" for nothing, or no confirmation wanted).
+    fn paneBusy(this: &State, n: &Node): string {
+        if !this.cfg.confirmClose || !n.hasTerm() { return ""; }
+        return n.session().busy();
+    }
+
+    fn islandBusy(this: &State, isl: &Island): string {
+        let p = &isl.panes;
+        for j in 0..p.nodes.len {
+            if !p.isLeaf(j) { continue; }
+            let what = this.paneBusy(p.get(j));
+            if what.len > 0 { return what; }
+        }
+        return "";
+    }
+}

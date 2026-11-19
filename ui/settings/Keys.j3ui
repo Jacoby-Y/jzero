@@ -1,0 +1,25 @@
+<script>
+    use jzero.config.draft;
+    use jzero.config.draft.Draft;
+    props { dr: &Draft; }
+</script>
+<div class="tab">
+    <settings.Row name="Quick terminal key" note="Global show/hide (X11), like ctrl+grave. Empty for none.">
+        <input type="text" placeholder="None" bind:value={dr.quickKey} />
+    </settings.Row>
+    <p class="note">Combos like ctrl+shift+o, ctrl+alt+left, f5. Empty unbinds.</p>
+    {#each 1..dr.binds.len as id}
+        <settings.Row name={dr.titles.items[id]}>
+            <input type="text" placeholder="None" bind:value={dr.binds.items[id]} />
+            {#if dr.binds.items[id] != dr.defaults.items[id]}
+                <button class="reset" title="Back to the default" on:click={draft.resetBind(dr, id)}><icon name="arrow-counterclockwise" /></button>
+            {/if}
+        </settings.Row>
+    {/each}
+    <button class="all" on:click={draft.resetBinds(dr)}>Reset all keys</button>
+</div>
+<style>
+    .note { color: var(--c-bright-black); font-size: 12px; margin: 6px 0; }
+    .reset { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; }
+    .all { height: 30px; padding: 0 12px; margin-top: 8px; background: var(--chrome-hover); }
+</style>

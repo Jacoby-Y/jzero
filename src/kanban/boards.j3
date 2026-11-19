@@ -1,0 +1,248 @@
+module jzero.kanban.boards;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.text;
+use j3.text.Text;
+use jzero.kanban.board;
+use jzero.kanban.board.Board;
+use jzero.session.paths;
+use jzero.util.sort;
+
+// What the kanban edit dialog is changing (`Boards.edit`).
+pub const EDIT_NONE = 0;
+pub const EDIT_CARD = 1;
+pub const EDIT_COLUMN = 2;
+pub const EDIT_BOARD = 3;
+
+const SUFFIX = ".md";  // 3 bytes, cut by hand below
+
+// The kanban view's boards: one file each in `<data>/kanban`, the open one in memory.
+// Edits mark it dirty; `save` writes it (State calls it on its save tick and when leaving).
+pub struct Boards {
+    listMem: &Arena;      // names, rebuilt by `refresh`
+    names: List<string>;  // board names, sorted (file names without .md)
+    boardMem: &Arena;     // the open board, rebuilt by `open`
+    board: Board;
+    cur: Text;            // the open board's name ("" none)
+    dirty: bool = false;
+    edit: int = 0;        // EDIT_*
+    editCol: int = -1;
+    editCard: int = -1;
+
+    fn isOpen(this: &Boards): bool { return this.cur.len() > 0; }
+
+    // Re-read the board list; keep the open board if its file is still there, else open the first.
+    fn refresh(this: &Boards) {
+        io.makeDirs(paths.kanban());
+        this.listMem.destroy();
+        *this.listMem = Arena.create(4096);
+        this.names = List<string>.new(this.listMem);
+        match io.listDir(paths.kanban(), this.listMem) {
+            Result.Ok(entries) {
+                for e in entries {
+                    let n = e.name;
+                    if e.isDir || n.len <= 3 || n[0] == 46 || n[n.len - 3..n.len] != SUFFIX { continue; }
+                    this.names.push(n[0..n.len - 3]);
+                }
+            }
+            Result.Err(_) {}
+        }
+        sort.strings(this.names.items[0..this.names.len]);
+        if this.has(this.cur.str()) { return; }
+        this.cur.clear();
+        if this.names.len > 0 { this.open(this.names.items[0]); }
+    }
+
+    fn has(this: &Boards, name: string): bool {
+        for i in 0..this.names.len { if this.names.items[i] == name { return true; } }
+        return false;
+    }
+
+    fn open(this: &Boards, name: string) {
+        this.save();
+        this.edit = EDIT_NONE;
+        this.cur.clear();
+        this.cur.pushStr(name);
+        this.boardMem.destroy();
+        *this.boardMem = Arena.create(16384);
+        this.board = board.create(this.boardMem);
+        match io.readFile(file(name), this.boardMem) {
+            Result.Ok(bytes) { board.decode(bytes as string, &this.board); }
+            Result.Err(_) {}
+        }
+    }
+
+    // A new board ("Board", "Board 2", ...) with the starter columns, opened.
+    fn create(this: &Boards) {
+        let name = Text.scratch();
+        name.pushStr("Board");
+        let n = 2;
+        while this.has(name.str()) {
+            name.clear();
+            name.add("Board ").pushInt(n);
+            n += 1;
+        }
+        this.add(name.str());
+        this.open(name.str());
+    }
+
+    // Write a new board `name` with the starter columns. False when the name is refused.
+    fn add(this: &Boards, name: string): bool {
+        if !validName(name) || this.has(name) { return false; }
+        let mem = Arena.create(4096);
+        let b = board.create(&mem);
+        board.starter(&b);
+        let ok = write(name, &b);
+        mem.destroy();
+        this.refresh();
+        return ok;
+    }
+
+    // Rename board `from`'s file. False when `to` is empty, has a `/`, or is taken.
+    fn rename(this: &Boards, from: string, to: string): bool {
+        if from == to { return true; }
+        if !validName(to) || this.has(to) { return false; }
+        let open = from == this.cur.str();
+        if open { this.save(); }
+        let src = Text.scratch();
+        src.pushStr(file(from));
+        match io.rename(src.str(), file(to)) {
+            Result.Ok(_) {}
+            Result.Err(_) { return false; }
+        }
+        if open {
+            this.cur.clear();
+            this.cur.pushStr(to);
+        }
+        this.refresh();
+        return true;
+    }
+
+    fn remove(this: &Boards, name: string) {
+        io.remove(file(name));
+        if name == this.cur.str() {
+            this.dirty = false;
+            this.cur.clear();
+            this.edit = EDIT_NONE;
+        }
+        this.refresh();
+    }
+
+    // Write the open board if it changed.
+    fn save(this: &Boards) {
+        if !this.dirty || !this.isOpen() { return; }
+        if write(this.cur.str(), &this.board) { this.dirty = false; }
+    }
+
+    // Board `name` for a change from outside the view (`kanban/kanbanctl.j3`): the open one, or a copy
+    // read into `mem`. Hand it back to `store` after changing it.
+    fn load(this: &Boards, name: string, mem: &Arena): &Board {
+        if name == this.cur.str() { return &this.board; }
+        let b = &mem.alloc::<Board>(1)[0];
+        *b = board.create(mem);
+        match io.readFile(file(name), mem) {
+            Result.Ok(bytes) { board.decode(bytes as string, b); }
+            Result.Err(_) {}
+        }
+        return b;
+    }
+
+    // Save a board `load` gave out. The open one drops its edit dialog (its indexes may have moved).
+    fn store(this: &Boards, name: string, b: &Board): bool {
+        if name != this.cur.str() { return write(name, b); }
+        this.edit = EDIT_NONE;
+        this.dirty = true;
+        this.save();
+        return !this.dirty;
+    }
+
+    fn startEdit(this: &Boards, kind: int, c: int, k: int) {
+        this.edit = kind;
+        this.editCol = c;
+        this.editCard = k;
+    }
+
+    fn addColumn(this: &Boards) {
+        let c = this.board.addColumn("New column");
+        this.dirty = true;
+        this.startEdit(EDIT_COLUMN, c, -1);
+    }
+
+    fn addCard(this: &Boards, c: int) {
+        let k = this.board.addCard(c, "New card");
+        this.dirty = true;
+        this.startEdit(EDIT_CARD, c, k);
+    }
+
+    // The edit dialog's Done. False (dialog stays) when a board name is refused.
+    fn apply(this: &Boards, name: string, body: string): bool {
+        if this.edit == EDIT_BOARD {
+            if !this.rename(this.cur.str(), name) { return false; }
+        } else if this.edit == EDIT_COLUMN {
+            set(&this.board.col(this.editCol).name, name);
+        } else if this.edit == EDIT_CARD {
+            let card = this.board.card(this.editCol, this.editCard);
+            set(&card.title, name);
+            set(&card.body, body);
+        }
+        this.dirty = true;
+        this.edit = EDIT_NONE;
+        return true;
+    }
+
+    // The edit dialog's Delete: the board, card or column being edited.
+    fn removeEdited(this: &Boards) {
+        if this.edit == EDIT_BOARD { this.remove(this.cur.str()); return; }
+        if this.edit == EDIT_CARD { this.board.col(this.editCol).cards.remove(this.editCard); }
+        else if this.edit == EDIT_COLUMN { this.board.cols.remove(this.editCol); }
+        this.dirty = true;
+        this.edit = EDIT_NONE;
+    }
+
+    fn moveCard(this: &Boards, c: int, k: int, toC: int, toK: int) {
+        this.board.moveCard(c, k, toC, toK);
+        this.dirty = true;
+    }
+
+    fn moveColumn(this: &Boards, from: int, to: int) {
+        this.board.moveColumn(from, to);
+        this.dirty = true;
+    }
+}
+
+// A card's `drag-id`: column and card in one int.
+pub const CARD_ID = 65536;
+
+fn set(t: &Text, s: string) {
+    t.clear();
+    t.pushStr(s);
+}
+
+// A board name that is safe as a file name: not empty, no leading `.`, no `/`.
+pub fn validName(name: string): bool { return name.len > 0 && name[0] != 46 && text.find(name, "/") < 0; }
+
+fn write(name: string, b: &Board): bool {
+    let t = Text.scratch();
+    b.encode(t);
+    match io.writeFile(file(name), t.bytes[0..t.len()]) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
+}
+
+// A board's file (frame scratch).
+fn file(name: string): string {
+    let t = Text.scratch();
+    t.add(paths.kanban()).add("/").add(name).add(SUFFIX);
+    return t.str();
+}
+
+pub fn create(mem: &Arena): Boards {
+    let listMem = &mem.alloc::<Arena>(1)[0];
+    *listMem = Arena.create(64);
+    let boardMem = &mem.alloc::<Arena>(1)[0];
+    *boardMem = Arena.create(64);
+    return Boards { listMem: listMem, names: List<string>.new(listMem), boardMem: boardMem, board: board.create(boardMem), cur: Text.new(mem) };
+}

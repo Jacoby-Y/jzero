@@ -1,0 +1,70 @@
+// Todo: a small list app. Copy this folder to ~/.config/jzero/extensions/todo,
+// then Command palette → "Extension: Todo".
+use tui;
+
+pub let title = "Todo";
+
+pub fn open(pane) {
+    pane.items = ["Try JZero extensions", "Edit main.j2 and save: it reloads"];
+    pane.done = [false, false];
+    pane.sel = 0;
+    pane.top = 0;
+    pane.typing = nil;   // the new item's text while adding
+}
+
+pub fn key(pane, k) {
+    if pane.typing != nil {
+        match k {
+            "enter" {
+                if len(pane.typing) > 0 { pane.items.push(pane.typing); pane.done.push(false); pane.sel = len(pane.items) - 1; }
+                pane.typing = nil;
+            }
+            "esc" { pane.typing = nil; }
+            "backspace" { if len(pane.typing) > 0 { pane.typing = slice(pane.typing, 0, len(pane.typing) - 1); } }
+            _ { if len(k) == 1 { pane.typing += k; } }
+        }
+        return;
+    }
+    let n = len(pane.items);
+    match k {
+        "up" { if pane.sel > 0 { pane.sel -= 1; } }
+        "k" { if pane.sel > 0 { pane.sel -= 1; } }
+        "down" { if pane.sel < n - 1 { pane.sel += 1; } }
+        "j" { if pane.sel < n - 1 { pane.sel += 1; } }
+        " " { if n > 0 { pane.done[pane.sel] = !pane.done[pane.sel]; } }
+        "a" { pane.typing = ""; }
+        "d" {
+            if n > 0 {
+                pane.items.remove(pane.sel);
+                pane.done.remove(pane.sel);
+                if pane.sel >= len(pane.items) && pane.sel > 0 { pane.sel -= 1; }
+            }
+        }
+        "q" { close(); }
+        _ {}
+    }
+}
+
+pub fn click(pane, x, y, button) {
+    let i = pane.top + y - 1;
+    if button == 0 && i >= 0 && i < len(pane.items) { pane.sel = i; }
+}
+
+pub fn draw(pane) {
+    clear();
+    let h = pane.rows - 3;
+    pane.top = tui.scrollTo(pane.sel, pane.top, h);
+    let rows = [];
+    for i, s in pane.items {
+        let mark = "[ ] ";
+        if pane.done[i] { mark = "[x] "; }
+        rows.push(" " + mark + s);
+    }
+    tui.text(1, 0, title, tui.GREEN, -1);
+    tui.text(len(title) + 2, 0, `{len(pane.items)} items`, tui.GRAY, -1);
+    tui.list(0, 1, pane.cols, h, rows, pane.sel, pane.top);
+    if pane.typing != nil {
+        tui.bar(pane, pane.rows - 2, " New: " + pane.typing + "_");
+    }
+    tui.bar(pane, pane.rows - 1, " ↑↓/jk move  space done  a add  d delete  q close");
+}

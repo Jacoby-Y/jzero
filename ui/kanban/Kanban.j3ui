@@ -1,0 +1,128 @@
+<script>
+    use j3.text.same;
+    use j3.game.mousePos;
+    use jzero.state.State;
+    use jzero.kanban.boards.{ CARD_ID, EDIT_NONE, EDIT_CARD, EDIT_COLUMN, EDIT_BOARD };
+    props { state: &State; }
+
+    // Right-click menu: the column and card under the pointer (-1: none).
+    let menuOpen = false;
+    let menuX: f32 = 0.0;
+    let menuY: f32 = 0.0;
+    let menuC = -1;
+    let menuK = -1;
+
+    // Outer level runs first; the column and card levels then set menuC / menuK.
+    fn openMenu() {
+        let m = mousePos();
+        menuX = m.x;
+        menuY = m.y;
+        menuC = -1;
+        menuK = -1;
+        menuOpen = true;
+    }
+
+    // A card or column dropped on column `c` before card `k` (-1: the end).
+    fn dropped(data: string, id: int, c: int, k: int) {
+        let kb = &state.kanban;
+        if same(data, "col") { kb.moveColumn(id, c); }
+        else if same(data, "card") { kb.moveCard(id / CARD_ID, id % CARD_ID, c, k); }
+    }
+</script>
+
+{#let kb = &state.kanban}
+<div class="kanban">
+    <aside class="boards">
+        <div class="head">
+            <span class="title">Boards</span>
+            <button class="tool" title="New board" on:click={kb.create()}><icon name="plus-lg" /></button>
+        </div>
+        {#each kb.names.items[0..kb.names.len] as name}
+            <button class="board" class:active={same(name, kb.cur.str())} on:click={kb.open(name)}>{name}</button>
+        {/each}
+    </aside>
+    {#if kb.isOpen()}
+        <section class="main" on:contextmenu={openMenu()}>
+            <div class="head">
+                <span class="title">{kb.cur.str()}</span>
+                <button class="tool" title="Rename or delete board" on:click={kb.startEdit(EDIT_BOARD, -1, -1)}><icon name="pencil" /></button>
+                <button class="tool" title="Add column" on:click={kb.addColumn()}><icon name="plus-lg" /></button>
+            </div>
+            <div class="cols">
+                {#each kb.board.columns() as col, c}
+                    <div class="col" on:contextmenu={menuC = c} on:drop={dropped(data, dragId, c, -1)}>
+                        <button class="colname" title="Drag to reorder, click to rename" draggable drag-data="col" drag-id={c}
+                            on:click={kb.startEdit(EDIT_COLUMN, c, -1)}>{col.name.str()} <span class="count">{col.cards.len}</span></button>
+                        <div class="cards">
+                            {#each col.cards.items[0..col.cards.len] as card, k}
+                                <button class="card" draggable drag-data="card" drag-id={c * CARD_ID + k} on:contextmenu={menuK = k}
+                                    on:click={kb.startEdit(EDIT_CARD, c, k)} on:drop={dropped(data, dragId, c, k)}>
+                                    <span class="ctitle">{card.title.str()}</span>
+                                    {#if card.body.len() > 0}
+                                        <span class="cbody">{card.body.str()}</span>
+                                    {/if}
+                                </button>
+                            {/each}
+                            <button class="add" on:click={kb.addCard(c)}><icon name="plus-lg" /> Add card</button>
+                        </div>
+                    </div>
+                {/each}
+            </div>
+        </section>
+    {:else}
+        <section class="main empty">
+            <p>No boards yet.</p>
+            <button class="add" on:click={kb.create()}><icon name="plus-lg" /> New board</button>
+        </section>
+    {/if}
+    {#if menuOpen}
+        <div class="menu" popover left={menuX} top={menuY} on:close={menuOpen = false}>
+            {#if menuK >= 0}
+                <button class="entry" menuitem on:click={menuOpen = false; kb.startEdit(EDIT_CARD, menuC, menuK)}>Edit Card</button>
+                <div class="sep"></div>
+            {/if}
+            {#if menuC >= 0}
+                <button class="entry" menuitem on:click={menuOpen = false; kb.startEdit(EDIT_COLUMN, menuC, -1)}>Rename Column</button>
+                <button class="entry" menuitem on:click={menuOpen = false; kb.addCard(menuC)}>Add Card</button>
+                <div class="sep"></div>
+            {/if}
+            <button class="entry" menuitem on:click={menuOpen = false; kb.startEdit(EDIT_BOARD, -1, -1)}>Edit Board</button>
+            <button class="entry" menuitem on:click={menuOpen = false; kb.addColumn()}>Add Column</button>
+            <button class="entry" menuitem on:click={menuOpen = false; kb.create()}>New Board</button>
+        </div>
+    {/if}
+    {#if kb.edit != EDIT_NONE}
+        <kanban.Edit state={state} />
+    {/if}
+</div>
+
+<style>
+    .kanban { flex: 1; min-height: 0; display: flex; flex-direction: row; background: var(--term-bg); color: var(--chrome-fg); }
+    .boards { width: 200px; flex-shrink: 0; display: flex; flex-direction: column; overflow-y: auto; background: var(--chrome-bg); }
+    .head { height: 36px; flex-shrink: 0; display: flex; flex-direction: row; align-items: center; gap: 4px; padding: 0 8px; }
+    .title { flex: 1; min-width: 0; color: var(--c-bright-white); white-space: nowrap; overflow: hidden; }
+    .tool { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; }
+    .board { height: 30px; padding: 0 12px; display: flex; align-items: center; justify-content: flex-start; white-space: nowrap; overflow: hidden; }
+    .board.active { background: var(--chrome-active); color: var(--c-bright-white); }
+    .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    .main.empty { align-items: center; justify-content: center; gap: 12px; }
+    .cols { flex: 1; min-height: 0; display: flex; flex-direction: row; gap: 8px; padding: 0 8px 8px 8px; overflow-x: auto; }
+    .col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; background: var(--chrome-bg); }
+    .col:drop-target { background: var(--chrome-hover); }
+    .colname { height: 32px; flex-shrink: 0; padding: 0 10px; display: flex; align-items: center; justify-content: flex-start; gap: 6px; color: var(--c-bright-white); user-select: none; }
+    .colname:dragging { opacity: 0.4; }
+    .count { color: var(--c-bright-black); }
+    .cards { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 6px 6px 6px; }
+    .card { flex-shrink: 0; padding: 8px 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; background: var(--chrome-hover); user-select: none; }
+    .card:hover { background: var(--ocean-tile); }
+    .card:dragging { opacity: 0.4; }
+    .card:drop-target { outline: 2px solid var(--chrome-active); outline-offset: -2px; }
+    .ctitle { color: var(--c-bright-white); }
+    .cbody { color: var(--c-bright-black); font-size: 12px; max-height: 48px; overflow: hidden; }
+    .add { height: 30px; flex-shrink: 0; padding: 0 10px; display: flex; align-items: center; justify-content: flex-start; gap: 6px; color: var(--c-bright-black); }
+    .menu { width: 200px; padding: 4px 0; display: flex; flex-direction: column; background: var(--chrome-hover); }
+    .entry { height: 28px; padding: 0 12px; display: flex; align-items: center; justify-content: flex-start; }
+    .entry:focus { background: var(--chrome-active); color: var(--c-bright-white); }
+    .sep { height: 1px; margin: 4px 0; background: var(--chrome-bg); }
+    .add:hover { color: var(--chrome-fg); }
+</style>

@@ -1,0 +1,149 @@
+<script>
+    use jzero.state.{ State, oceanSnap };
+    use j3.game;
+    use j3.memory;
+    use j3.game.{ mousePos, mouseDown, Mouse };
+    use jzero.actions;
+    use jzero.layout.island.TAG_COUNT;
+    props { state: &State; }
+
+    const DRAG_SLOP: f32 = 4.0;  // px the pointer must move before a press becomes a drag
+    const DOUBLE_CLICK = 400;      // ms between presses that open an island
+
+    let dragIdx = -1;
+    let moved = false;
+    let startMx: f32 = 0.0;
+    let startMy: f32 = 0.0;
+    let startX: f32 = 0.0;
+    let startY: f32 = 0.0;
+    let lastClickIdx = -1;
+    let lastClickAt = -100000;
+
+    fn onFrame(dt: f32) {
+        if dragIdx < 0 { return; }
+        let m = mousePos();
+        let dx = m.x - startMx;
+        let dy = m.y - startMy;
+        if !moved && dx * dx + dy * dy > DRAG_SLOP * DRAG_SLOP { moved = true; lastClickIdx = -1; }
+        if moved {
+            let isl = state.islands.get(dragIdx);
+            isl.x = oceanSnap(startX + dx);
+            isl.y = oceanSnap(startY + dy);
+        }
+        if !mouseDown(Mouse.Left) { release(); }
+    }
+
+    // A press selects and may start a drag; a second quick press on the same island opens it.
+    fn grab(i: int) {
+        let now = game.ticks();
+        if lastClickIdx == i && now - lastClickAt < DOUBLE_CLICK {
+            lastClickIdx = -1;
+            dragIdx = -1;
+            state.openIsland(i);
+            return;
+        }
+        lastClickIdx = i;
+        lastClickAt = now;
+        let m = mousePos();
+        let isl = state.islands.get(i);
+        dragIdx = i;
+        moved = false;
+        startMx = m.x;
+        startMy = m.y;
+        startX = isl.x;
+        startY = isl.y;
+        state.selected = i;
+    }
+
+    fn release() { dragIdx = -1; }
+
+    // Right-click: select the island and open its info menu at the pointer.
+    let infoOpen = false;
+    let infoX: f32 = 0.0;
+    let infoY: f32 = 0.0;
+    fn openInfo(i: int, x: f32, y: f32) {
+        state.selected = i;
+        infoX = x;
+        infoY = y;
+        infoOpen = true;
+    }
+
+    fn newIsland() { state.selected = state.newIsland(); }
+
+    let filter = 0;  // tag shown (0: every island)
+
+    fn shows(tag: int): bool { return filter == 0 || tag == filter; }
+
+    // Lay the islands out on the grid, most recently used first.
+    fn sortByUse() {
+        let order = List<int>.new(memory.scratch(65536));  // frame scratch: used up right here
+        state.islands.byUse(&order);
+        for k in 0..order.len {
+            let isl = state.islands.get(order.items[k]);
+            isl.x = state.slotXOf(k);
+            isl.y = state.slotYOf(k);
+        }
+    }
+    // Backdrop wordmark, drawn faintly behind the islands.
+    const ART: [6]string = [
+        "     ██╗███████╗███████╗██████╗  ██████╗ ",
+        "     ██║╚══███╔╝██╔════╝██╔══██╗██╔═══██╗",
+        "     ██║  ███╔╝ █████╗  ██████╔╝██║   ██║",
+        "██   ██║ ███╔╝  ██╔══╝  ██╔══██╗██║   ██║",
+        "╚█████╔╝███████╗███████╗██║  ██║╚██████╔╝",
+        " ╚════╝ ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ",
+    ];
+</script>
+
+<div class="ocean">
+    <div class="art">
+        {#each ART as line}<div class="line">{line}</div>{/each}
+    </div>
+    <ocean.Ripples />
+    <div class="water" on:mousedown={state.selected = -1}></div>
+    {#each state.islands.all() as isl, i}
+        {#if shows(isl.tag)}
+        <div class="isl" class:selected={state.selected == i} style:left={isl.x} style:top={isl.y}
+            on:mousedown={if button == 0 { grab(i); }} on:contextmenu={openInfo(i, mouse.x, mouse.y)}>
+            <div class="tile tag-{isl.tag}" class:open={isl.open}><IslandIcon icon={isl.icon} /></div>
+            <span class="name">{isl.name.str()}</span>
+        </div>
+        {/if}
+    {/each}
+    <div class="toolbar">
+        <button class="tool" on:click={newIsland()}><icon name="plus-lg" /> New island</button>
+        <button class="tool" on:click={actions.run(state, actions.FROM_TEMPLATE)}><icon name="layout-split" /> From template</button>
+        <button class="tool" on:click={sortByUse()}><icon name="clock-history" /> Sort by last used</button>
+        {#each 0..TAG_COUNT as k}
+            <button class="chip tag-{k}" class:on={filter == k} title={if k == 0 { "Every island" } else { "Only this tag" }} on:click={filter = k}>
+                {#if k == 0}All{:else}<icon name="circle-fill" />{/if}
+            </button>
+        {/each}
+        <span class="hint">Drag to move. Right-click for info.</span>
+    </div>
+    {#if infoOpen && state.selected >= 0}
+        <ocean.Inspector state={state} x={infoX} y={infoY} on:close={infoOpen = false} />
+    {/if}
+</div>
+
+<style>
+    .ocean { flex: 1; min-height: 0; position: relative; overflow: hidden; background: var(--ocean-bg); }
+    .water { position: absolute; left: 0; top: 0; right: 0; bottom: 0; }
+    .art { position: absolute; left: 0; top: 0; right: 0; bottom: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; }
+    .line { font-family: "Mono"; font-size: clamp(14px, 2.6vw, 40px); line-height: 1; white-space: pre; color: var(--ocean-art); }
+    .isl { position: absolute; width: 88px; padding: 4px 0; display: flex; flex-direction: column; align-items: center; gap: 6px; cursor: pointer; }
+    .tile { width: 56px; height: 56px; font-size: 26px; display: flex; align-items: center; justify-content: center; background: var(--ocean-tile); color: var(--c-bright-white); }
+    .tile.open { color: var(--c-bright-green); }
+    .isl.selected .tile { background: var(--chrome-active); }
+    .name { padding: 1px 6px; text-align: center; color: var(--c-bright-white); }
+    .isl.selected .name { background: var(--chrome-active); }
+    .toolbar { position: absolute; left: 12px; bottom: 12px; display: flex; flex-direction: row; align-items: center; gap: 12px; }
+    .tool { padding: 6px 12px; display: flex; flex-direction: row; align-items: center; gap: 6px; background: var(--ocean-tile); }
+    .tool icon { width: 18px; height: 18px; flex-shrink: 0; }
+    .hint { color: var(--c-bright-black); }
+    .chip { width: 30px; height: 30px; font-size: 12px; display: flex; align-items: center; justify-content: center; background: var(--ocean-tile); }
+    .chip.on { background: var(--chrome-active); color: var(--c-bright-white); }
+    .tile.tag-1, .chip.tag-1 { color: var(--c-red); } .tile.tag-2, .chip.tag-2 { color: var(--c-green); }
+    .tile.tag-3, .chip.tag-3 { color: var(--c-yellow); } .tile.tag-4, .chip.tag-4 { color: var(--c-blue); }
+    .tile.tag-5, .chip.tag-5 { color: var(--c-magenta); } .tile.tag-6, .chip.tag-6 { color: var(--c-cyan); }
+</style>

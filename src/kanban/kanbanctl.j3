@@ -1,0 +1,195 @@
+module jzero.kanban.kanbanctl;
+
+// `jzctl kanban ...`: list, show and change kanban boards from outside (agents). Routed here
+// from `state/ctl.j3`; help in `features/ctlhelp.j3`. Boards are named, columns by index or
+// name, cards by index within their column (as `show` numbers them). Works on boards that are
+// not open in the view; the open one updates live.
+
+use j3.data.json;
+use j3.instance.Request;
+use j3.memory.Arena;
+use j3.text.Text;
+use jzero.features.ctl;
+use jzero.kanban.board.{ Board, indented };
+use jzero.kanban.boards.Boards;
+
+const USAGE = "err\nusage: jzctl kanban ls|show|new|rename|rm|col|card ... (jzctl help kanban)\n";
+
+pub fn request(kb: &Boards, req: Request, args: []string) {
+    kb.refresh();  // files may have changed outside
+    let mem = Arena.create(16384);
+    req.reply(answer(kb, args, &mem));
+    mem.destroy();
+}
+
+fn answer(kb: &Boards, args: []string, mem: &Arena): string {
+    let sub = arg(args, 2);
+    if sub == "ls" { return ls(kb, ctl.has(args, "--json")); }
+    if sub == "new" {
+        let name = arg(args, 3);
+        if !oneLine(name) || !kb.add(name) { return "err\nboard name is empty, taken, or has a / or a newline\n"; }
+        return "ok\n";
+    }
+    if sub == "col" || sub == "card" {
+        let name = arg(args, 4);
+        if !kb.has(name) { return noBoard(name); }
+        let b = kb.load(name, mem);
+        let out = if sub == "col" { col(b, args) } else { card(b, args) };
+        if starts(out, "ok") && !kb.store(name, b) { return "err\ncould not write the board file\n"; }
+        return out;
+    }
+    let name = arg(args, 3);
+    if sub != "show" && sub != "rename" && sub != "rm" { return USAGE; }
+    if !kb.has(name) { return noBoard(name); }
+    if sub == "show" { return show(name, kb.load(name, mem), ctl.has(args, "--json")); }
+    if sub == "rm" { kb.remove(name); return "ok\n"; }
+    let to = arg(args, 4);
+    if !oneLine(to) || !kb.rename(name, to) { return "err\nnew name is empty, taken, or has a / or a newline\n"; }
+    return "ok\n";
+}
+
+// `col add|rename|rm|mv <board> ...`
+fn col(b: &Board, args: []string): string {
+    let op = arg(args, 3);
+    if op == "add" {
+        let name = arg(args, 5);
+        if !oneLine(name) { return "err\ncolumn name is empty or has a newline\n"; }
+        return okInt(b.addColumn(name));
+    }
+    let c = colRef(b, arg(args, 5));
+    if c < 0 { return "err\nno such column (jzctl kanban show <board>)\n"; }
+    if op == "rm" { b.cols.remove(c); return "ok\n"; }
+    if op == "rename" {
+        let name = arg(args, 6);
+        if !oneLine(name) { return "err\ncolumn name is empty or has a newline\n"; }
+        set(&b.col(c).name, name);
+        return "ok\n";
+    }
+    if op == "mv" {
+        let to = ctl.num(arg(args, 6), -1);
+        if to < 0 || to >= b.cols.len { return "err\n<to> is not a column position\n"; }
+        b.moveColumn(c, to);
+        return "ok\n";
+    }
+    return "err\nusage: jzctl kanban col add|rename|rm|mv <board> ... (jzctl help kanban)\n";
+}
+
+// `card add|edit|rm|mv <board> <col> ...`
+fn card(b: &Board, args: []string): string {
+    let op = arg(args, 3);
+    let c = colRef(b, arg(args, 5));
+    if c < 0 { return "err\nno such column (jzctl kanban show <board>)\n"; }
+    if op == "add" {
+        let title = arg(args, 6);
+        if !oneLine(title) { return "err\ncard title is empty or has a newline\n"; }
+        let k = b.addCard(c, title);
+        set(&b.card(c, k).body, ctl.flag(args, "--body"));
+        return okInt(k);
+    }
+    let k = ctl.num(arg(args, 6), -1);
+    if k < 0 || k >= b.col(c).cards.len { return "err\nno such card (jzctl kanban show <board>)\n"; }
+    if op == "rm" { b.col(c).cards.remove(k); return "ok\n"; }
+    if op == "edit" {
+        let title = ctl.flag(args, "--title");
+        if ctl.has(args, "--title") && !oneLine(title) { return "err\ncard title is empty or has a newline\n"; }
+        if title.len > 0 { set(&b.card(c, k).title, title); }
+        if ctl.has(args, "--body") { set(&b.card(c, k).body, ctl.flag(args, "--body")); }
+        return "ok\n";
+    }
+    if op == "mv" {
+        let toC = colRef(b, arg(args, 7));
+        if toC < 0 { return "err\nno such target column\n"; }
+        let toK = ctl.num(arg(args, 8), -1);
+        if arg(args, 8).len > 0 && (toK < 0 || toK > b.col(toC).cards.len) { return "err\n<before> is not a card position\n"; }
+        b.moveCard(c, k, toC, toK);
+        return "ok\n";
+    }
+    return "err\nusage: jzctl kanban card add|edit|rm|mv <board> <col> ... (jzctl help kanban)\n";
+}
+
+fn ls(kb: &Boards, js: bool): string {
+    let t = Text.scratch();
+    t.pushStr("ok\n");
+    if js { t.pushStr("["); }
+    for i in 0..kb.names.len {
+        let n = kb.names.items[i];
+        if js {
+            if i > 0 { t.pushStr(","); }
+            json.quote(n, t);
+        } else {
+            t.add(n).push(10);
+        }
+    }
+    if js { t.pushStr("]\n"); }
+    return t.str();
+}
+
+// Plain: `## <c> <column>`, `- <k> <title>`, body lines indented two spaces.
+// JSON: {name, columns: [{name, cards: [{title, body}]}]} (indexes are the array order).
+fn show(name: string, b: &Board, js: bool): string {
+    let t = Text.scratch();
+    t.pushStr("ok\n");
+    if js { t.pushStr("{\"name\":"); json.quote(name, t); t.pushStr(",\"columns\":["); }
+    for c in 0..b.cols.len {
+        let col = b.col(c);
+        if js {
+            if c > 0 { t.pushStr(","); }
+            t.pushStr("{\"name\":"); json.quote(col.name.str(), t); t.pushStr(",\"cards\":[");
+        } else {
+            t.add("## ").pushInt(c);
+            t.add(" ").add(col.name.str()).push(10);
+        }
+        for k in 0..col.cards.len {
+            let cd = b.card(c, k);
+            if js {
+                if k > 0 { t.pushStr(","); }
+                t.pushStr("{\"title\":"); json.quote(cd.title.str(), t);
+                t.pushStr(",\"body\":"); json.quote(cd.body.str(), t); t.pushStr("}");
+            } else {
+                t.add("- ").pushInt(k);
+                t.add(" ").add(cd.title.str()).push(10);
+                indented(cd.body.str(), t);
+            }
+        }
+        if js { t.pushStr("]}"); }
+    }
+    if js { t.pushStr("]}\n"); }
+    return t.str();
+}
+
+// A column by index, else by exact name (-1 when neither).
+fn colRef(b: &Board, s: string): int {
+    let n = ctl.num(s, -1);
+    if n >= 0 && n < b.cols.len { return n; }
+    for c in 0..b.cols.len { if b.col(c).name.str() == s { return c; } }
+    return -1;
+}
+
+fn arg(args: []string, i: int): string {
+    if i < args.len { return args[i]; }
+    return "";
+}
+
+// Not empty, no newline (names and titles are one line in the board file).
+fn oneLine(s: string): bool {
+    if s.len == 0 { return false; }
+    for ch in s { if ch == 10 || ch == 13 { return false; } }
+    return true;
+}
+
+fn noBoard(name: string): string { return Text.scratch().add("err\nno board \"").add(name).add("\" (jzctl kanban ls)\n").str(); }
+
+fn okInt(n: int): string {
+    let t = Text.scratch();
+    t.pushStr("ok\n");
+    t.pushInt(n);
+    t.push(10);
+    return t.str();
+}
+
+fn starts(s: string, p: string): bool { return s.len >= p.len && s[0..p.len] == p; }
+
+fn set(t: &Text, s: string) {
+    t.clear();
+    t.pushStr(s);
+}

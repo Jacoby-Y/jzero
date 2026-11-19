@@ -1,0 +1,72 @@
+module jzero.term.procinfo;
+
+use j3.sys;
+use j3.text.{ Text, cstr };
+use jzero.platform.os;
+
+// What a shell's process is doing, from /proc. `buf` is a scratch buffer (4 KiB or more).
+// Windows has no /proc: nothing is known here (`available` false) and the session falls back
+// to what shell integration reports (OSC 7 for the cwd, OSC 133 for "a command runs").
+pub fn available(): bool { return !os.windows(); }
+
+// The working directory of `pid`, appended to `out`. Nothing when unknown.
+pub fn cwd(pid: int, buf: []u8, out: &Text) {
+    if !available() { return; }
+    let n = sys.realpathTo(cstr(`/proc/{pid}/cwd`) as ptr, buf);
+    if n > 0 { out.pushBytes(buf[0..n]); }
+}
+
+// The name of what runs in the foreground of shell `pid`'s terminal ("" when the shell itself
+// waits). `always`: report the shell's own name too (a program pane). Frame scratch.
+pub fn busy(pid: int, always: bool, buf: []u8): string {
+    if !available() { return ""; }
+    let fg = foreground(pid, buf);
+    if !always && (fg <= 0 || fg == pid) { return ""; }
+    if fg <= 0 { fg = pid; }
+    let n = read(`/proc/{fg}/comm`, buf);
+    let name = buf[0..n] as string;
+    while name.len > 0 && name[name.len - 1] == 10 { name = name[0..name.len - 1]; }
+    if name.len == 0 { name = "a program"; }
+    let t = Text.scratch();
+    t.pushStr(name);
+    return t.str();
+}
+
+// The terminal's foreground process group (field 8 of /proc/<pid>/stat), -1 when unknown.
+pub fn foreground(pid: int, buf: []u8): int {
+    let n = read(`/proc/{pid}/stat`, buf);
+    return tpgid(buf[0..n] as string);
+}
+
+// Field 8 (tpgid) of a /proc stat line, -1 when it is not one.
+fn tpgid(s: string): int {
+    let i = s.len;
+    while i > 0 && s[i - 1] != 41 { i -= 1; }  // after the last ')' of the command name
+    if i == 0 { return -1; }
+    let field = 0;
+    let v = 0;
+    while i < s.len {
+        if s[i] == 32 { field += 1; if field == 7 { return v; } v = 0; }
+        else if s[i] >= 48 && s[i] <= 57 { v = v * 10 + int(s[i] - 48); }
+        i += 1;
+    }
+    return -1;
+}
+
+// A small /proc file into `buf`; its length.
+fn read(path: string, buf: []u8): int {
+    let fd = sys.open(cstr(path) as ptr, sys.O_RDONLY);
+    if fd < 0 { return 0; }
+    let n = sys.read(fd, &buf[0] as ptr, buf.len);
+    sys.close(fd);
+    if n < 0 { return 0; }
+    return n;
+}
+
+// Self-check: the stat line parser, and this process (no terminal: not -1 or a real group).
+pub fn selfTest() {
+    check(tpgid("123 (a) b) S 1 123 123 34816 4567 4194560 0") == 4567, "tpgid");
+    check(tpgid("garbage") == -1, "bad line");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`procinfo selfTest: {what}`); } }

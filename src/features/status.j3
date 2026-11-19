@@ -1,0 +1,54 @@
+module jzero.features.status;
+
+use j3.sys;
+use j3.text.Text;
+
+// A pane's command status for the title bar: `running 12s`, `✓ 2.0s`, `✗ 1 · 3m 4s`.
+// `runMs` >= 0 while a command runs (how long so far); else `exit` (-1: none yet) and `ms`.
+// Frame scratch.
+pub fn text(runMs: int, exit: int, ms: int): string {
+    let t = Text.scratch();
+    if runMs >= 0 {
+        t.pushStr("running ");
+        duration(runMs, t);
+        return t.str();
+    }
+    if exit < 0 { return ""; }
+    if exit == 0 { t.pushStr("✓ "); }
+    else {
+        t.pushStr("✗ ");
+        t.pushInt(exit);
+        t.pushStr(" · ");
+    }
+    duration(ms, t);
+    return t.str();
+}
+
+// `0.4s`, `9.9s`, `12s`, `3m 4s`, `2h 5m`.
+pub fn duration(ms: int, t: &Text) {
+    if ms < 10000 {
+        t.pushInt(ms / 1000);
+        t.push(46);
+        t.pushInt((ms / 100) % 10);
+        t.push(115);
+        return;
+    }
+    let s = ms / 1000;
+    if s < 60 { t.pushInt(s); t.push(115); return; }
+    if s < 3600 { t.pushInt(s / 60); t.pushStr("m "); t.pushInt(s % 60); t.push(115); return; }
+    t.pushInt(s / 3600);
+    t.pushStr("h ");
+    t.pushInt((s / 60) % 60);
+    t.push(109);
+}
+
+// Self-check: the formats.
+pub fn selfTest() {
+    check(text(-1, -1, 0) == "", "none");
+    check(text(-1, 0, 2049) == "✓ 2.0s", text(-1, 0, 2049));
+    check(text(-1, 2, 184000) == "✗ 2 · 3m 4s", text(-1, 2, 184000));
+    check(text(12500, -1, 0) == "running 12s", "running");
+    check(text(-1, 0, 7500000) == "✓ 2h 5m", text(-1, 0, 7500000));
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`status selfTest: {what}`); } }

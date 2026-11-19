@@ -1,0 +1,102 @@
+module jzero.explorer.explorer;
+
+// Explorer part: the non-text views (image modal, markdown preview, thumbnail grid) and links.
+
+extend Explorer {
+    // Show an image in the modal (the tree or editor stays under it).
+    fn openImage(this: &Explorer, path: string) {
+        let p = Text.scratch();  // `path` may be `image` itself (stepping)
+        p.pushStr(path);
+        if !this.viewer.load(p.str()) { this.note("Cannot show ", p.str()); return; }
+        this.image.clear();
+        this.image.pushStr(p.str());
+    }
+
+    fn viewing(this: &Explorer): bool { return this.image.len() > 0; }
+
+    fn closeImage(this: &Explorer) {
+        this.viewer.free();
+        this.image.clear();
+    }
+
+    // The previous (-1) or next (1) image in the open image's folder.
+    fn stepImage(this: &Explorer, step: int) {
+        if !this.viewing() { return; }
+        let next = Text.scratch();
+        if image.sibling(this.image.str(), step, next) { this.openImage(next.str()); }
+    }
+
+    fn previewing(this: &Explorer): bool { return this.mode == EDIT && this.kind == kinds.MARKDOWN && this.preview; }
+
+    fn togglePreview(this: &Explorer) {
+        this.preview = !this.preview;
+        this.showFind = false;
+        this.reparse();
+    }
+
+    // Rebuild the preview from the editor text (after a load, an edit or a theme change).
+    fn reparse(this: &Explorer) {
+        if this.previewing() { this.doc.parse(this.text, this.folder()); }
+    }
+
+    // Folder of the open file.
+    fn folder(this: &Explorer): string {
+        return os.parent(this.file.str());
+    }
+
+    // Tick the task box whose mark is at byte `at` of the text, and save.
+    fn toggleTask(this: &Explorer, at: int) {
+        if at < 0 || at >= this.text.len { return; }
+        let out = this.nextSwap();
+        out.pushStr(this.text[0..at]);
+        out.push(if this.text[at] == 32 { 120 } else { 32 });
+        out.pushStr(this.text[at + 1..this.text.len]);
+        this.text = out.str();
+        this.write();
+        this.rehighlight();
+        this.reparse();
+    }
+
+    // A link in the preview: web links go to the desktop; files and [[notes]] open here.
+    fn follow(this: &Explorer, href: string, wiki: bool) {
+        if href.len == 0 || href[0] == 35 { return; }
+        if !wiki && (find(href, "://") > 0 || find(href, "mailto:") == 0) { links.open(href, this.mem); return; }
+        if this.dirty() { this.note("Save first: ", this.file.str()); return; }
+        let p = Text.scratch();
+        let target = href;
+        let hash = find(target, "#");
+        if hash >= 0 { target = target[0..hash]; }
+        if os.isAbs(target) { mddoc.unescape(target, p); }
+        else { p.pushStr(this.folder()); p.push(47); mddoc.unescape(target, p); }
+        if wiki && find(target, ".") < 0 { p.pushStr(".md"); }
+        if !io.exists(p.str()) && wiki && this.notesDir.len() > 0 {
+            p.clear();
+            p.pushStr(this.notesDir.str());
+            p.push(47);
+            p.pushStr(target);
+            if find(target, ".") < 0 { p.pushStr(".md"); }
+        }
+        if !io.exists(p.str()) { this.note("Not found: ", href); return; }
+        let path = Text.new(this.mem);  // openFile copies it; scratch may be reused inside
+        path.pushStr(p.str());
+        this.openFile(path.str());
+    }
+
+    fn toggleGrid(this: &Explorer) {
+        this.grid = !this.grid;
+        if !this.grid { this.thumbs.clear(); }
+    }
+
+    // Grid view: show folder `i` as the root (the tree's folders open in place instead).
+    fn enter(this: &Explorer, i: int) {
+        let r = &this.rows.items[i];
+        if !r.isDir { this.activate(i); return; }
+        let p = Text.new(this.mem);
+        p.pushStr(r.path.str());
+        this.root.clear();
+        this.root.pushStr(p.str());
+        this.selected = -1;
+        this.thumbs.clear();
+        this.refresh();
+    }
+}

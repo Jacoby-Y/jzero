@@ -1,0 +1,33 @@
+<script>
+    use jzero.state.State;
+    props { state: &State; }
+
+    // `a/b.md` shows as `a/b`.
+    fn label(rel: string): string { return rel[0..rel.len - 3]; }
+</script>
+
+<dialog modal class="pick" on:close={state.notePickOpen = false}>
+    <h2>Turn into note</h2>
+    <div class="list">
+        {#each state.noteList.items[0..state.noteList.len] as rel}
+            <button class="row" on:click={state.pickNote(rel)}>{label(rel)}</button>
+        {/each}
+        {#if state.noteList.len == 0}
+            <p class="none">No notes yet. Make one from the notes button.</p>
+        {/if}
+    </div>
+    <div class="acts">
+        <button class="small" on:click={state.notePickOpen = false}>Cancel</button>
+    </div>
+</dialog>
+
+<style>
+    .pick { width: 420px; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--chrome-bg); color: var(--chrome-fg); }
+    h2 { font-size: 16px; color: var(--c-bright-white); }
+    .list { max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; }
+    .row { height: 28px; padding: 0 10px; text-align: left; justify-content: flex-start; display: flex; align-items: center; white-space: pre; }
+    .row:hover { background: var(--chrome-hover); }
+    .none { color: var(--c-bright-black); }
+    .acts { display: flex; flex-direction: row; justify-content: flex-end; }
+    .small { height: 30px; padding: 0 14px; background: var(--chrome-hover); }
+</style>

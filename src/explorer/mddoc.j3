@@ -1,0 +1,399 @@
+module jzero.explorer.mddoc;
+
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.text.Text;
+use j3.ui.spans.SPAN_COLOR;
+use jzero.explorer.highlight;
+use jzero.explorer.highlight.Highlighter;
+use jzero.explorer.markdown.{ close, markerEnd, isWord, startsWith };
+use jzero.explorer.mdhtml;
+use jzero.explorer.mdhtml.Tag;
+
+// Markdown read into blocks of inline runs for the explorer's preview (`ui/explorer/MdView.j3ui`).
+// Styles nest (`**a `b`**`, `[`c`](u)`); README-style HTML (`<p align>`, `<img width>`, `<a>`, `<br>`, `<sub>`) works.
+// ponytail: line-based like markdown.j3 (no escapes, no entities, tags close on their own line); CommonMark if people ask.
+
+pub const B_PARA = 0;
+pub const B_HEADING = 1;
+pub const B_ITEM = 2;   // list item (task when `check` >= 0)
+pub const B_QUOTE = 3;
+pub const B_CODE = 4;   // fence or front matter
+pub const B_RULE = 5;
+pub const B_ROW = 6;    // table row: `from..to` are cells
+
+pub const R_TEXT = 0;   // styled by the flags; a link when `link` (href: the target, or the note name when `wiki`)
+pub const R_IMAGE = 1;  // href: a file path, text: alt, width: CSS ("96px", "49%") or ""
+pub const R_COLOR = 2;  // highlighted code: href is `#rrggbb`
+pub const R_BREAK = 3;  // `<br>`
+
+pub struct Run {
+    kind: int;
+    text: string;
+    href: string = "";
+    width: string = "";
+    bold: bool = false;
+    italic: bool = false;
+    code: bool = false;
+    small: bool = false; // `<sub>`, `<sup>`, `<small>`
+    link: bool = false;
+    wiki: bool = false;
+}
+
+pub const LEFT = 0;
+pub const CENTER = 1;
+pub const RIGHT = 2;
+
+pub struct Cell {
+    from: int;
+    to: int;
+    align: int = 0;      // LEFT, CENTER, RIGHT
+}
+
+pub struct Block {
+    kind: int;
+    level: int = 0;      // heading 1-6, list depth
+    marker: string = ""; // list: "•" or "3."
+    check: int = -1;     // task: -1 none, 0 open, 1 done
+    checkAt: int = -1;   // source byte of the box's mark
+    head: bool = false;  // table header row
+    center: bool = false; // `<p align="center">`
+    from: int = 0;       // runs (cells for B_ROW)
+    to: int = 0;
+}
+
+pub struct Doc {
+    mem: &Arena;         // rewound by every `parse`
+    hl: Highlighter;     // its own, so the editor's spans stay
+    src: Text;           // copy of the parsed text; runs view it
+    dir: string = "";    // folder of the file, for relative images
+    blocks: List<Block>;
+    runs: List<Run>;
+    cells: List<Cell>;
+    open: int = -1;      // block a plain next line joins (-1 none)
+
+    fn parse(this: &Doc, text: string, dir: string) {
+        this.mem.rewind(0);
+        this.src = Text.new(this.mem);
+        this.blocks = List<Block>.new(this.mem);
+        this.runs = List<Run>.new(this.mem);
+        this.cells = List<Cell>.new(this.mem);
+        this.open = -1;
+        this.src.pushStr(text);
+        let d = Text.new(this.mem);
+        d.pushStr(dir);
+        this.dir = d.str();
+        let s = this.src.str();
+        let i = this.frontMatter(s);
+        let fence = -1;  // start of the fenced code, -1 outside
+        let lang = "";
+        while i < s.len {
+            let end = i;
+            while end < s.len && s[end] != 10 { end += 1; }
+            let k = i;
+            while k < end && (s[k] == 32 || s[k] == 9) { k += 1; }
+            let line = s[k..end];
+            if fence >= 0 {
+                if startsWith(line, "```") { this.code(s[fence..if i > fence { i - 1 } else { fence }], lang); fence = -1; }
+            } else if startsWith(line, "```") {
+                fence = if end < s.len { end + 1 } else { end };
+                lang = trim(line[3..line.len]);
+                this.open = -1;
+            } else {
+                this.line(s, i, k, end);
+            }
+            i = end + 1;
+        }
+        if fence >= 0 { this.code(s[fence..s.len], lang); }
+    }
+
+    // `---` front matter at the top shows as a code block; returns where the body starts.
+    fn frontMatter(this: &Doc, s: string): int {
+        if !startsWith(s, "---\n") { return 0; }
+        let i = 4;
+        while i < s.len {
+            let end = i;
+            while end < s.len && s[end] != 10 { end += 1; }
+            if s[i..end] == "---" {
+                this.code(s[4..if i > 4 { i - 1 } else { 4 }], "yaml");
+                return end + 1;
+            }
+            i = end + 1;
+        }
+        return 0;
+    }
+
+    // One line outside a fence: `k` is past its indent.
+    fn line(this: &Doc, s: string, start: int, k: int, end: int) {
+        let line = s[k..end];
+        if line.len == 0 { this.open = -1; return; }
+        let h = 0;
+        while h < line.len && h < 7 && line[h] == 35 { h += 1; }
+        if h > 0 && h < 7 && (h == line.len || line[h] == 32) {
+            let b = this.add(Block { kind: B_HEADING, level: h });
+            this.inline(s, skipSpaces(s, k + h, end), end, b, Run { kind: R_TEXT, text: "" });
+            this.open = -1;
+            return;
+        }
+        if isRule(line) { this.add(Block { kind: B_RULE }); this.open = -1; return; }
+        if line[0] == 60 && this.htmlBlock(s, k, end) { return; }
+        if line[0] == 62 {
+            let q = skipSpaces(s, k + 1, end);
+            if this.open >= 0 && this.blocks.items[this.open].kind == B_QUOTE { this.more(s, q, end); return; }
+            let b = this.add(Block { kind: B_QUOTE });
+            this.inline(s, q, end, b, Run { kind: R_TEXT, text: "" });
+            this.open = this.blocks.len - 1;
+            return;
+        }
+        if line[0] == 124 { this.row(s, k, end); this.open = -1; return; }
+        let m = markerEnd(s, k, end);
+        if m > k {
+            let depth = (k - start) / 2;
+            if depth > 6 { depth = 6; }
+            let mk: string = if s[k] >= 48 && s[k] <= 57 { s[k..m - 1] } else { "•" };
+            let b = this.add(Block { kind: B_ITEM, level: depth, marker: mk });
+            let t = m;
+            if t + 3 <= end && s[t] == 91 && s[t + 2] == 93 && (s[t + 1] == 32 || s[t + 1] == 120 || s[t + 1] == 88)
+                && (t + 3 == end || s[t + 3] == 32) {
+                b.check = if s[t + 1] == 32 { 0 } else { 1 };
+                b.checkAt = t + 1;
+                t = skipSpaces(s, t + 3, end);
+            }
+            this.inline(s, t, end, b, Run { kind: R_TEXT, text: "" });
+            this.open = this.blocks.len - 1;
+            return;
+        }
+        if this.open >= 0 { this.more(s, k, end); return; }
+        let b = this.add(Block { kind: B_PARA });
+        this.inline(s, k, end, b, Run { kind: R_TEXT, text: "" });
+        this.open = this.blocks.len - 1;
+    }
+
+    // A line starting with `<p>`, `<div>`, `<hN>` (opens a block until its closing tag or a blank line)
+    // or a lone closing one. False for inline tags, which go on as text.
+    fn htmlBlock(this: &Doc, s: string, k: int, end: int): bool {
+        let t = mdhtml.at(s, k, end);
+        if t.end < 0 || !mdhtml.isBlock(t.name) { return false; }
+        if t.closing { this.open = -1; return true; }
+        let h = mdhtml.heading(t.name);
+        let b = this.add(Block { kind: if h > 0 { B_HEADING } else { B_PARA }, level: h,
+            center: t.name == "center" || mdhtml.attr(t, "align") == "center" });
+        this.inline(s, t.end, end, b, Run { kind: R_TEXT, text: "" });
+        this.open = if closesBlock(s[k..end]) { -1 } else { this.blocks.len - 1 };
+        return true;
+    }
+
+    // A line that continues the open block (a soft break is a space).
+    fn more(this: &Doc, s: string, from: int, end: int) {
+        let b = &this.blocks.items[this.open];
+        this.runs.push(Run { kind: R_TEXT, text: " " });
+        this.inline(s, from, end, b, Run { kind: R_TEXT, text: "" });
+    }
+
+    // `| a | b |`; a `|---|:-:|` line marks the row above as the header.
+    fn row(this: &Doc, s: string, k: int, end: int) {
+        let e = end;
+        while e > k && (s[e - 1] == 32 || s[e - 1] == 9) { e -= 1; }
+        let sep = true;
+        for c in k..e { if s[c] != 124 && s[c] != 45 && s[c] != 58 && s[c] != 32 { sep = false; break; } }
+        if e - 1 > k && s[e - 1] == 124 { e -= 1; }
+        let prev = this.lastRow();
+        if sep {
+            if prev.len > 0 { this.blocks.items[this.blocks.len - 1].head = true; }
+            let col = 0;
+            let at = k + 1;
+            while at <= e && col < prev.len {
+                let c = at;
+                while c < e && s[c] != 124 { c += 1; }
+                prev[col].align = align(trim(s[at..c]));
+                col += 1;
+                at = c + 1;
+            }
+            return;
+        }
+        let first = this.cells.len;
+        let at = k + 1;
+        while at <= e {
+            let c = at;
+            while c < e && s[c] != 124 { c += 1; }
+            let cell = Cell { from: this.runs.len, to: 0 };
+            let a = skipSpaces(s, at, c);
+            let z = c;
+            while z > a && s[z - 1] == 32 { z -= 1; }
+            let tmp = Block { kind: B_PARA, from: this.runs.len };
+            this.inline(s, a, z, &tmp, Run { kind: R_TEXT, text: "" });
+            cell.to = this.runs.len;
+            if this.cells.len - first < prev.len { cell.align = prev[this.cells.len - first].align; }
+            this.cells.push(cell);
+            at = c + 1;
+        }
+        this.add(Block { kind: B_ROW, from: first, to: this.cells.len });
+    }
+
+    // Cells of the table row just above (empty when the last block isn't one).
+    fn lastRow(this: &Doc): []Cell {
+        if this.blocks.len == 0 || this.blocks.items[this.blocks.len - 1].kind != B_ROW { return this.cells.items[0..0]; }
+        return this.rowCells(&this.blocks.items[this.blocks.len - 1]);
+    }
+
+    fn code(this: &Doc, body: string, lang: string) {
+        let b = this.add(Block { kind: B_CODE });
+        let name = Text.new(this.mem);
+        name.pushStr("x.");
+        name.pushStr(if lang.len > 0 { lang } else { "txt" });
+        let sp = this.hl.spans(body, name.str());
+        let pos = 0;
+        for x in sp {
+            if x.kind != SPAN_COLOR || x.start < pos { continue; }
+            if x.start > pos { this.runs.push(Run { kind: R_TEXT, text: body[pos..x.start] }); }
+            this.runs.push(Run { kind: R_COLOR, text: body[x.start..x.start + x.len], href: x.data });
+            pos = x.start + x.len;
+        }
+        if pos < body.len { this.runs.push(Run { kind: R_TEXT, text: body[pos..body.len] }); }
+        b.to = this.runs.len;
+        this.open = -1;
+    }
+
+    fn add(this: &Doc, b: Block): &Block {
+        b.from = if b.kind == B_ROW { b.from } else { this.runs.len };
+        b.to = if b.kind == B_ROW { b.to } else { this.runs.len };
+        this.blocks.push(b);
+        return &this.blocks.items[this.blocks.len - 1];
+    }
+
+    fn blockRuns(this: &Doc, b: &Block): []Run { return this.runs.items[b.from..b.to]; }
+    fn rowCells(this: &Doc, b: &Block): []Cell { return this.cells.items[b.from..b.to]; }
+    fn cellRuns(this: &Doc, c: Cell): []Run { return this.runs.items[c.from..c.to]; }
+}
+
+// A doc whose headers live in `parent`.
+pub fn create(parent: &Arena): Doc {
+    let mem = &parent.alloc::<Arena>(1)[0];
+    *mem = Arena.create(65536);
+    return Doc {
+        mem: mem, hl: highlight.create(parent), src: Text.new(mem),
+        blocks: List<Block>.new(mem), runs: List<Run>.new(mem), cells: List<Cell>.new(mem),
+    };
+}
+
+// `%20` and friends in a link target, into `out`.
+pub fn unescape(s: string, out: &Text) {
+    let i = 0;
+    while i < s.len {
+        if s[i] == 37 && i + 2 < s.len && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0 {
+            out.push(u8(hex(s[i + 1]) * 16 + hex(s[i + 2])));
+            i += 3;
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+}
+
+fn hex(c: u8): int {
+    if c >= 48 && c <= 57 { return int(c) - 48; }
+    if c >= 97 && c <= 102 { return int(c) - 87; }
+    if c >= 65 && c <= 70 { return int(c) - 55; }
+    return -1;
+}
+
+// `---`, `***`, `___` (3 or more, spaces allowed).
+fn isRule(line: string): bool {
+    let c = line[0];
+    if c != 45 && c != 42 && c != 95 { return false; }
+    let n = 0;
+    for x in line { if x == c { n += 1; } else if x != 32 { return false; } }
+    return n >= 3;
+}
+
+// `:--`, `:-:`, `--:` in a table's separator row.
+fn align(c: string): int {
+    if c.len > 1 && c[c.len - 1] == 58 { return if c[0] == 58 { CENTER } else { RIGHT }; }
+    return LEFT;
+}
+
+// The line ends a block it opened: the last tag on it is a closing block tag (`<h1>J3</h1>`).
+fn closesBlock(line: string): bool {
+    let k = line.len - 2;
+    while k > 0 && !(line[k] == 60 && line[k + 1] == 47) { k -= 1; }
+    if k <= 0 { return false; }
+    let t = mdhtml.at(line, k, line.len);
+    return t.closing && mdhtml.isBlock(t.name);
+}
+
+fn isDigits(s: string): bool {
+    for c in s { if c < 48 || c > 57 { return false; } }
+    return true;
+}
+
+fn firstWord(s: string): string {
+    let a = 0;
+    while a < s.len && s[a] == 32 { a += 1; }
+    let z = a;
+    while z < s.len && s[z] != 32 { z += 1; }
+    return s[a..z];
+}
+
+fn trim(s: string): string {
+    let a = 0;
+    let z = s.len;
+    while a < z && (s[a] == 32 || s[a] == 9) { a += 1; }
+    while z > a && (s[z - 1] == 32 || s[z - 1] == 9 || s[z - 1] == 13) { z -= 1; }
+    return s[a..z];
+}
+
+fn skipSpaces(s: string, i: int, end: int): int {
+    let k = i;
+    while k < end && s[k] == 32 { k += 1; }
+    return k;
+}
+
+fn find2(s: string, p: string): bool {
+    let k = 0;
+    while k + p.len <= s.len { if s[k..k + p.len] == p { return true; } k += 1; }
+    return false;
+}
+
+fn at(s: string, i: int, end: int): u8 { if i < end { return s[i]; } return 0; }
+
+// Self-check: every block kind, inline runs, tasks, tables, images, fences.
+pub fn selfTest(mem: &Arena) {
+    let d = create(mem);
+    d.parse("---\nt: 1\n---\n# Hi **b**\npara *i*\nmore `c`\n\n- [ ] task\n  2. sub [l](u.md)\n> q [[w|W]]\n---\n| a | b |\n|---|--:|\n| [[v]] | ![x](a%20b.png) |\n```j3\nlet x\n```", "/d");
+    let b = d.blocks.items[0..d.blocks.len];
+    check(b.len == 10, "count");
+    check(b[0].kind == B_CODE && d.blockRuns(&b[0]).len > 0, "front matter");
+    check(b[1].kind == B_HEADING && b[1].level == 1 && d.runs.items[b[1].from + 1].bold, "heading");
+    let p = d.blockRuns(&b[2]);
+    check(b[2].kind == B_PARA && p.len == 5 && p[1].italic && p[1].text == "i" && p[2].text == " " && p[4].code, "para joins lines");
+    check(b[3].kind == B_ITEM && b[3].check == 0 && d.src.str()[b[3].checkAt] == 32 && d.blockRuns(&b[3])[0].text == "task", "task");
+    let sub = d.blockRuns(&b[4]);
+    check(b[4].level == 1 && b[4].marker == "2." && sub[1].link && !sub[1].wiki && sub[1].href == "u.md" && sub[1].text == "l", "sub item, link");
+    check(b[5].kind == B_QUOTE && b[6].kind == B_RULE, "quote, rule");
+    check(b[7].kind == B_ROW && b[7].head && d.rowCells(&b[7]).len == 2 && d.rowCells(&b[7])[1].align == RIGHT, "header row");
+    let cs = d.rowCells(&b[8]);
+    let w = d.blockRuns(&b[5])[1];
+    let im = d.cellRuns(cs[1])[0];
+    check(w.wiki && w.href == "w" && w.text == "W", "wikilink alias");
+    check(d.cellRuns(cs[0])[0].wiki && cs[0].align == LEFT && cs[1].align == RIGHT, "cell wikilink, align");
+    check(im.kind == R_IMAGE && im.href == "/d/a b.png" && im.text == "x", "image");
+    check(b[9].kind == B_CODE, "fence");
+
+    // Nesting and README-style HTML.
+    d.parse("**a `b`** [`c`](u)\n<p align=\"center\">\n  <img src=\"l.svg\" width=\"96\"><br>\n  <a href=\"x\"><img src=\"https://b/s.svg\" alt=\"CI\"></a> <i>i</i> <!-- n -->\n</p>\n<h2 align=\"center\">T</h2>\n<sub>s</sub> a < b", "/d");
+    b = d.blocks.items[0..d.blocks.len];
+    check(b.len == 4, "html count");
+    let n = d.blockRuns(&b[0]);
+    check(n[0].bold && !n[0].code && n[1].bold && n[1].code && n[1].text == "b", "bold with code");
+    check(n[3].link && n[3].code && n[3].href == "u" && n[3].text == "c", "code in link");
+    let h = d.blockRuns(&b[1]);
+    check(b[1].kind == B_PARA && b[1].center, "centered p");
+    check(h[1].kind == R_IMAGE && h[1].href == "/d/l.svg" && h[1].width == "96px" && h[2].kind == R_BREAK, "img, br");
+    check(h.len == 8 && h[4].link && h[4].code && h[4].text == "CI" && h[4].href == "x", "badge in a, comment dropped");
+    check(h[6].italic && h[6].text == "i" && !h[7].italic && !h[7].link, "i, a close");
+    check(b[2].kind == B_HEADING && b[2].level == 2 && b[2].center, "h2");
+    let t = d.blockRuns(&b[3]);
+    check(b[3].kind == B_PARA && t[0].small && t[0].text == "s" && !t[1].small && t[1].text == " a < b", "sub, stray <");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`mddoc selfTest: {what}`); } }

@@ -1,0 +1,11 @@
+name = Makefile
+ext = mk mak make
+file = Makefile makefile GNUmakefile
+comment = #
+string = " " escape
+string = ' '
+region = variable $( )
+region = variable ${ }
+prefix = variable $
+keyword = ifeq ifneq ifdef ifndef else endif include define endef export override
+key = :

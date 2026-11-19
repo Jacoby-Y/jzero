@@ -1,0 +1,81 @@
+<script>
+    use jzero.state.State;
+    use jzero.actions;
+    use jzero.config.config;
+    use jzero.config.draft;
+    use jzero.features.links;
+    use jzero.session.paths;
+    props { state: &State; }
+    // Sidebar tabs, by index.
+    const TABS: [6]string = ["Appearance", "Colors", "Shell", "Behavior", "Explorer", "Keys"];
+    let tab = 0;
+    fn onMount() {
+        let dr = &state.draft;
+        draft.load(dr, &state.cfg, &state.themes, state.binds, state.defBinds);
+        for id in 0..actions.COUNT { dr.names.push(actions.name(id)); dr.titles.push(actions.title(id)); }
+    }
+    // Live preview: every change shows at once; the file is written on Save.
+    fn onFrame(dt: f32) {
+        if draft.apply(&state.draft, &state.cfg, &state.themes) { state.applyConfig(); }
+    }
+    fn save() {
+        if draft.check(&state.draft, &state.keyNames).len > 0 { return; }
+        draft.finish(&state.draft, &state.cfg, &state.themes);
+        if !config.save(&state.cfg, state.draft.mem) {
+            state.draft.message.clear();
+            state.draft.message.pushStr("Could not write the config file");
+            return;
+        }
+        state.reloadConfig();
+        state.settingsOpen = false;
+    }
+    // Drop the preview: back to the file.
+    fn cancel() {
+        state.reloadConfig();
+        state.settingsOpen = false;
+    }
+</script>
+<dialog modal class="settings" on:close={cancel()}>
+    <nav class="tabs">
+        <h2>Settings</h2>
+        {#each 0..6 as k}
+            <button class="tab" class:on={tab == k} on:click={tab = k}>{TABS[k]}</button>
+        {/each}
+    </nav>
+    <div class="side">
+        <div class="body">
+            {#match tab}
+            {:case 0}<settings.Appearance state={state} />
+            {:case 1}<settings.Colors state={state} />
+            {:case 2}<settings.Shell dr={&state.draft} />
+            {:case 3}<settings.Behavior dr={&state.draft} />
+            {:case 4}<settings.Explorer dr={&state.draft} />
+            {:else}<settings.Keys dr={&state.draft} />
+            {/match}
+        </div>
+        {#if state.draft.message.len() > 0}
+            <p class="error">{state.draft.message.str()}</p>
+        {/if}
+        <div class="actions">
+            <button title={paths.tilde(config.path())} on:click={links.open(config.path(), state.mem)}>Open config file</button>
+            <button title={paths.tilde(config.themesDir())} on:click={links.open(config.themesDir(), state.mem)}>Open themes folder</button>
+            <span class="gap"></span>
+            <button on:click={cancel()}>Cancel</button>
+            <button class="primary" default on:click={save()}>Save</button>
+        </div>
+    </div>
+</dialog>
+<style>
+    .settings { width: 760px; height: 560px; display: flex; flex-direction: row; background: var(--chrome-bg); color: var(--chrome-fg); }
+    .tabs { width: 160px; padding: 16px 0; display: flex; flex-direction: column; background: var(--divider); }
+    h2 { font-size: 16px; color: var(--c-bright-white); padding: 0 16px 12px 16px; }
+    .tab { height: 32px; padding: 0 16px; text-align: left; }
+    .tab.on { background: var(--chrome-active); color: var(--c-bright-white); }
+    .side { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 16px; gap: 10px; }
+    .body { flex: 1; min-height: 0; overflow-y: auto; }
+    .error { color: var(--chrome-danger); }
+    .actions { display: flex; flex-direction: row; gap: 8px; }
+    .actions button { height: 30px; padding: 0 12px; background: var(--chrome-hover); }
+    .actions .primary { background: var(--chrome-active); color: var(--c-bright-white); }
+    .gap { flex: 1; }
+</style>

@@ -1,0 +1,8 @@
+name = JSON
+ext = json jsonc json5 geojson webmanifest
+file = .babelrc .eslintrc .prettierrc
+comment = //
+comment = /* */
+string = " " escape
+constant = true false null
+key = : anywhere

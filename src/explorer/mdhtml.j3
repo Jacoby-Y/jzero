@@ -1,0 +1,79 @@
+module jzero.explorer.mdhtml;
+
+use j3.sys;
+
+// The bit of HTML a README uses (`<p align="center">`, `<img width>`, `<a href>`, `<br>`, `<sub>`), read as tags.
+// ponytail: one tag at a time, double-quoted attributes, no entities; a real HTML parser if docs need it.
+
+pub struct Tag {
+    end: int;            // past `>`
+    name: string;        // lowercase as written: "p", "img", "h1"
+    closing: bool;       // `</p>`
+    body: string;        // between the name and `>`: the attributes
+}
+
+// The tag starting at `s[i] == '<'`; `end` is -1 when it isn't one (`a < b`, an open `<`).
+pub fn at(s: string, i: int, end: int): Tag {
+    let none = Tag { end: -1, name: "", closing: false, body: "" };
+    let k = i + 1;
+    let closing = k < end && s[k] == 47;
+    if closing { k += 1; }
+    let n = k;
+    while n < end && isName(s[n]) { n += 1; }
+    if n == k || s[k] < 97 || s[k] > 122 { return none; }
+    let z = n;
+    while z < end && s[z] != 62 { if s[z] == 34 { z += 1; while z < end && s[z] != 34 { z += 1; } } z += 1; }
+    if z >= end { return none; }
+    return Tag { end: z + 1, name: s[k..n], closing: closing, body: s[n..z] };
+}
+
+// `<!-- ... -->` on one line: where it ends, or -1.
+pub fn comment(s: string, i: int, end: int): int {
+    if i + 4 > end || s[i..i + 4] != "<!--" { return -1; }
+    let k = i + 4;
+    while k + 3 <= end { if s[k..k + 3] == "-->" { return k + 3; } k += 1; }
+    return -1;
+}
+
+// `key="value"` in a tag's attributes ("" when missing).
+pub fn attr(t: Tag, key: string): string {
+    let b = t.body;
+    let k = 0;
+    while k + key.len + 2 <= b.len {
+        if (k == 0 || b[k - 1] == 32 || b[k - 1] == 9) && b[k..k + key.len] == key && b[k + key.len] == 61 && b[k + key.len + 1] == 34 {
+            let a = k + key.len + 2;
+            let z = a;
+            while z < b.len && b[z] != 34 { z += 1; }
+            return b[a..z];
+        }
+        k += 1;
+    }
+    return "";
+}
+
+// A tag that starts its own block (a paragraph or heading) rather than sitting in text.
+pub fn isBlock(name: string): bool {
+    return name == "p" || name == "div" || name == "center" || heading(name) > 0;
+}
+
+// 1-6 for `h1`..`h6`, else 0.
+pub fn heading(name: string): int {
+    if name.len == 2 && name[0] == 104 && name[1] >= 49 && name[1] <= 54 { return int(name[1]) - 48; }
+    return 0;
+}
+
+fn isName(c: u8): bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57); }
+
+pub fn selfTest() {
+    let s = "x <img src=\"a b.png\" width=\"96\" alt=\"J3 >\"> </p> a < b <!-- c -->";
+    let t = at(s, 2, s.len);
+    check(t.name == "img" && !t.closing && attr(t, "src") == "a b.png" && attr(t, "width") == "96" && attr(t, "alt") == "J3 >", "img attrs");
+    check(attr(t, "rc") == "" && s[t.end - 1] == 62, "attr edges");
+    let c = at(s, t.end + 1, s.len);
+    check(c.name == "p" && c.closing, "closing");
+    check(at(s, c.end + 3, s.len).end == -1, "not a tag");
+    check(comment(s, s.len - 10, s.len) == s.len, "comment");
+    check(isBlock("h2") && heading("h2") == 2 && !isBlock("a") && heading("hr") == 0, "block tags");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`mdhtml selfTest: {what}`); } }

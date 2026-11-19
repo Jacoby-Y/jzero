@@ -1,0 +1,152 @@
+module jzero.explorer.thumbs;
+
+use j3.game;
+use j3.game.{ Rgba, Texture };
+use j3.gfx.canvas.{ Canvas, Mode };
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.text.Text;
+
+const SIDE = 192;  // longest thumbnail side, px
+const MAX = 256;   // textures kept; the least recently drawn one goes first
+
+const PENDING = 0;
+const READY = 1;
+const FAILED = 2;
+
+struct Thumb {
+    path: Text;
+    tex: Texture;
+    state: int = 0;
+    wanted: int = 0;  // frame it was last asked for
+}
+
+// Small textures of image files for the grid view, made on demand one per frame.
+// ponytail: decodes on the frame thread (j3.game.loadRgba is main-thread only); a big JPEG
+// costs a frame. A worker when j3c gets a thread-safe decoder for every SDL_image format.
+pub struct Thumbs {
+    mem: &Arena;      // paths; rewound by `clear`
+    items: List<Thumb>;
+    decode: &Arena;   // full-size pixels while shrinking; destroyed when nothing is pending
+    decoding: bool = false;
+
+    // The thumbnail of `path` (empty while it is made or when it cannot be read).
+    fn get(this: &Thumbs, path: string): Texture {
+        let now = game.frameCount();
+        for i in 0..this.items.len {
+            let t = &this.items.items[i];
+            if t.path.str() == path { t.wanted = now; return t.tex; }
+        }
+        let slot = this.slotFor();
+        slot.path.clear();
+        slot.path.pushStr(path);
+        slot.tex = Texture {};
+        slot.state = PENDING;
+        slot.wanted = now;
+        return slot.tex;
+    }
+
+    // A fresh slot, or the least recently drawn one freed for reuse.
+    fn slotFor(this: &Thumbs): &Thumb {
+        if this.items.len < MAX {
+            this.items.push(Thumb { path: Text.new(this.mem), tex: Texture {} });
+            return &this.items.items[this.items.len - 1];
+        }
+        let old = 0;
+        for i in 1..this.items.len { if this.items.items[i].wanted < this.items.items[old].wanted { old = i; } }
+        let t = &this.items.items[old];
+        if t.tex.w > 0 { game.destroyTexture(t.tex); }
+        return t;
+    }
+
+    // Make one thumbnail asked for in the last frames. True while more wait (keep the loop awake).
+    fn step(this: &Thumbs): bool {
+        let now = game.frameCount();
+        let next = -1;
+        for i in 0..this.items.len {
+            let t = &this.items.items[i];
+            if t.state == PENDING && now - t.wanted <= 2 { next = i; break; }
+        }
+        if next < 0 {
+            if this.decoding { this.decode.destroy(); this.decoding = false; }
+            return false;
+        }
+        if !this.decoding { *this.decode = Arena.create(1048576); this.decoding = true; }
+        let t = &this.items.items[next];
+        let mark = this.decode.checkpoint();
+        let src = game.loadRgba(t.path.str(), this.decode);
+        if src.pixels.len == 0 {
+            t.state = FAILED;
+        } else {
+            let c = shrink(src, this.decode);
+            t.tex = game.textureFromCanvas(c);
+            t.state = READY;
+        }
+        this.decode.rewind(mark);
+        return true;
+    }
+
+    fn clear(this: &Thumbs) {
+        for i in 0..this.items.len {
+            let t = &this.items.items[i];
+            if t.tex.w > 0 { game.destroyTexture(t.tex); }
+        }
+        this.mem.rewind(0);
+        this.items = List<Thumb>.new(this.mem);
+        if this.decoding { this.decode.destroy(); this.decoding = false; }
+    }
+
+    fn destroy(this: &Thumbs) {
+        this.clear();
+        this.mem.destroy();
+    }
+}
+
+// Thumbnails with their own arena, headers allocated in `parent`.
+pub fn create(parent: &Arena): Thumbs {
+    let mem = &parent.alloc::<Arena>(1)[0];
+    *mem = Arena.create(65536);
+    let decode = &parent.alloc::<Arena>(1)[0];
+    return Thumbs { mem: mem, items: List<Thumb>.new(mem), decode: decode };
+}
+
+// `src` scaled down so its longest side is at most SIDE: each output pixel averages a 2x2 grid of
+// samples in its source cell. ponytail: 4 samples, not a full box filter; fine at thumbnail size.
+pub fn shrink(src: Rgba, mem: &Arena): Canvas {
+    let w = int(src.w);
+    let h = int(src.h);
+    let ow = w;
+    let oh = h;
+    if w >= h && w > SIDE { ow = SIDE; oh = h * SIDE / w; }
+    if h > w && h > SIDE { oh = SIDE; ow = w * SIDE / h; }
+    if ow < 1 { ow = 1; }
+    if oh < 1 { oh = 1; }
+    let c = Canvas.create(mem, i32(ow), i32(oh), Mode.Smooth);
+    for y in 0..oh {
+        for x in 0..ow {
+            let sum: [4]int = [0, 0, 0, 0];
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let px = (x * 4 + sx * 2 + 1) * w / (ow * 4);
+                    let py = (y * 4 + sy * 2 + 1) * h / (oh * 4);
+                    let at = (py * w + px) * 4;
+                    for k in 0..4 { sum[k] += int(src.pixels[at + k]); }
+                }
+            }
+            let o = (y * ow + x) * 4;
+            for k in 0..4 { c.pixels[o + k] = u8(sum[k] / 4); }
+        }
+    }
+    return c;
+}
+
+pub fn selfTest(mem: &Arena) {
+    let px = mem.alloc::<u8>(400 * 100 * 4);
+    for i in 0..px.len { px[i] = 200; }
+    let c = shrink(Rgba { pixels: px, w: 400, h: 100 }, mem);
+    check(c.w == 192 && c.h == 48 && c.pixels[0] == 200, "shrink wide");
+    let s = shrink(Rgba { pixels: px[0..10 * 10 * 4], w: 10, h: 10 }, mem);
+    check(s.w == 10 && s.h == 10, "small stays");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`thumbs selfTest: {what}`); } }

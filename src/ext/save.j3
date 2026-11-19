@@ -1,0 +1,128 @@
+module jzero.ext.save;
+
+// `pane.saved`: an extension pane's value kept across restarts and reloads. Written as a j2
+// literal (`<data>/ext/<pane id>`) and read back by the VM itself, so there is no parser here.
+// Kept: nil, bools, numbers, strings, arrays, tables with name keys. Functions become nil.
+
+use j3.io;
+use j3.j2;
+use j3.j2.{ Limits, Value, Vm };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+
+const MAX_DEPTH = 32;   // deeper (or cyclic) parts are written as nil
+
+// Write `v` to `path` (the file is removed when `v` is nil).
+pub fn write(path: string, v: Value) {
+    if v.isNil() { io.remove(path); return; }
+    let t = Text.scratch();
+    encode(t, v, 0);
+    io.writeFile(path, t.bytes[0..t.len()]);
+}
+
+// The value in `path`, nil when missing or unreadable.
+pub fn read(vm: &Vm, path: string): Value {
+    let mem = Arena.create(4096);
+    let v = j2.nil();
+    match io.readFile(path, &mem) {
+        Result.Ok(bytes) { v = decode(vm, bytes as string); }
+        Result.Err(_) {}
+    }
+    mem.destroy();
+    return v;
+}
+
+pub fn decode(vm: &Vm, lit: string): Value {
+    let src = Text.scratch();
+    src.pushStr("pub let v = ");
+    src.pushStr(lit);
+    src.pushStr(";");
+    match vm.loadString("saved", src.str()) {
+        Result.Ok(exports) { return exports.asTable().get("v"); }
+        Result.Err(_) { return j2.nil(); }
+    }
+}
+
+pub fn encode(t: &Text, v: Value, depth: int) {
+    if depth > MAX_DEPTH { t.pushStr("nil"); return; }
+    if v.tag == j2.T_BOOL || v.tag == j2.T_INT { j2.fmtValue(t, v); return; }
+    match v.tag {
+        j2.T_FLOAT {
+            let from = t.len();
+            j2.fmtValue(t, v);
+            let out = t.str();
+            if !hasAny(out[from..out.len], ".enN") { t.pushStr(".0"); }  // stays a float
+        }
+        j2.T_STR { quote(t, v.asStr()); }
+        j2.T_ARRAY {
+            t.push(91);
+            let a = j2.arrOf(v).values();
+            for i in 0..a.len {
+                if i > 0 { t.pushStr(", "); }
+                encode(t, a[i], depth + 1);
+            }
+            t.push(93);
+        }
+        j2.T_TABLE {
+            t.push(123);
+            let tb = j2.tableOf(v);
+            let first = true;
+            let i = tb.next(0);
+            while i >= 0 {
+                let e = tb.entries()[i];
+                // ponytail: only name keys (`{ a: 1 }`); other keys are dropped
+                if e.key.tag == j2.T_STR && isName(e.key.asStr()) {
+                    if !first { t.pushStr(", "); }
+                    first = false;
+                    t.pushStr(e.key.asStr());
+                    t.pushStr(": ");
+                    encode(t, e.val, depth + 1);
+                }
+                i = tb.next(i + 1);
+            }
+            t.push(125);
+        }
+        _ { t.pushStr("nil"); }
+    }
+}
+
+fn quote(t: &Text, s: string) {
+    t.push(34);
+    for i in 0..s.len {
+        let c = s[i];
+        if c == 34 || c == 92 { t.push(92); t.push(c); }
+        else if c == 10 { t.pushStr("\\n"); }
+        else if c == 13 { t.pushStr("\\r"); }
+        else if c == 9 { t.pushStr("\\t"); }
+        else { t.push(c); }
+    }
+    t.push(34);
+}
+
+fn isName(s: string): bool {
+    if s.len == 0 { return false; }
+    for i in 0..s.len {
+        let c = s[i];
+        let alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+        if !alpha && !(i > 0 && c >= 48 && c <= 57) { return false; }
+    }
+    return true;
+}
+
+fn hasAny(s: string, chars: string): bool {
+    for i in 0..s.len { for j in 0..chars.len { if s[i] == chars[j] { return true; } } }
+    return false;
+}
+
+// Self-check: a literal survives decode → encode unchanged.
+pub fn selfTest(mem: &Arena) {
+    let vm = &mem.alloc::<Vm>(1)[0];
+    *vm = Vm.new(mem, Limits { heapBytes: 1 << 20, stepsPerCall: 100000 });
+    vm.openLibs(j2.LIB_ALL);
+    let lit = "{a: 1, b: 2.5, c: 3.0, s: \"q\\\"\\\\\\n\", xs: [true, false, nil, -4], t: {}}";
+    let t = Text.new(mem);
+    encode(&t, decode(vm, lit), 0);
+    if t.str() != lit { sys.panic(`ext save selfTest: {t.str()}`); }
+}

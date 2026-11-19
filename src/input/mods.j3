@@ -1,0 +1,18 @@
+module jzero.input.mods;
+
+use j3.game.{ Key, keyDownRaw };
+
+pub const CTRL = 1;
+pub const SHIFT = 2;
+pub const ALT = 4;
+pub const SUPER = 8;
+
+// Modifier bits held right now (sees keys a UI text box has taken too).
+pub fn held(): int {
+    let m = 0;
+    if keyDownRaw(Key.Ctrl) || keyDownRaw(Key.CtrlRight) { m |= CTRL; }
+    if keyDownRaw(Key.Shift) || keyDownRaw(Key.ShiftRight) { m |= SHIFT; }
+    if keyDownRaw(Key.Alt) || keyDownRaw(Key.AltRight) { m |= ALT; }
+    if keyDownRaw(Key.Super) { m |= SUPER; }
+    return m;
+}

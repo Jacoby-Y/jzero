@@ -1,0 +1,100 @@
+module jzero.features.links;
+
+use j3.memory.Arena;
+use j3.sys;
+use j3.term.Cell;
+use j3.term.ansi.{ Parser, feed };
+use j3.term.grid.Grid;
+use j3.text.{ Text, find };
+use jzero.platform.desktop;
+
+const SCHEMES: [4]string = ["https://", "http://", "file://", "ftp://"];
+// Bytes that end a plain URL.
+const STOPS = " \t\"'`<>|{}^\\";
+// Trailing characters dropped from a plain URL (sentence punctuation).
+const TRAIL = ".,;:!?)]'";
+
+// The link under column `col` of grid line `line`: an OSC 8 hyperlink, else a plain URL in
+// the text. Writes its URI to `uri` and returns its columns [lo, hi); hi <= lo for none.
+pub fn at(g: &Grid, line: int, col: int, uri: &Text): [2]int {
+    let none: [2]int = [0, 0];
+    let cells = g.line(line);
+    if col < 0 || col >= cells.len { return none; }
+    let id = int(cells[col].link);
+    if id != 0 {
+        let r: [2]int = [col, col + 1];
+        while r[0] > 0 && int(cells[r[0] - 1].link) == id { r[0] -= 1; }
+        while r[1] < cells.len && int(cells[r[1]].link) == id { r[1] += 1; }
+        uri.pushStr(g.linkUri(id));
+        return r;
+    }
+    let text = Text.scratch();
+    for c in cells { text.push(asciiOf(c)); }
+    return plainUrl(text.str(), col, uri);
+}
+
+// One byte per cell: ASCII as is, anything else 1 (never part of a URL).
+fn asciiOf(c: Cell): u8 {
+    if c.cp == 0 { return 32; }
+    if c.cp < 127 && c.cp >= 32 { return u8(c.cp); }
+    return 1;
+}
+
+fn plainUrl(s: string, col: int, uri: &Text): [2]int {
+    let r: [2]int = [0, 0];
+    for scheme in SCHEMES {
+        let from = 0;
+        while from < s.len {
+            let k = find(s[from..s.len], scheme);
+            if k < 0 { break; }
+            let lo = from + k;
+            let hi = lo + scheme.len;
+            while hi < s.len && !isStop(s[hi]) { hi += 1; }
+            while hi > lo + scheme.len && contains(TRAIL, s[hi - 1]) { hi -= 1; }
+            if col >= lo && col < hi && hi > lo + scheme.len {
+                uri.pushStr(s[lo..hi]);
+                r[0] = lo;
+                r[1] = hi;
+                return r;
+            }
+            from = hi;
+        }
+    }
+    return r;
+}
+
+fn isStop(b: u8): bool { return b < 32 || contains(STOPS, b); }
+
+fn contains(set: string, b: u8): bool {
+    for i in 0..set.len { if set[i] == b { return true; } }
+    return false;
+}
+
+// Open `uri` (or a path) with the desktop's handler, detached.
+pub fn open(uri: string, mem: &Arena) { desktop.open(uri, mem); }
+
+// Self-check: plain URLs with trailing punctuation, OSC 8 links.
+pub fn selfTest(mem: &Arena) {
+    let g = Grid.new(mem, 60, 3, 0);
+    let p = Parser.new(mem);
+    feed(&p, "see https://example.com/a?b=1. and (http://x.y)", &g);
+    let u = Text.new(mem);
+    let r = at(&g, 0, 10, &u);
+    check(r[0] == 4 && r[1] == 29 && u.str() == "https://example.com/a?b=1", u.str());
+    u.clear();
+    r = at(&g, 0, 40, &u);
+    check(u.str() == "http://x.y", u.str());
+    u.clear();
+    r = at(&g, 0, 2, &u);
+    check(r[1] <= r[0], "no link");
+    let osc = Text.new(mem);
+    osc.push(27); osc.pushStr("]8;;https://osc.example"); osc.push(7);
+    osc.pushStr("\r\nclick");
+    osc.push(27); osc.pushStr("]8;;"); osc.push(7);
+    feed(&p, osc.str(), &g);
+    u.clear();
+    r = at(&g, 1, 2, &u);
+    check(r[0] == 0 && r[1] == 5 && u.str() == "https://osc.example", u.str());
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`links selfTest: {what}`); } }

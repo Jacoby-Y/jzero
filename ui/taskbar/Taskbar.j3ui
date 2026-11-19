@@ -1,0 +1,95 @@
+<script>
+    use j3.build;
+    use jzero.state.{ State, OCEAN };
+    props { state: &State; }
+
+    let pickOpen = false;
+
+    // The plus button: closed islands, most recently used first, under a plus for a new one.
+    fn togglePick() {
+        pickOpen = !pickOpen;
+        if !pickOpen { return; }
+        state.islands.byUse(&state.recent);
+        let k = 0;
+        for j in 0..state.recent.len {
+            let i = state.recent.items[j];
+            if !state.islands.get(i).open { state.recent.items[k] = i; k += 1; }
+        }
+        state.recent.len = k;
+    }
+
+    fn pick(i: int) {
+        pickOpen = false;
+        state.hideViews();
+        state.openIsland(if i < 0 { state.newIsland() } else { i });
+    }
+
+    // A pane dropped here moves to this island; another taskbar icon takes this one's place.
+    fn dropped(data: string, from: int, i: int) {
+        if data == "pane" { state.movePane(from, i); }
+        else if data == "island" { state.moveIsland(from, i); }
+    }
+</script>
+
+<nav class="bar">
+    {#if build.DEV}
+        <div class="notch top"></div>
+        <div class="notch bottom"></div>
+    {/if}
+    <button class="item ocean" title="Ocean" class:active={state.active == OCEAN && !state.viewOpen()} on:click={state.hideViews(); state.active = OCEAN}>
+        <icon name="ocean-fish" />
+    </button>
+    <div class="sep"></div>
+    {#each state.islands.all() as isl, i}
+        {#if isl.open}
+            <button class="item isl tag-{isl.tag}" class:active={state.active == i && !state.viewOpen()}
+                draggable drag-data="island" drag-id={i}
+                on:click={state.hideViews(); state.active = i} on:drop={dropped(data, dragId, i)}
+                on:mousedown={if button == 1 { state.requestCloseIsland(i); }}>
+                <IslandIcon icon={isl.icon} />
+                <span class="tip">{isl.name.str()}</span>
+                {#if isl.unseen}
+                    <div class="dot"></div>
+                {/if}
+            </button>
+        {/if}
+    {/each}
+    <div class="host">
+        <button class="item" title="Open or new island" class:active={pickOpen} on:click={togglePick()}><icon name="plus-lg" /></button>
+        {#if pickOpen}
+            <div class="pick" popover on:close={pickOpen = false}>
+                <button class="item" menuitem title="New island" on:click={pick(-1)}><icon name="plus-lg" /></button>
+                {#each 0..state.recent.len as k}
+                    {#let isl = state.islands.get(state.recent.items[k])}
+                    <button class="item isl tag-{isl.tag}" menuitem on:click={pick(state.recent.items[k])}><IslandIcon icon={isl.icon} /><span class="tip">{isl.name.str()}</span></button>
+                {/each}
+            </div>
+        {/if}
+    </div>
+    <div class="spacer"></div>
+    <button class="item" title="Kanban" class:active={state.kanbanOpen} on:click={state.toggleKanban()}><icon name="kanban" /></button>
+    <button class="item" title="Notes" class:active={state.notesOpen} on:click={state.toggleNotes()}><icon name="journal-text" /></button>
+    <button class="item" title="Settings" on:click={state.settingsOpen = true}><icon name="gear" /></button>
+</nav>
+
+<style>
+    .bar { position: relative; width: 52px; display: flex; flex-direction: column; align-items: center; padding: 8px 0; gap: 4px; background: var(--chrome-bg); }
+    .item { width: 40px; height: 40px; font-size: 18px; display: flex; align-items: center; justify-content: center; }
+    .item.active { background: var(--chrome-active); color: var(--c-bright-white); }
+    .isl { position: relative; }
+    .host { position: relative; }
+    .tip { display: none; position: absolute; left: 100%; top: 8px; margin-left: 6px; z-index: 10; padding: 2px 8px; white-space: nowrap; font-size: 13px; color: var(--c-white); background: var(--chrome-active); }  /* instant hover name, unlike title's delay */
+    .isl:hover > .tip { display: block; }
+    .pick { position: absolute; left: 100%; top: 0; padding: 4px 6px; display: flex; flex-direction: column; gap: 4px; background: var(--chrome-bg); }
+    .pick .item:hover, .pick .item:focus { background: var(--chrome-hover); }
+    .isl:drop-target { background: var(--chrome-hover); }
+    .dot { position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; background: var(--c-bright-yellow); }
+    .tag-1 { color: var(--c-red); } .tag-2 { color: var(--c-green); } .tag-3 { color: var(--c-yellow); }
+    .tag-4 { color: var(--c-blue); } .tag-5 { color: var(--c-magenta); } .tag-6 { color: var(--c-cyan); }
+    .ocean { color: var(--c-bright-blue); }
+    .sep { width: 28px; height: 1px; margin: 4px 0; background: var(--chrome-hover); }
+    .spacer { flex: 1; }
+    .notch { position: absolute; left: 0; width: 8px; height: 8px; background: var(--c-bright-cyan); }  /* dev build marker */
+    .notch.top { top: 0; clip-path: polygon(0 0, 100% 0, 0 100%); }
+    .notch.bottom { bottom: 0; clip-path: polygon(0 0, 0 100%, 100% 100%); }
+</style>

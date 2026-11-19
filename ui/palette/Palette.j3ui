@@ -1,0 +1,92 @@
+<script>
+    use jzero.state.State;
+    use jzero.actions;
+    use jzero.features.palette;
+    use jzero.theme.theme;
+    use j3.game.{ Key, keyPressedRaw };
+    props { state: &State; }
+
+    const ROWS = 12;
+
+    let query = "";
+    let hl = 0;
+    let picked = false;
+    let started = false;
+
+    fn onFrame(dt: f32) {
+        let pal = &state.palette;
+        // Start from the query the opener set (e.g. "SSH: "). onFrame runs before onMount.
+        if !started { started = true; query = pal.query.str(); }
+        if query != pal.query.str() {
+            if pal.mode == palette.FOUND { actions.fillFound(state, query); } else { pal.filter(query); }
+            hl = 0;
+        }
+        if keyPressedRaw(Key.Down) && hl + 1 < pal.shown.len { hl += 1; }
+        if keyPressedRaw(Key.Up) && hl > 0 { hl -= 1; }
+        preview();
+    }
+
+    // A highlighted theme shows at once; anything else shows the saved one.
+    fn preview() {
+        let pal = &state.palette;
+        if hl < pal.shown.len && pal.get(hl).kind == palette.THEME { theme.show(&state.themes, pal.get(hl).id); }
+        else { theme.show(&state.themes, state.cfg.theme); }
+    }
+
+    fn run() {
+        if hl >= state.palette.shown.len { return; }
+        picked = true;
+        actions.pick(state, state.palette.get(hl));
+    }
+
+    fn close() {
+        if !picked { theme.show(&state.themes, state.cfg.theme); }
+        state.paletteOpen = false;
+    }
+
+    fn placeholder(): string {
+        if state.palette.mode == palette.FOUND { return "Search output and commands of every island…"; }
+        return "Type a command, theme, island…";
+    }
+
+    // First row shown, so the highlight stays in the window of ROWS.
+    fn first(): int {
+        if hl < ROWS { return 0; }
+        return hl - ROWS + 1;
+    }
+
+    fn last(): int {
+        let n = state.palette.shown.len;
+        if first() + ROWS < n { return first() + ROWS; }
+        return n;
+    }
+</script>
+
+<dialog modal autoselect class="palette" on:close={close()}>
+    <input type="text" class="query" placeholder={placeholder()} bind:value={query} on:submit={run()} />
+    <div class="list">
+        {#each first()..last() as k}
+            <div class="row" class:hl={k == hl} on:mousemove={hl = k} on:click={hl = k; run()}>
+                <span class="lbl">{state.palette.get(k).label.str()}</span>
+                {#if state.palette.get(k).kind == palette.ACTION}
+                    <span class="key">{state.hint(state.palette.get(k).id)}</span>
+                {/if}
+            </div>
+        {/each}
+        {#if state.palette.shown.len == 0}
+            <div class="row none">{if state.palette.mode == palette.FOUND && query.len < 2 { "Type to search every pane's output and commands" } else { "No matches" }}</div>
+        {/if}
+    </div>
+</dialog>
+
+<style>
+    .palette { width: 520px; margin-top: 80px; display: flex; flex-direction: column; background: var(--chrome-bg); color: var(--chrome-fg); }
+    .query { height: 38px; padding: 0 12px; background: var(--chrome-hover); color: var(--c-bright-white); border: none; }
+    .list { display: flex; flex-direction: column; padding: 4px 0; }
+    .row { height: 28px; padding: 0 12px; display: flex; align-items: center; white-space: pre; overflow: hidden; }
+    .row.hl { background: var(--chrome-active); color: var(--c-bright-white); }
+    .lbl { flex: 1; min-width: 0; overflow: hidden; }
+    .key { margin-left: 12px; color: var(--c-bright-black); }
+    .row.hl .key { color: var(--c-white); }
+    .none { color: var(--c-bright-black); }
+</style>

@@ -1,0 +1,235 @@
+module jzero.devhook;
+
+use j3.build;
+use j3.game;
+use j3.game.{ Key, Mouse, frameCount };
+use jzero.input.keynames;
+use jzero.input.keynames.KeyNames;
+use jzero.input.mods;
+use j3.option.Option;
+use j3.sys;
+use j3.text.find;
+use j3.ui.dom.Dom;
+use j3.ui.testkit;
+use jzero.actions;
+use jzero.state.State;
+
+// Dev builds only: drive the app from env vars for headless checks.
+//   JZERO_ACTIONS="island:0,split_right,type:ls\n"  run once at frame 5 (or JZERO_AT):
+//     island:N opens island N, type:TEXT writes TEXT (\n = Enter) to the focused shell,
+//     wait:N runs the rest N frames later, select:N shows the ocean with island N selected, find:TEXT searches the focused shell for TEXT,
+//     found:TEXT opens "search everything" for TEXT, template:NAME opens a template, ext:NAME opens extension NAME (replaces the focused pane unless busy), exrow:N clicks row N of the focused explorer, selrow:N selects screen row N of the focused shell, menu opens the right-click menu,
+//     anything else is an action name (`actions.name`).
+pub fn frame(s: &State) {
+    if !build.DEV { return; }
+    let at = 5;
+    if sys.env("JZERO_AT").len > 0 { at = num(sys.env("JZERO_AT")); }
+    let f = frameCount();
+    if f == at { RESUME_FROM = 0; }
+    else if f != RESUME_AT { return; }
+    RESUME_AT = -1;
+    let all = sys.env("JZERO_ACTIONS");
+    let list = all[RESUME_FROM..all.len];
+    while list.len > 0 {
+        let end = find(list, ",");
+        if end < 0 { end = list.len; }
+        let cmd = list[0..end];
+        let rest = "";
+        if end < list.len { rest = list[end + 1..list.len]; }
+        if startsWith(cmd, "wait:") {
+            // the rest of the list runs N frames later
+            RESUME_AT = f + num(cmd[5..cmd.len]);
+            RESUME_FROM = all.len - rest.len;
+            return;
+        }
+        step(s, cmd);
+        list = rest;
+    }
+}
+
+#[singleton] let RESUME_AT: int = -1;   // frame a `wait:N` continues at
+#[singleton] let RESUME_FROM: int = 0;  // where in JZERO_ACTIONS it continues
+
+fn step(s: &State, cmd: string) {
+    if startsWith(cmd, "island:") {
+        s.openIsland(num(cmd[7..cmd.len]));
+    } else if startsWith(cmd, "type:") {
+        typeText(s, cmd[5..cmd.len]);
+
+    } else if startsWith(cmd, "selrow:") {
+        withTerm(s, num(cmd[7..cmd.len]));
+    } else if startsWith(cmd, "select:") {
+        s.active = -1;
+        s.selected = num(cmd[7..cmd.len]);
+    } else if startsWith(cmd, "exrow:") {
+        match s.current() {
+            Option.Some(isl) {
+                let n = isl.panes.get(isl.panes.focus);
+                if n.hasExplorer() { n.explorer().activate(num(cmd[6..cmd.len])); }
+            }
+            Option.None {}
+        }
+    } else if startsWith(cmd, "find:") {
+        match s.current() {
+            Option.Some(isl) {
+                match isl.panes.focusedTerm() {
+                    Option.Some(t) {
+                        t.find.query = cmd[5..cmd.len];
+                        t.openSearch();
+                    }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+    } else if startsWith(cmd, "ext:") {
+        s.splitExt(cmd[4..cmd.len]);
+    } else if startsWith(cmd, "template:") {
+        s.openTemplate(cmd[9..cmd.len]);
+    } else if startsWith(cmd, "found:") {
+        actions.run(s, actions.SEARCH_ALL);
+        actions.fillFound(s, cmd[6..cmd.len]);
+    } else if cmd == "menu" {
+        s.openMenu(300.0, 200.0);
+    } else {
+        actions.run(s, actions.byName(cmd));
+    }
+}
+
+fn typeText(s: &State, text: string) {
+    match s.current() {
+        Option.Some(isl) {
+            match isl.panes.focusedTerm() {
+                Option.Some(t) {
+                    // `\n` in the env var arrives as two characters; send Enter instead.
+                    let i = 0;
+                    while i < text.len {
+                        if text[i] == 92 && i + 1 < text.len && text[i + 1] == 110 {
+                            t.write("\r" as []u8);
+                            i += 2;
+                        } else {
+                            t.write(text[i..i + 1] as []u8);
+                            i += 1;
+                        }
+                    }
+                }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+}
+
+fn startsWith(s: string, p: string): bool { return s.len >= p.len && s[0..p.len] == p; }
+
+fn withTerm(s: &State, row: int) {
+    match s.current() {
+        Option.Some(isl) {
+            match isl.panes.focusedTerm() {
+                Option.Some(t) {
+                    let l = t.grid.scrollbackLen() + row;
+                    t.sel.press(&t.grid, l, 0, 0);
+                    t.sel.press(&t.grid, l, 0, 1);
+                    t.sel.press(&t.grid, l, 0, 2);
+                    t.sel.release();
+                }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+}
+
+fn num(s: string): int {
+    let v = 0;
+    for i in 0..s.len { v = v * 10 + int(s[i] - 48); }
+    return v;
+}
+
+// `JZERO_UI="10:home,14:home,30:tag:select:0"`: at each frame, click the element showing that
+// text (`tag:<tag>:<k>`: the k-th element with that tag). Real input, as from SDL (reaches panes,
+// programs and extensions too): `xy:<x>:<y>` a left press at window pixel x,y, released the next
+// frame; `tap:<x>:<y>` pressed and released in one frame (touchpad tap); `rxy:<x>:<y>` like `xy:` with the right button; `wheel:<x>:<y>:<n>` n notches (negative =
+// down); `drag:<x1>:<y1>:<x2>:<y2>` a left drag over 6 frames; `text:TEXT` types it; `key:ctrl+shift+p` presses a combo. Call every frame.
+pub fn ui(d: &Dom, names: &KeyNames) {
+    if !build.DEV { return; }
+    let f = frameCount();
+    let list = sys.env("JZERO_UI");
+    while list.len > 0 {
+        let end = find(list, ",");
+        if end < 0 { end = list.len; }
+        let item = list[0..end];
+        let colon = find(item, ":");
+        if colon > 0 {
+            let at = num(item[0..colon]);
+            let what = item[colon + 1..item.len];
+            if startsWith(what, "xy:") {
+                if f == at || f == at + 1 { press(what[3..what.len], Mouse.Left, f == at); }
+            } else if startsWith(what, "tap:") {
+                if f == at { press(what[4..what.len], Mouse.Left, true); game.simButton(Mouse.Left, false); }
+            } else if startsWith(what, "rxy:") {
+                if f == at || f == at + 1 { press(what[4..what.len], Mouse.Right, f == at); }
+            } else if startsWith(what, "drag:") {
+                if f >= at && f <= at + 6 { drag(what[5..what.len], f - at); }
+            } else if startsWith(what, "wheel:") {
+                if f == at { wheel(what[6..what.len]); }
+            } else if startsWith(what, "text:") {
+                if f == at { game.simText(what[5..what.len]); }
+            } else if startsWith(what, "key:") {
+                if f == at || f == at + 1 { simCombo(names, what[4..what.len], f == at); }
+            } else if startsWith(what, "tag:") {
+                let rest = what[4..what.len];
+                let c2 = find(rest, ":");
+                testkit.clickTag(d, f, at, rest[0..c2], num(rest[c2 + 1..rest.len]));
+            } else {
+                testkit.clickText(d, f, at, what);
+            }
+        }
+        if end == list.len { break; }
+        list = list[end + 1..list.len];
+    }
+}
+
+// `x:y`: the cursor there, `btn` down (or up).
+fn press(xy: string, btn: Mouse, down: bool) {
+    let c = find(xy, ":");
+    game.simMouse(f32(num(xy[0..c])), f32(num(xy[c + 1..xy.len])));
+    game.simButton(btn, down);
+}
+
+// `x1:y1:x2:y2` left-drag, step `k` of 0..6: down at the start, moving, up at the end.
+fn drag(spec: string, k: int) {
+    let v: [4]int = [0, 0, 0, 0];
+    let rest = spec;
+    for i in 0..4 {
+        let c = find(rest, ":");
+        if c < 0 { c = rest.len; }
+        v[i] = num(rest[0..c]);
+        if c < rest.len { rest = rest[c + 1..rest.len]; }
+    }
+    let t = f32(k) / 6.0;
+    game.simMouse(f32(v[0]) + f32(v[2] - v[0]) * t, f32(v[1]) + f32(v[3] - v[1]) * t);
+    if k == 0 { game.simButton(Mouse.Left, true); }
+    if k == 6 { game.simButton(Mouse.Left, false); }
+}
+
+// `x:y:n`: the cursor there, `n` wheel notches (`-n` down).
+fn wheel(xyn: string) {
+    let c = find(xyn, ":");
+    let rest = xyn[c + 1..xyn.len];
+    let c2 = find(rest, ":");
+    game.simMouse(f32(num(xyn[0..c])), f32(num(rest[0..c2])));
+    let n = rest[c2 + 1..rest.len];
+    if startsWith(n, "-") { game.simWheel(-f32(num(n[1..n.len]))); } else { game.simWheel(f32(num(n))); }
+}
+
+// A combo's modifiers and key down (or up), as if from the keyboard.
+fn simCombo(names: &KeyNames, combo: string, down: bool) {
+    let m = 0;
+    let key = Key.A;
+    if !keynames.parseCombo(names, combo, &m, &key) { return; }
+    if (m & mods.CTRL) != 0 { game.simKey(Key.Ctrl, down); }
+    if (m & mods.SHIFT) != 0 { game.simKey(Key.Shift, down); }
+    if (m & mods.ALT) != 0 { game.simKey(Key.Alt, down); }
+    game.simKey(key, down);
+}

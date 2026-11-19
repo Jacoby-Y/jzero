@@ -1,0 +1,62 @@
+module jzero.session.paths;
+
+use j3.io;
+use j3.text.Text;
+use jzero.platform.os;
+
+// App state lives in `$XDG_DATA_HOME/jzero` (default `~/.local/share/jzero`; Windows `%APPDATA%/jzero`):
+//   islands        the ocean: islands, split trees, pane cwds (`store.j3`)
+//   scroll/<id>    a closed pane's scrollback text
+//   hist/<id>      a pane's shell history (its `HISTFILE`)
+//   cmds/<id>      a pane's command list (shell integration), newest last
+//   ext/<id>       an extension pane's `pane.saved` (`ext/save.j3`)
+//   notes/         the notes view's default folder
+//   kanban/<name>.md  one kanban board (`kanban/board.j3`)
+// Every fn returns a view of frame scratch: use it at once.
+pub fn dir(): Text {
+    let t = os.dataBase();
+    t.pushStr("/jzero");
+    return *t;
+}
+
+pub fn islands(): string { return under("islands", -1); }
+pub fn scroll(id: int): string { return under("scroll/", id); }
+pub fn hist(id: int): string { return under("hist/", id); }
+pub fn cmds(id: int): string { return under("cmds/", id); }
+pub fn ext(id: int): string { return under("ext/", id); }
+pub fn notes(): string { return under("notes", -1); }
+pub fn kanban(): string { return under("kanban", -1); }
+
+fn under(name: string, id: int): string {
+    let t = dir();
+    t.push(47);
+    t.pushStr(name);
+    if id >= 0 { t.pushInt(id); }
+    return t.str();
+}
+
+pub fn ensureDirs() {
+    io.makeDirs(under("scroll", -1));
+    io.makeDirs(under("hist", -1));
+    io.makeDirs(under("cmds", -1));
+    io.makeDirs(under("ext", -1));
+}
+
+// A pane is gone for good: drop its files.
+pub fn removePane(id: int) {
+    io.remove(scroll(id));
+    io.remove(hist(id));
+    io.remove(cmds(id));
+    io.remove(ext(id));
+}
+
+// `path` with a leading home folder shown as `~` (frame scratch when changed).
+pub fn tilde(path: string): string {
+    let home = os.home();
+    if home.len == 0 || path.len < home.len || path[0..home.len] != home { return path; }
+    if path.len > home.len && path[home.len] != 47 { return path; }
+    let t = Text.scratch();
+    t.push(126);
+    t.pushStr(path[home.len..path.len]);
+    return t.str();
+}

@@ -1,0 +1,21 @@
+module jzero.util.sort;
+
+// Byte order. Insertion sort; ponytail: O(n²), fine for the short lists it gets.
+pub fn strings(s: []string) {
+    for i in 1..s.len {
+        let v = s[i];
+        let j = i;
+        while j > 0 && less(v, s[j - 1]) {
+            s[j] = s[j - 1];
+            j -= 1;
+        }
+        s[j] = v;
+    }
+}
+
+fn less(a: string, b: string): bool {
+    let n = a.len;
+    if b.len < n { n = b.len; }
+    for i in 0..n { if a[i] != b[i] { return a[i] < b[i]; } }
+    return a.len < b.len;
+}

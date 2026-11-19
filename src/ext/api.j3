@@ -1,0 +1,220 @@
+module jzero.ext.api;
+
+// What extension scripts can call (bound into the VM by `host.j3`), and key events as the
+// names scripts get (`keyName`). Drawing natives write ANSI into the current pane's `inbox`;
+// j2 strings can't hold ESC, so scripts draw through these, never raw escapes.
+// Script docs: `docs/extensions.md`.
+
+use j3.game;
+use j3.j2;
+use j3.j2.{ Args, Ref, Value, Vm };
+use j3.memory.Arena;
+use j3.sys;
+use j3.text.Text;
+use j3.term.input.{ Event, KEY_CHAR, KEY_ENTER, KEY_UP, KEY_DELETE, KEY_F1, KEY_F12, MOD_SHIFT, MOD_ALT, MOD_CTRL };
+use jzero.features.notify;
+use jzero.term.session.Session;
+
+// The pane a script call runs for (`vm.host`). Set by the host around every call.
+pub struct Target {
+    s: &Session;
+    on: bool = false;
+    cols: int = 0;     // the pane's width; `write` cuts text at it
+    col: int = 0;      // the cursor column `write` and `at` keep track of
+    tui: Ref;          // the bundled `tui` module once a script `use`s it
+}
+
+const NAMES: [14]string = ["enter", "tab", "backspace", "esc", "up", "down", "left", "right", "home", "end", "pgup", "pgdn", "insert", "delete"];
+
+pub fn bind(vm: &Vm) {
+    vm.bind("write", write);
+    vm.bind("at", at);
+    vm.bind("color", color);
+    vm.bind("bold", bold);
+    vm.bind("invert", invert);
+    vm.bind("reset", reset);
+    vm.bind("clear", clear);
+    vm.bind("cursor", cursor);
+    vm.bind("close", close);
+    vm.bind("notify", notifyN);
+    vm.bind("clipboard", clipboard);
+    vm.bind("ms", ms);
+    vm.bind("width", width);
+    vm.bind("cut", cut);
+}
+
+fn noPane(vm: &Vm): Value { return vm.raise("drawing only works inside open/key/click/resize/tick/draw"); }
+
+fn csi(vm: &Vm, body: string): Value {
+    let t = vm.host as &Target;
+    if !t.on { return noPane(vm); }
+    t.s.inbox.push(27);
+    t.s.inbox.push(91);
+    t.s.inbox.pushStr(body);
+    return j2.nil();
+}
+
+// write(text): text at the cursor, cut at the right edge; "\n" starts the next line at column 0.
+fn write(vm: &Vm, args: Args): Value {
+    let s = args.str(0);
+    let t = vm.host as &Target;
+    if !t.on { return noPane(vm); }
+    for i in 0..s.len {
+        let c = s[i];
+        if c == 10 { t.s.inbox.push(13); t.s.inbox.push(10); t.col = 0; continue; }
+        if (c & 192) != 128 { t.col += 1; }   // a code point starts (one column, as `width`)
+        if t.col <= t.cols { t.s.inbox.push(c); }
+    }
+    return j2.nil();
+}
+
+// at(col, row): move the cursor, 0-based.
+fn at(vm: &Vm, args: Args): Value {
+    let x = args.int(0);
+    let y = args.int(1);
+    (vm.host as &Target).col = x;
+    let b = Text.scratch();
+    b.pushInt(y + 1);
+    b.push(59);
+    b.pushInt(x + 1);
+    b.push(72);
+    return csi(vm, b.str());
+}
+
+// color(fg, bg): theme colors 0..15 (the terminal palette), -1 or nil for the default.
+fn color(vm: &Vm, args: Args): Value {
+    let fg = args.intOr(0, -1);
+    let bg = args.intOr(1, -1);
+    let b = Text.scratch();
+    sgr(b, fg, 30, 90, 39);
+    b.push(59);
+    sgr(b, bg, 40, 100, 49);
+    b.push(109);
+    return csi(vm, b.str());
+}
+
+fn sgr(b: &Text, c: int, base: int, bright: int, def: int) {
+    if c < 0 || c > 15 { b.pushInt(def); }
+    else if c < 8 { b.pushInt(base + c); }
+    else { b.pushInt(bright + c - 8); }
+}
+
+// bold(on)
+fn bold(vm: &Vm, args: Args): Value {
+    if args.get(0).truthy() { return csi(vm, "1m"); }
+    return csi(vm, "22m");
+}
+
+// invert(on): swap the text and background colors (a selected row in any theme).
+fn invert(vm: &Vm, args: Args): Value {
+    if args.get(0).truthy() { return csi(vm, "7m"); }
+    return csi(vm, "27m");
+}
+
+// reset(): default colors and weight.
+fn reset(vm: &Vm, args: Args): Value { return csi(vm, "0m"); }
+
+// clear(): blank screen, cursor home.
+fn clear(vm: &Vm, args: Args): Value {
+    (vm.host as &Target).col = 0;
+    csi(vm, "0m");
+    csi(vm, "2J");
+    return csi(vm, "H");
+}
+
+// cursor(on): show or hide the text cursor.
+fn cursor(vm: &Vm, args: Args): Value {
+    if args.get(0).truthy() { return csi(vm, "?25h"); }
+    return csi(vm, "?25l");
+}
+
+// close(): close this pane.
+fn close(vm: &Vm, args: Args): Value {
+    let t = vm.host as &Target;
+    if !t.on { return noPane(vm); }
+    t.s.extDone = true;
+    return j2.nil();
+}
+
+// notify(title, body): a desktop notification.
+fn notifyN(vm: &Vm, args: Args): Value {
+    let title = args.str(0);
+    let body = "";
+    if args.count() > 1 { body = args.str(1); }
+    notify.send(title, body);
+    return j2.nil();
+}
+
+// clipboard(text)
+fn clipboard(vm: &Vm, args: Args): Value {
+    game.setClipboard(args.str(0));
+    return j2.nil();
+}
+
+// width(s): columns `s` takes (code points; wide CJK counts as one).
+fn width(vm: &Vm, args: Args): Value {
+    let s = args.str(0);
+    let n = 0;
+    for i in 0..s.len { if (s[i] & 192) != 128 { n += 1; } }
+    return j2.int(n);
+}
+
+// cut(s, w): the first `w` columns of `s` (whole code points).
+fn cut(vm: &Vm, args: Args): Value {
+    let s = args.str(0);
+    let w = args.int(1);
+    let n = 0;
+    for i in 0..s.len {
+        if (s[i] & 192) != 128 {
+            if n == w { return j2.str(vm, s[0..i]); }
+            n += 1;
+        }
+    }
+    return args.get(0);
+}
+
+// ms(): milliseconds on a steady clock (timing, animation).
+fn ms(vm: &Vm, args: Args): Value { return j2.int(game.ticks()); }
+
+// A key event as a script sees it: the character ("a", "A", " "), or a name ("enter", "up",
+// "f5"), after any of "ctrl+", "alt+" (and "shift+" for named keys). "" when it has no name.
+pub fn keyName(e: &Event, out: &Text) {
+    out.clear();
+    if (e.mods & MOD_CTRL) != 0 { out.pushStr("ctrl+"); }
+    if (e.mods & MOD_ALT) != 0 { out.pushStr("alt+"); }
+    if e.key == KEY_CHAR {
+        utf8(e.cp, out);
+        return;
+    }
+    if (e.mods & MOD_SHIFT) != 0 { out.pushStr("shift+"); }
+    if e.key >= KEY_ENTER && e.key <= KEY_DELETE { out.pushStr(NAMES[e.key - KEY_ENTER]); return; }
+    if e.key >= KEY_F1 && e.key <= KEY_F12 { out.push(102); out.pushInt(e.key - KEY_F1 + 1); return; }
+    out.clear();
+}
+
+fn utf8(cp: i32, out: &Text) {
+    let c = int(cp);
+    if c < 128 { out.push(u8(c)); }
+    else if c < 2048 { out.push(u8(192 | (c >> 6))); out.push(u8(128 | (c & 63))); }
+    else if c < 65536 { out.push(u8(224 | (c >> 12))); out.push(u8(128 | ((c >> 6) & 63))); out.push(u8(128 | (c & 63))); }
+    else { out.push(u8(240 | (c >> 18))); out.push(u8(128 | ((c >> 12) & 63))); out.push(u8(128 | ((c >> 6) & 63))); out.push(u8(128 | (c & 63))); }
+}
+
+// Self-check: key names.
+pub fn selfTest(mem: &Arena) {
+    let t = Text.new(mem);
+    let e = Event { key: KEY_CHAR, cp: 97, mods: MOD_CTRL };
+    keyName(&e, &t);
+    check(t.str() == "ctrl+a", t.str());
+    e = Event { key: KEY_UP, mods: MOD_SHIFT };
+    keyName(&e, &t);
+    check(t.str() == "shift+up", t.str());
+    e = Event { key: KEY_F1 + 4 };
+    keyName(&e, &t);
+    check(t.str() == "f5", t.str());
+    e = Event { key: KEY_CHAR, cp: 8593 };
+    keyName(&e, &t);
+    check(t.str() == "↑", t.str());
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`ext api selfTest: {what}`); } }

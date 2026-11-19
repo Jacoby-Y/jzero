@@ -1,0 +1,48 @@
+<script>
+    use jzero.state.{ State, OCEAN };
+    use jzero.theme.theme;
+    props { state: &State; }
+</script>
+
+<div class="app theme-{theme.cssName()}" class:clear={state.cfg.backgroundOpacity < 100}>
+    <taskbar.Taskbar state={state} />
+    <div class="main">
+        <island.TitleBar state={state} />
+        {#if state.notesOpen}
+            <div class="notes">
+                <explorer.Explorer ex={&state.notes} clip={&state.clip} focused={!state.overlayOpen()} side={true} scale={state.notesScale()} style:left="0" style:top="0" style:width="100%" style:height="100%" />
+            </div>
+        {:else if state.kanbanOpen}
+            <kanban.Kanban state={state} />
+        {:else if state.active == OCEAN}
+            <ocean.Ocean state={state} />
+        {:else}
+            <island.Island state={state} isl={state.islands.get(state.active)} />
+        {/if}
+    </div>
+    {#if state.settingsOpen}
+        <settings.Settings state={state} />
+    {/if}
+    {#if state.gitOpen}
+        <git.GitPanel state={state} />
+    {/if}
+    {#if state.paletteOpen}
+        <palette.Palette state={state} />
+    {/if}
+    {#if state.notePickOpen}
+        <notes.NotePick state={state} />
+    {/if}
+    {#if state.menuOpen}
+        <menu.ContextMenu state={state} />
+    {/if}
+    {#if state.ask != 0}
+        <Confirm state={state} />
+    {/if}
+</div>
+
+<style>
+    .app { display: flex; flex-direction: row; height: 100%; background: var(--chrome-bg); }
+    .app.clear { background: transparent; }  /* background-opacity: the panes draw their own */
+    .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    .notes { flex: 1; min-height: 0; position: relative; }
+</style>

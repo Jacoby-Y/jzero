@@ -1,0 +1,35 @@
+[package]
+name = "jzero"
+entry = "src/main.j3"
+version = "0.1.22"
+description = "Fast all-in-one terminal emulator with islands, splits and a file explorer"
+
+[emit]
+backend = "llvm"
+opt = 0
+debug = true
+target = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"]
+
+[link]
+libs = ["SDL2", "SDL2_ttf", "GL"]
+
+[ui]
+dir = "ui"
+theme = "ui/theme.css"
+
+[dist]
+build_outputs = ["zip", "deb"]
+icon = "packaging/icon.png"
+title = "JZero"
+categories = "System;TerminalEmulator;"
+section = "x11"
+depends = ["libsdl2-image-2.0-0"]  # JPG, WebP, GIF, SVG... in the explorer (loaded at runtime)
+postinst = "packaging/postinst"
+prerm = "packaging/prerm"
+
+[dist.actions]
+new-island = { name = "New Island", exec = "--new-island" }
+toggle = { name = "Show or Hide", exec = "--toggle" }
+
+[dependencies]
+qr = { git = "https://github.com/jacoby-y/j3-qr", tag = "v0.1.0" }

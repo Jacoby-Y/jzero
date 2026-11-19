@@ -1,0 +1,195 @@
+module jzero.explorer.ops;
+
+use j3.io;
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.explorer.explorer.Explorer;
+use jzero.explorer.clip;
+use jzero.explorer.clip.Clip;
+use jzero.explorer.explorer;
+use jzero.platform.desktop;
+use jzero.platform.fileops;
+use jzero.platform.os;
+
+pub const NONE = 0;
+pub const NEW_FILE = 1;
+pub const NEW_FOLDER = 2;
+pub const RENAME = 3;
+
+// File operations of the explorer pane. Each reports a problem in `e.message` and refreshes
+// the tree on success.
+
+// Create a file or folder `name` in the explorer's target folder. Its path, or "" on failure.
+pub fn create(e: &Explorer, name: string, folder: bool): string {
+    if !validName(e, name) { return ""; }
+    let p = join(e.mem, e.targetDir(), name);
+    if io.exists(p) { e.note("Already exists: ", p); return ""; }
+    if folder {
+        match io.makeDirs(p) {
+            Result.Ok(_) {}
+            Result.Err(_) { e.note("Could not create ", p); return ""; }
+        }
+    } else {
+        match io.writeFile(p, "" as []u8) {
+            Result.Ok(_) {}
+            Result.Err(_) { e.note("Could not create ", p); return ""; }
+        }
+    }
+    e.refresh();
+    return p;
+}
+
+// Rename the selected row to `name` (same folder).
+pub fn rename(e: &Explorer, name: string) {
+    if e.selected < 0 || !validName(e, name) { return; }
+    let r = &e.rows.items[e.selected];
+    let old = r.path.str();
+    let dir = old[0..old.len - r.name.len - 1];
+    let p = join(e.mem, dir, name);
+    if io.exists(p) { e.note("Already exists: ", p); return; }
+    match io.rename(old, p) {
+        Result.Ok(_) { e.refresh(); }
+        Result.Err(_) { e.note("Could not rename ", old); }
+    }
+}
+
+// Move `path` into folder `dir`.
+pub fn move(e: &Explorer, path: string, dir: string) {
+    let p = join(e.mem, dir, baseName(path));
+    if p == path || startsWithDir(dir, path) { return; }  // onto itself or into its own subtree
+    if io.exists(p) { e.note("Already exists: ", p); return; }
+    match io.rename(path, p) {
+        Result.Ok(_) { e.refresh(); }
+        Result.Err(_) { e.note("Could not move ", path); }
+    }
+}
+
+// Move the picked rows to the trash (`platform/desktop.j3`).
+pub fn trash(e: &Explorer) {
+    let tmp = Arena.create(4096);
+    let ps = e.pickedPaths(&tmp);
+    if ps.len > 0 {
+        report(e, desktop.trash(ps.items[0..ps.len], &tmp));
+        e.selected = -1;
+        e.clearPicks();
+        e.refresh();
+    }
+    tmp.destroy();
+}
+
+// Put the picked rows on `c` (`cut`: the paste moves them).
+pub fn copy(e: &Explorer, c: &Clip, cut: bool) {
+    let tmp = Arena.create(4096);
+    let ps = e.pickedPaths(&tmp);
+    if ps.len > 0 {
+        c.set(ps.items[0..ps.len], cut);
+        let t = Text.scratch();
+        if cut { t.pushStr("Cut "); } else { t.pushStr("Copied "); }
+        t.pushInt(ps.len);
+        if ps.len == 1 { t.pushStr(" item"); } else { t.pushStr(" items"); }
+        e.note(t.str(), "");
+    }
+    tmp.destroy();
+}
+
+// Copy (or move, after a cut) the clip into the target folder. A taken name gets " (copy)", " (copy 2)", ...
+pub fn paste(e: &Explorer, c: &Clip) {
+    if c.paths.len == 0 { return; }
+    let dir = e.targetDir();
+    let tmp = Arena.create(4096);
+    for k in 0..c.paths.len {
+        let src = c.paths.items[k];
+        if startsWithDir(dir, src) { e.note("Cannot paste a folder into itself: ", src); continue; }
+        let name = baseName(src);
+        let to = join(&tmp, dir, name);
+        if c.cut && to == src { continue; }
+        if io.exists(to) { to = freeName(&tmp, dir, name); }
+        report(e, if c.cut { fileops.move(src, to, &tmp) } else { fileops.copy(src, to, &tmp) });
+    }
+    if c.cut { c.clear(); }
+    tmp.destroy();
+    e.refresh();
+}
+
+// `dir/name (copy).ext`, or `(copy 2)`, ... the first that does not exist.
+fn freeName(mem: &Arena, dir: string, name: string): string {
+    let dot = name.len;
+    let k = name.len - 1;
+    while k > 0 { if name[k] == 46 { dot = k; break; } k -= 1; }
+    let n = 1;
+    while true {
+        let t = Text.new(mem);
+        t.pushStr(name[0..dot]);
+        t.pushStr(" (copy");
+        if n > 1 { t.push(32); t.pushInt(n); }
+        t.push(41);
+        t.pushStr(name[dot..name.len]);
+        let p = join(mem, dir, t.str());
+        if !io.exists(p) { return p; }
+        n += 1;
+    }
+    return "";
+}
+
+fn baseName(path: string): string {
+    let k = path.len;
+    while k > 0 && path[k - 1] != 47 { k -= 1; }
+    return path[k..path.len];
+}
+
+// Show what went wrong with a file operation ("" is success) in the pane.
+fn report(e: &Explorer, err: string) { if err.len > 0 { e.note(err, ""); } }
+
+fn validName(e: &Explorer, name: string): bool {
+    let bad = name.len == 0 || name == "." || name == "..";
+    for i in 0..name.len { if os.badNameChar(name[i]) { bad = true; } }
+    if bad {
+        e.note("Not a valid name: ", name);
+        return false;
+    }
+    return true;
+}
+
+fn join(mem: &Arena, dir: string, name: string): string {
+    let t = Text.new(mem);
+    t.pushStr(dir);
+    if dir.len == 0 || dir[dir.len - 1] != 47 { t.push(47); }
+    t.pushStr(name);
+    return t.str();
+}
+
+// `path` is `dir` or inside it.
+fn startsWithDir(path: string, dir: string): bool {
+    if path.len < dir.len || path[0..dir.len] != dir { return false; }
+    return path.len == dir.len || path[dir.len] == 47;
+}
+
+// Self-check on a temp folder: copy and paste with a free name, cut and paste moves.
+pub fn selfTest(mem: &Arena) {
+    let dir = Text.new(mem);
+    os.testDir("ops", &dir);
+    let sub = join(mem, dir.str(), "sub");
+    io.makeDirs(sub);
+    let f = join(mem, dir.str(), "b.txt");
+    io.writeFile(f, "x" as []u8);
+    let e = explorer.open(&mem.alloc::<Arena>(1)[0], dir.str(), false);
+    e.refresh();
+    let c = clip.create(&mem.alloc::<Arena>(1)[0]);
+    e.press(1, 0);
+    copy(e, &c, false);
+    paste(e, &c);
+    paste(e, &c);
+    check(io.exists(join(mem, dir.str(), "b (copy).txt")) && io.exists(join(mem, dir.str(), "b (copy 2).txt")) && c.paths.len == 1, "copy paste");
+    e.press(1, 0);
+    copy(e, &c, true);
+    e.press(0, 0);
+    paste(e, &c);
+    check(io.exists(join(mem, sub, "b (copy 2).txt")) && c.paths.len == 0, "cut paste");
+    fileops.removeTree(dir.str(), mem);
+    explorer.close(e);
+    c.mem.destroy();
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`ops selfTest: {what}`); } }

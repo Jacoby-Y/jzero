@@ -1,0 +1,123 @@
+module jzero.term.session;
+
+// Session part: what is drawn over the grid (cursor style and blink, marks, search,
+// selection, links, IME text, dimming, bell).
+
+extend Session {
+    // The configured cursor shape (DECSCUSR: 2 block, 4 underline, 6 bar; one less blinks),
+    // unless the program set its own.
+    fn applyCursorStyle(this: &Session) {
+        let want = config.cursorShape(this.cfg);
+        if this.grid.cursorShape == 0 || this.grid.cursorShape == this.shape {
+            this.grid.cursorShape = want;
+            this.shape = want;
+        }
+    }
+
+    // The background around the cells (the View fills the cells itself, at the window's
+    // background alpha), so a see-through window shows the desktop evenly.
+    fn drawPadding(this: &Session, w: f32, h: f32, gw: f32, gh: f32) {
+        let px = f32(this.cfg.padX);
+        let py = f32(this.cfg.padY);
+        game.setColor(theme.withAlpha(theme.bg(), this.cfg.backgroundOpacity * 255 / 100));
+        game.drawRect(Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: w, y: py });
+        game.drawRect(Vec2 { x: 0.0, y: py + gh }, Vec2 { x: w, y: h - py - gh });
+        game.drawRect(Vec2 { x: 0.0, y: py }, Vec2 { x: px, y: gh });
+        game.drawRect(Vec2 { x: px + gw, y: py }, Vec2 { x: w - px - gw, y: gh });
+    }
+
+    // Dim an unfocused pane; flash on a bell.
+    fn drawOverlay(this: &Session, w: f32, h: f32, focused: bool) {
+        if !focused && this.cfg.unfocusedOpacity < 100 {
+            game.setColor(theme.bgAlpha((100 - this.cfg.unfocusedOpacity) * 255 / 100));
+            game.drawRect(Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: w, y: h });
+        }
+        if this.cfg.visualBell && this.flashing() {
+            game.setColor(theme.fgAlpha(40));
+            game.drawRect(Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: w, y: h });
+        }
+    }
+
+    // The visual bell is showing (the owner keeps frames coming meanwhile).
+    fn flashing(this: &Session): bool { return game.ticks() - this.bellAt < BELL_MS; }
+
+    // IME: the text being composed, drawn at the cursor; the candidate window opens there.
+    fn drawCompose(this: &Session, px: f32, py: f32, origin: Vec2) {
+        let cw = f32(this.view.cellW);
+        let ch = f32(this.view.cellH);
+        let x = px + f32(this.grid.cursorX()) * cw;
+        let y = py + f32(this.grid.cursorY()) * ch;
+        game.textInputRect(origin.x + x, origin.y + y, cw, ch);
+        let pre = game.textComposing();
+        if pre.len == 0 { return; }
+        let size = game.textSize(this.view.font, pre);
+        game.setColor(theme.withAlpha(theme.bg(), 255));
+        game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: size.x, y: ch });
+        game.setColor(theme.withAlpha(theme.fg(), 255));
+        game.drawText(this.view.font, Vec2 { x: x, y: y }, pre);
+        game.drawRect(Vec2 { x: x, y: y + ch - 1.0 }, Vec2 { x: size.x, y: 1.0 });
+    }
+
+    fn drawHollowCursor(this: &Session, px: f32, py: f32) {
+        let cw = f32(this.view.cellW);
+        let ch = f32(this.view.cellH);
+        let x = px + f32(this.grid.cursorX()) * cw;
+        let y = py + f32(this.grid.cursorY()) * ch;
+        game.setColor(theme.cursor());
+        game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: cw, y: 1.0 });
+        game.drawRect(Vec2 { x: x, y: y + ch - 1.0 }, Vec2 { x: cw, y: 1.0 });
+        game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: 1.0, y: ch });
+        game.drawRect(Vec2 { x: x + cw - 1.0, y: y }, Vec2 { x: 1.0, y: ch });
+    }
+
+    // Red marks left of prompts whose command failed (in the padding; none without padding).
+    fn drawMarks(this: &Session, px: f32, py: f32) {
+        if this.tap.failed.len == 0 || px < GUTTER + 1.0 || this.grid.altScreen() { return; }
+        let top = this.topLine();
+        let ch = f32(this.view.cellH);
+        game.setColor(theme.danger());
+        for i in 0..this.tap.failed.len {
+            let row = this.tap.failed.items[i] - top;
+            if row < 0 || row >= this.grid.rows() { continue; }
+            game.drawRect(Vec2 { x: px - GUTTER - 1.0, y: py + f32(row) * ch }, Vec2 { x: GUTTER, y: ch });
+        }
+    }
+
+    fn drawLink(this: &Session, px: f32, py: f32) {
+        if this.linkLine < 0 { return; }
+        let row = this.linkLine - this.topLine();
+        if row < 0 || row >= this.grid.rows() { return; }
+        let cw = f32(this.view.cellW);
+        let ch = f32(this.view.cellH);
+        game.setColor(theme.link());
+        game.drawRect(Vec2 { x: px + f32(this.linkLo) * cw, y: py + f32(row + 1) * ch - 2.0 }, Vec2 { x: f32(this.linkHi - this.linkLo) * cw, y: 1.0 });
+    }
+
+    fn drawSelection(this: &Session, px: f32, py: f32) {
+        if !this.sel.on { return; }
+        game.setColor(theme.selection());
+        let top = this.topLine();
+        let cw = f32(this.view.cellW);
+        let ch = f32(this.view.cellH);
+        for r in 0..this.grid.rows() {
+            let span = this.sel.span(top + r, this.grid.cols());
+            if span[1] <= span[0] { continue; }
+            game.drawRect(Vec2 { x: px + f32(span[0]) * cw, y: py + f32(r) * ch }, Vec2 { x: f32(span[1] - span[0]) * cw, y: ch });
+        }
+    }
+
+    fn drawSearch(this: &Session, px: f32, py: f32) {
+        if !this.find.open || this.find.count() == 0 { return; }
+        let top = this.topLine();
+        let rows = this.grid.rows();
+        let cw = f32(this.view.cellW);
+        let ch = f32(this.view.cellH);
+        let hits = &this.find.hits;
+        for i in 0..this.find.count() {
+            let row = hits.items[i * 3] - top;
+            if row < 0 || row >= rows { continue; }
+            game.setColor(theme.searchHit(i == this.find.cur));
+            game.drawRect(Vec2 { x: px + f32(hits.items[i * 3 + 1]) * cw, y: py + f32(row) * ch }, Vec2 { x: f32(hits.items[i * 3 + 2]) * cw, y: ch });
+        }
+    }
+}

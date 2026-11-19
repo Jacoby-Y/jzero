@@ -1,0 +1,81 @@
+// JFishy: an ascii fish with buttons for color, shape and catchphrase. Copy this folder to
+// ~/.config/jzero/extensions/jfishy, then Command palette → "Extension: JFishy".
+use tui;
+
+pub let title = "JFishy";
+
+const COLORS = [tui.CYAN, tui.YELLOW, tui.RED, tui.GREEN, tui.MAGENTA, tui.BLUE, 11, 14, 13];
+// Each fish is drawn as-is (raw strings keep the backslashes); `art` drops the blank first
+// and last lines.
+fn art(s) { let l = split(s, "\n"); l.remove(0); l.pop(); return l; }
+
+const SHAPES = [
+    ["><>"],
+    ["><(((('>"],
+    art(r"
+  ,-.  ,
+ ( o )<
+  `-'  `
+"),
+    art(r"
+     ______
+ |\ /  o   \
+ | >  ))    >
+ |/ \______/
+"),
+    art(r"
+        _.-=-._     .
+      .'  o    `-.  |\
+ >>  (  ))))      >=|
+      `.       _.-' |/
+        `-=-='      '
+"),
+];
+
+const PHRASES = ["blub.", "just keep swimming", "something smells fishy", "I'm hooked!", "water you doing?", "o  o  o", "cod you not?"];
+
+// pane.saved survives restarts: the fish keeps its look.
+pub fn open(pane) {
+    if pane.saved == nil { pane.saved = { color: 0, shape: 1, phrase: 0 }; }
+}
+
+fn nextColor(pane) { pane.saved.color = (pane.saved.color + 1) % len(COLORS); }
+fn nextShape(pane) { pane.saved.shape = (pane.saved.shape + 1) % len(SHAPES); }
+fn nextPhrase(pane) { pane.saved.phrase = (pane.saved.phrase + 1) % len(PHRASES); }
+
+pub fn key(pane, k) {
+    match k {
+        "c" { nextColor(pane); }
+        "s" { nextShape(pane); }
+        "p" { nextPhrase(pane); }
+        "q" { close(); }
+        _ {}
+    }
+}
+
+pub fn draw(pane) {
+    clear();
+    let st = pane.saved;
+    let fish = SHAPES[st.shape];
+    let fw = 0;
+    for line in fish { fw = math.max(fw, width(line)); }
+    let fx = math.max(0, (pane.cols - fw) / 2);
+    let fy = math.max(4, (pane.rows - len(fish)) / 2);
+
+    // speech bubble above the fish, tail pointing at its head (right side)
+    let say = PHRASES[st.phrase];
+    let bw = width(say) + 4;
+    let bx = math.clamp(fx + fw - bw / 2, 0, math.max(0, pane.cols - bw));
+    tui.box(bx, fy - 4, bw, 3, "", tui.WHITE);
+    tui.text(bx + 2, fy - 3, say, tui.WHITE, -1);
+    tui.text(math.min(fx + fw - 1, pane.cols - 1), fy - 1, "/", tui.WHITE, -1);
+
+    for i, line in fish { tui.text(fx, fy + i, line, COLORS[st.color], -1); }
+
+    let y = pane.rows - 1;
+    let x = 1;
+    x += tui.button(pane, x, y, "Color", nextColor) + 1;
+    x += tui.button(pane, x, y, "Shape", nextShape) + 1;
+    x += tui.button(pane, x, y, "Say", nextPhrase) + 1;
+    tui.text(x + 1, y, "c/s/p  q close", tui.GRAY, -1);
+}

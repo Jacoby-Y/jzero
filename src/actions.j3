@@ -1,0 +1,293 @@
+module jzero.actions;
+
+use j3.option.Option;
+use jzero.config.config;
+use jzero.features.palette;
+use jzero.explorer.syntax.registry;
+use jzero.features.ssh;
+use jzero.platform.shells;
+use j3.memory.{ Arena, List };
+use jzero.features.palette.Entry;
+use jzero.features.everything;
+use jzero.layout.split;
+use jzero.state.{ State, OCEAN };
+
+// Every user action has an id. Keybinds, the palette and buttons all go through `run`.
+pub const NONE = 0;
+pub const SPLIT_RIGHT = 1;
+pub const SPLIT_DOWN = 2;
+pub const CLOSE_PANE = 3;
+pub const EQUALIZE = 4;
+pub const FOCUS_LEFT = 5;
+pub const FOCUS_RIGHT = 6;
+pub const FOCUS_UP = 7;
+pub const FOCUS_DOWN = 8;
+pub const COPY = 9;
+pub const PASTE = 10;
+pub const NEW_ISLAND = 11;
+pub const SETTINGS = 12;
+pub const PROMPT_PREV = 13;
+pub const PROMPT_NEXT = 14;
+pub const PALETTE = 15;
+pub const EXPLORER = 16;
+pub const SSH = 17;
+pub const ZOOM_IN = 18;
+pub const ZOOM_OUT = 19;
+pub const ZOOM_RESET = 20;
+pub const NEXT_ISLAND = 21;
+pub const PREV_ISLAND = 22;
+pub const SEARCH = 23;
+pub const COPY_OUTPUT = 24;
+pub const ZOOM_PANE = 25;
+pub const BROADCAST = 26;
+pub const SEARCH_ALL = 27;
+pub const SAVE_TEMPLATE = 28;
+pub const FROM_TEMPLATE = 29;
+pub const CLOSE_ISLAND = 30;
+pub const QUIT = 31;
+pub const NOTE = 32;
+pub const RELOAD_EXT = 33;
+pub const EXT_FOLDER = 34;
+pub const REMOTE = 35;
+pub const GIT = 36;
+pub const COUNT = 37;
+
+// Config names (`keybind = ctrl+shift+o=split_right`) and palette titles, by id.
+const NAMES: [37]string = [
+    "", "split_right", "split_down", "close_pane", "equalize_splits",
+    "focus_left", "focus_right", "focus_up", "focus_down",
+    "copy", "paste", "new_island", "open_settings", "jump_prompt_prev", "jump_prompt_next", "command_palette", "open_explorer", "ssh",
+    "increase_font_size", "decrease_font_size", "reset_font_size", "next_island", "previous_island",
+    "search", "copy_last_output", "toggle_split_zoom", "toggle_broadcast", "search_everything", "save_template", "new_from_template",
+    "close_island", "quit", "turn_into_note", "reload_extensions", "open_extensions_folder", "remote_access", "open_git_ui",
+];
+const TITLES: [37]string = [
+    "", "Split right", "Split down", "Close pane", "Equalize splits",
+    "Focus pane left", "Focus pane right", "Focus pane up", "Focus pane down",
+    "Copy", "Paste", "New island", "Settings", "Jump to previous prompt", "Jump to next prompt", "Command palette", "Turn into explorer", "SSH to host…",
+    "Increase font size", "Decrease font size", "Reset font size", "Next island", "Previous island",
+    "Find in scrollback", "Copy last output", "Zoom pane", "Broadcast input", "Search everything…", "Save island as template",
+    "New island from template…", "Close island", "Quit", "Turn into note…",
+    "Reload extensions", "Open extensions folder", "Remote access (phone)", "Open Git UI",
+];
+
+// Right-click menu entries, 0 = separator.
+const MENU: [16]int = [COPY, PASTE, COPY_OUTPUT, SEARCH, 0, SPLIT_RIGHT, SPLIT_DOWN, ZOOM_PANE, EXPLORER, NOTE, SSH, GIT, CLOSE_PANE, 0, NEW_ISLAND, BROADCAST];
+pub const MENU_LEN = 16;
+
+pub fn menuItem(i: int): int { return MENU[i]; }
+pub fn title(id: int): string { return TITLES[id]; }
+pub fn name(id: int): string { return NAMES[id]; }
+
+pub fn byName(name: string): int {
+    for i in 1..COUNT { if NAMES[i] == name { return i; } }
+    return NONE;
+}
+
+pub fn run(s: &State, id: int) {
+    match id {
+        SPLIT_RIGHT { s.splitFocused(split.RIGHT); }
+        SPLIT_DOWN { s.splitFocused(split.DOWN); }
+        CLOSE_PANE { s.closeFocusedPane(); }
+        EQUALIZE { withPanes(s, 0, 0, true); }
+        FOCUS_LEFT { withPanes(s, -1, 0, false); }
+        FOCUS_RIGHT { withPanes(s, 1, 0, false); }
+        FOCUS_UP { withPanes(s, 0, -1, false); }
+        FOCUS_DOWN { withPanes(s, 0, 1, false); }
+        COPY { withTerm(s, 0); }
+        PASTE { withTerm(s, 1); }
+        PROMPT_PREV { withTerm(s, 2); }
+        PROMPT_NEXT { withTerm(s, 3); }
+        NEW_ISLAND { s.openIsland(s.newIsland()); }
+        SETTINGS { s.settingsOpen = true; }
+        PALETTE { if s.paletteOpen { s.paletteOpen = false; } else { openPalette(s); } }
+        EXPLORER { s.requestExplorer(); }
+        NOTE { s.openNotePick(); }
+        RELOAD_EXT { s.ext.reloadAll(); registry.refresh(0, true); }
+        EXT_FOLDER { s.openExtFolder(); }
+        REMOTE { s.openRemote(); }
+        GIT { s.openGit(); }
+        ZOOM_IN { s.zoom(1); }
+        ZOOM_OUT { s.zoom(-1); }
+        ZOOM_RESET { s.zoom(0); }
+        NEXT_ISLAND { s.cycleIsland(1); }
+        PREV_ISLAND { s.cycleIsland(-1); }
+        SSH {
+            openPalette(s);
+            s.palette.filter("SSH: ");
+        }
+        SEARCH { withTerm(s, 4); }
+        COPY_OUTPUT { withTerm(s, 5); }
+        ZOOM_PANE { withIsland(s, 0); }
+        BROADCAST { withIsland(s, 1); }
+        SAVE_TEMPLATE { withIsland(s, 2); }
+        CLOSE_ISLAND { if s.active != OCEAN { s.requestCloseIsland(s.active); } }
+        QUIT { s.requestQuit(); }
+        SEARCH_ALL {
+            s.gatherAll();
+            s.palette.clear();
+            s.palette.mode = palette.FOUND;
+            s.palette.filter("");
+            s.paletteOpen = true;
+        }
+        FROM_TEMPLATE {
+            openPalette(s);
+            s.palette.filter("Template: ");
+        }
+        _ {}
+    }
+}
+
+// An island action on the active island: 0 zoom pane, 1 broadcast, 2 save as template.
+fn withIsland(s: &State, op: int) {
+    match s.current() {
+        Option.Some(isl) {
+            match op {
+                0 { isl.panes.toggleZoom(); }
+                1 { isl.broadcast = !isl.broadcast; }
+                _ { s.saveTemplate(s.active); }
+            }
+        }
+        Option.None {}
+    }
+}
+
+// "Search everything" results for `query` into the palette.
+pub fn fillFound(s: &State, query: string) {
+    let p = &s.palette;
+    p.clear();
+    s.found.find(query, 200);
+    for k in 0..s.found.count() {
+        let d = s.found.doc(k);
+        let l = p.add(palette.FOUND, k, -1);
+        l.pushStr(s.islands.get(d.island).name.str());
+        if d.kind == everything.COMMAND { l.pushStr(" $ "); } else { l.pushStr(" │ "); }
+        l.pushStr(trimLine(s.found.line(k)));
+    }
+    p.showAll(query);
+}
+
+fn trimLine(s: string): string {
+    let a = 0;
+    while a < s.len && (s[a] == 32 || s[a] == 9) { a += 1; }
+    let b = s.len;
+    if b - a > 160 { b = a + 160; }
+    return s[a..b];
+}
+
+// Focus move (dx, dy) or equalize on the active island's panes.
+fn withPanes(s: &State, dx: int, dy: int, equalize: bool) {
+    match s.current() {
+        Option.Some(isl) {
+            if equalize { isl.panes.equalize(); } else { isl.panes.focusDir(dx, dy); }
+        }
+        Option.None {}
+    }
+}
+
+// A shell action on the focused pane of the active island: 0 copy, 1 paste, 2/3 previous/next
+// prompt, 4 search, 5 copy the last command's output.
+fn withTerm(s: &State, op: int) {
+    match s.current() {
+        Option.Some(isl) {
+            match isl.panes.focusedTerm() {
+                Option.Some(t) {
+                    match op {
+                        0 { t.copy(); }
+                        1 { t.paste(); }
+                        2 { t.jumpPrompt(-1); }
+                        3 { t.jumpPrompt(1); }
+                        4 { if t.find.open { t.closeSearch(); } else { t.openSearch(); } }
+                        _ { t.copyLastOutput(); }
+                    }
+                }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+}
+
+// Fill the palette: every action, theme, island and pane.
+fn openPalette(s: &State) {
+    let p = &s.palette;
+    p.clear();
+    p.mode = palette.NORMAL;
+    for id in 1..COUNT {
+        if id != PALETTE && id != SSH && id != FROM_TEMPLATE { p.add(palette.ACTION, id, -1).pushStr(TITLES[id]); }
+    }
+    for t in 0..s.themes.count() {
+        let l = p.add(palette.THEME, t, -1);
+        l.pushStr("Theme: ");
+        l.pushStr(s.themes.title(t));
+    }
+    p.hostMem.destroy();
+    *p.hostMem = Arena.create(16384);
+    p.hosts = List<string>.new(p.hostMem);
+    p.names = List<string>.new(p.hostMem);
+    ssh.hosts(p.hostMem, &p.hosts);
+    s.templates(p.hostMem, &p.names);
+    for k in 0..p.names.len {
+        let l = p.add(palette.TEMPLATE, k, -1);
+        l.pushStr("Template: ");
+        l.pushStr(p.names.items[k]);
+    }
+    if s.active != OCEAN {
+        for x in 0..s.ext.count() {
+            let l = p.add(palette.EXT, x, -1);
+            l.pushStr("Extension: ");
+            l.pushStr(s.ext.title(x));
+        }
+        if p.shells.len == 0 { shells.detect(s.mem, &p.shells); }  // once: the list costs a few program lookups
+        for k in 0..p.shells.len {
+            let l = p.add(palette.SHELL, k, -1);
+            l.pushStr("Shell: ");
+            l.pushStr(p.shells.items[k].title);
+        }
+        for h in 0..p.hosts.len {
+            let l = p.add(palette.SSH, h, -1);
+            l.pushStr("SSH: ");
+            l.pushStr(p.hosts.items[h]);
+        }
+    }
+    for i in 0..s.islands.count() {
+        let isl = s.islands.get(i);
+        let l = p.add(palette.ISLAND, i, -1);
+        l.pushStr("Island: ");
+        l.pushStr(isl.name.str());
+        if !isl.open { continue; }
+        for j in 0..isl.panes.nodes.len {
+            if !isl.panes.isLeaf(j) { continue; }
+            let pl = p.add(palette.PANE, i, j);
+            pl.pushStr("Pane: ");
+            pl.pushStr(isl.name.str());
+            pl.pushStr(" / ");
+            pl.pushStr(isl.panes.get(j).cwd.str());
+        }
+    }
+    p.filter("");
+    s.paletteOpen = true;
+}
+
+// Run a palette entry (the palette is closed first).
+pub fn pick(s: &State, e: &Entry) {
+    s.paletteOpen = false;
+    match e.kind {
+        palette.ACTION { run(s, e.id); }
+        palette.THEME {
+            s.cfg.themeName = s.themes.name(e.id);
+            config.save(&s.cfg, s.mem);
+            s.reloadConfig();
+        }
+        palette.ISLAND { s.openIsland(e.id); }
+        palette.SSH { s.splitSsh(s.palette.hosts.items[e.id]); }
+        palette.EXT { s.splitExt(s.ext.name(e.id)); }
+        palette.SHELL { s.splitShell(e.id); }
+        palette.TEMPLATE { s.openTemplate(s.palette.names.items[e.id]); }
+        palette.FOUND { s.openFound(e.id, s.palette.query.str()); }
+        _ {
+            s.openIsland(e.id);
+            s.islands.get(e.id).panes.focus = e.sub;
+        }
+    }
+}

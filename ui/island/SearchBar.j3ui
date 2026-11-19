@@ -1,0 +1,48 @@
+<script>
+    use jzero.term.session.Session;
+    use jzero.input.mods;
+    use j3.game.{ Key, keyPressedRaw };
+    use j3.text.Text;
+    props { s: &Session; }
+
+    let box = -1;
+
+    fn onMount() { d.focusNode(box); }
+
+    fn onFrame(dt: f32) {
+        if keyPressedRaw(Key.Escape) { s.closeSearch(); }
+    }
+
+    // Enter: next match; Shift+Enter: previous.
+    fn submit() {
+        if (mods.held() & mods.SHIFT) != 0 { s.searchStep(-1); } else { s.searchStep(1); }
+    }
+
+    fn count(): string {
+        let n = s.find.count();
+        if s.find.query.len == 0 { return ""; }
+        if n == 0 { return "No matches"; }
+        let t = Text.scratch();
+        t.pushInt(s.find.cur + 1);
+        t.push(47);
+        t.pushInt(n);
+        return t.str();
+    }
+</script>
+
+<div class="search">
+    <input type="text" class="q" placeholder="Find" bind:this={box} bind:value={s.find.query} on:submit={submit()} />
+    <span class="count">{count()}</span>
+    <button class="btn" class:on={s.find.caseSensitive} title="Match case" on:click={s.find.caseSensitive = !s.find.caseSensitive}>Aa</button>
+    <button class="btn" title="Previous (Shift+Enter)" on:click={s.searchStep(-1)}><icon name="chevron-up" /></button>
+    <button class="btn" title="Next (Enter)" on:click={s.searchStep(1)}><icon name="chevron-down" /></button>
+    <button class="btn" title="Close (Escape)" on:click={s.closeSearch()}><icon name="x-lg" /></button>
+</div>
+
+<style>
+    .search { position: absolute; top: 8px; right: 16px; width: 380px; height: 34px; padding: 0 4px; display: flex; flex-direction: row; align-items: center; gap: 2px; background: var(--chrome-bg); z-index: 3; }
+    .q { flex: 1; min-width: 0; height: 26px; padding: 0 6px; background: var(--chrome-hover); color: var(--c-bright-white); border: none; }
+    .count { min-width: 76px; text-align: center; color: var(--c-bright-black); }
+    .btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; }
+    .btn.on { background: var(--chrome-active); color: var(--c-bright-white); }
+</style>

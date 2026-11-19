@@ -1,0 +1,227 @@
+module jzero.session.store;
+
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.sys;
+use j3.text.Text;
+use jzero.layout.island;
+use jzero.layout.island.{ Island, Islands };
+use jzero.layout.split;
+use jzero.layout.split.Panes;
+
+// The islands file: one line per record, fields split by one space, free text last.
+//   jzero-islands 3
+//   next <next pane id>
+//   island <icon> <x> <y> <open 0|1> <root> <focus> <font px> <tag> <used> <name>
+//   node <kind> <ratio x10000> <a> <b> <pane id> <pane kind> <cwd>   (that island's nodes, in order)
+//   run <command>   (templates only: the startup command of the node before it)
+// Node indices are the island's live nodes renumbered from 0. Version 2 files (no font px,
+// tag, used) still load.
+const HEADER = "jzero-islands 3";
+const HEADER_V2 = "jzero-islands 2";
+pub const TEMPLATE_HEADER = "jzero-template 1";
+
+pub fn encode(islands: &Islands, nextId: int, out: &Text) {
+    out.pushStr(HEADER);
+    out.pushStr("\nnext ");
+    out.pushInt(nextId);
+    out.push(10);
+    for i in 0..islands.count() {
+        if !islands.get(i).temp { encodeIsland(islands.get(i), out, false); }
+    }
+}
+
+// One island; `runs`: a `run` line after each shell pane with its last command (templates).
+pub fn encodeIsland(isl: &Island, out: &Text, runs: bool) {
+    let p = &isl.panes;
+    out.pushStr("island ");
+    field(out, isl.icon);
+    field(out, int(isl.x));
+    field(out, int(isl.y));
+    field(out, if isl.open { 1 } else { 0 });
+    field(out, newIndex(p, p.root));
+    field(out, newIndex(p, p.focus));
+    field(out, isl.fontPx);
+    field(out, isl.tag);
+    field(out, isl.used);
+    out.pushStr(isl.name.str());
+    out.push(10);
+    for i in 0..p.nodes.len {
+        let n = p.get(i);
+        if !n.alive { continue; }
+        out.pushStr("node ");
+        field(out, n.kind);
+        field(out, int(n.ratio * 10000.0));
+        field(out, newIndex(p, n.a));
+        field(out, newIndex(p, n.b));
+        field(out, n.id);
+        field(out, n.pane);
+        out.pushStr(n.cwd.str());
+        out.push(10);
+        if runs && n.kind == split.LEAF && n.pane == split.TERMINAL {
+            out.pushStr("run ");
+            out.pushStr(n.recentCmds(1));
+            if out.len() > 0 && out.bytes[out.len() - 1] != 10 { out.push(10); }
+        }
+    }
+}
+
+// Index of node `i` among the live nodes (-1 stays -1).
+fn newIndex(p: &Panes, i: int): int {
+    if i < 0 { return -1; }
+    let k = 0;
+    for j in 0..i { if p.get(j).alive { k += 1; } }
+    return k;
+}
+
+fn field(out: &Text, v: int) {
+    out.pushInt(v);
+    out.push(32);
+}
+
+// Read `src` into `islands` (appended). Returns the next pane id, or -1 when `src` is not an
+// islands file (then nothing was added).
+pub fn decode(src: string, mem: &Arena, islands: &Islands): int {
+    let r = Reader { s: src };
+    let head = r.line();
+    if head != HEADER && head != HEADER_V2 && head != TEMPLATE_HEADER { return -1; }
+    let v2 = head == HEADER_V2;
+    let next = 0;
+    let cur = -1;
+    while !r.done() {
+        let line = r.line();
+        let f = Reader { s: line };
+        let tag = f.word();
+        if tag == "next" {
+            next = f.int();
+        } else if tag == "island" {
+            let icon = f.int();
+            let x = f32(f.int());
+            let y = f32(f.int());
+            let open = f.int() == 1;
+            let root = f.int();
+            let focus = f.int();
+            let px = 0;
+            let tg = 0;
+            let used = 0;
+            if !v2 { px = f.int(); tg = f.int(); used = f.int(); }
+            cur = islands.add(mem, f.rest(), icon, x, y);
+            let isl = islands.get(cur);
+            isl.fontPx = px;
+            isl.tag = tg;
+            isl.used = used;
+            isl.open = open;
+            isl.panes.root = root;
+            isl.panes.focus = focus;
+        } else if tag == "node" && cur >= 0 {
+            let p = &islands.get(cur).panes;
+            let i = p.addNode(f.int());
+            let n = p.get(i);
+            n.ratio = f32(f.int()) / 10000.0;
+            n.a = f.int();
+            n.b = f.int();
+            n.id = f.int();
+            n.pane = f.int();
+            n.cwd.pushStr(f.rest());
+        } else if tag == "run" && cur >= 0 {
+            // A template's startup command: kept as the node's command list.
+            let p = &islands.get(cur).panes;
+            if p.nodes.len > 0 { p.get(p.nodes.len - 1).cmds.pushStr(f.rest()); }
+        }
+    }
+    for i in 0..islands.count() { link(&islands.get(i).panes); }
+    return next;
+}
+
+// Parents from children, then rects. Drops a tree whose links do not hold together.
+fn link(p: &Panes) {
+    let n = p.nodes.len;
+    if p.root < 0 || p.root >= n { p.clear(); return; }
+    for i in 0..n {
+        let node = p.get(i);
+        if node.kind == split.LEAF { continue; }
+        if node.a < 0 || node.a >= n || node.b < 0 || node.b >= n { p.clear(); return; }
+        p.get(node.a).parent = i;
+        p.get(node.b).parent = i;
+    }
+    if p.focus < 0 || p.focus >= n || p.get(p.focus).kind != split.LEAF { p.focus = p.firstLeaf(p.root); }
+    p.layout();
+}
+
+// Splits a string into lines and space-separated fields.
+struct Reader {
+    s: string;
+    at: int = 0;
+
+    fn done(this: &Reader): bool { return this.at >= this.s.len; }
+
+    fn line(this: &Reader): string {
+        let start = this.at;
+        while this.at < this.s.len && this.s[this.at] != 10 { this.at += 1; }
+        let l = this.s[start..this.at];
+        this.at += 1;
+        return l;
+    }
+
+    fn word(this: &Reader): string {
+        let start = this.at;
+        while this.at < this.s.len && this.s[this.at] != 32 { this.at += 1; }
+        let w = this.s[start..this.at];
+        if this.at < this.s.len { this.at += 1; }
+        return w;
+    }
+
+    fn int(this: &Reader): int {
+        let w = this.word();
+        let neg = w.len > 0 && w[0] == 45;
+        let v = 0;
+        for i in 0..w.len {
+            if w[i] >= 48 && w[i] <= 57 { v = v * 10 + int(w[i] - 48); }
+        }
+        if neg { return 0 - v; }
+        return v;
+    }
+
+    fn rest(this: &Reader): string {
+        let r = this.s[minI(this.at, this.s.len)..this.s.len];
+        this.at = this.s.len;
+        return r;
+    }
+}
+
+fn minI(a: int, b: int): int { if a < b { return a; } return b; }
+
+// Self-check: a split island survives encode and decode.
+pub fn selfTest(mem: &Arena) {
+    let a = island.create(mem);
+    let i = a.add(mem, "my island", 3, 10.0, 20.0);
+    let p = &a.get(i).panes;
+    p.start(Option.None, 7);
+    p.get(0).cwd.pushStr("/tmp/a b");
+    p.split(split.DOWN, Option.None, 8);
+    p.close(0);
+    p.split(split.RIGHT, Option.None, 9);
+    a.get(i).open = true;
+    a.get(i).fontPx = 17;
+    a.get(i).tag = 2;
+    let tmp = a.add(mem, "temp", 0, 0.0, 0.0);
+    a.get(tmp).temp = true;
+    let t = Text.new(mem);
+    encode(&a, 10, &t);
+    let b = island.create(mem);
+    check(decode(t.str(), mem, &b) == 10, "next");
+    let q = &b.get(0).panes;
+    check(b.count() == 1 && b.get(0).name.str() == "my island" && b.get(0).icon == 3 && b.get(0).open, "island");
+    check(b.get(0).fontPx == 17 && b.get(0).tag == 2, "font and tag");
+    let old = island.create(mem);
+    check(decode("jzero-islands 2\nnext 3\nisland 1 5 6 0 0 0 v2 name\nnode 0 5000 -1 -1 2 0 /tmp\n", mem, &old) == 3, "v2");
+    check(old.get(0).name.str() == "v2 name" && old.get(0).panes.get(0).cwd.str() == "/tmp", "v2 island");
+    check(q.get(q.root).kind == split.RIGHT && q.get(q.focus).id == 9, "tree");
+    b.add(mem, "temp", 0, 0.0, 0.0);
+    b.get(1).temp = true;
+    let t2 = Text.new(mem);
+    encode(&b, 10, &t2);
+    check(t.str() == t2.str(), t2.str());
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`store selfTest: {what}`); } }

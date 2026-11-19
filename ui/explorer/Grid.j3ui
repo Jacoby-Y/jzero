@@ -1,0 +1,72 @@
+<script>
+    // The file list as tiles: images show a thumbnail, folders open as the new root.
+    use jzero.explorer.explorer.Explorer;
+    use jzero.explorer.kinds;
+    use jzero.explorer.ops;
+    use jzero.input.mods;
+    use j3.game;
+    use j3.gfx.paint;
+    props { ex: &Explorer; }
+    events { pick(i: int); menu(i: int); }
+
+    fn onFrame(dt: f32) {
+        if ex.thumbs.step() { game.idleWake(); }
+    }
+
+    // A click picks the tile; a double click opens it (a folder becomes the root).
+    fn click(i: int) {
+        if !ex.press(i, mods.held()) { return; }
+        if ex.rows.items[i].isDir { ex.enter(i); } else { emit pick(i); }
+    }
+
+    // The thumbnail fitted and centered in the tile's picture box.
+    fn drawThumb(i: int, size: Vec2) {
+        if i >= ex.rows.len { return; }
+        let t = ex.thumbs.get(ex.rows.items[i].path.str());
+        if t.w == 0 { return; }
+        let s = size.x / f32(t.w);
+        let sy = size.y / f32(t.h);
+        if sy < s { s = sy; }
+        if s > 1.0 { s = 1.0; }
+        let w = f32(t.w) * s;
+        let h = f32(t.h) * s;
+        paint.image(t, Vec2 { x: (size.x - w) * 0.5, y: (size.y - h) * 0.5 }, Vec2 { x: w, y: h });
+    }
+</script>
+
+<div class="grid">
+    {#each ex.rows.items[0..ex.rows.len] as &r, i}
+        {#if r.depth == 0}
+            <div class="tile git-{r.git}" class:sel={ex.picked(i)} title={r.name}
+                draggable drag-data={r.path.str()} on:dragstart={ex.setDragOut(data)} on:dragend={ex.dragOut.clear()} on:click={click(i)} on:contextmenu={emit menu(i)}>
+                {#if r.isDir}
+                    <div class="pic" on:drop={ops.move(ex, data, r.path.str())}><icon name="folder" /></div>
+                {:else if kinds.isImage(r.name)}
+                    <canvas class="pic" on:draw={drawThumb(i, size)}></canvas>
+                {:else if kinds.of(r.name) == kinds.MARKDOWN}
+                    <div class="pic"><icon name="markdown" /></div>
+                {:else}
+                    <div class="pic"><icon name="file-earmark" /></div>
+                {/if}
+                <span class="nm">{r.name}</span>
+                <span class="info">{ex.info(i)}</span>
+            </div>
+        {/if}
+    {/each}
+</div>
+
+<style>
+    .grid { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: row; flex-wrap: wrap; align-content: flex-start; gap: 0.286em; padding: 0.571em; }
+    .tile { width: 7.857em; display: flex; flex-direction: column; align-items: center; gap: 0.214em; padding: 0.286em; cursor: pointer; user-select: none; }
+    .tile:hover { background: var(--chrome-hover); }
+    .tile.sel { background: var(--chrome-active); color: var(--c-bright-white); }
+    .tile:drop-target { background: var(--chrome-active); }
+    .pic { width: 7.286em; height: 5.714em; display: flex; align-items: center; justify-content: center; font-size: 1em; color: var(--c-bright-black); }
+    .pic icon { width: 2.857em; height: 2.857em; }
+    .nm { width: 100%; text-align: center; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+    .info { color: var(--c-bright-black); font-size: 0.857em; white-space: pre; }
+    .tile.sel .info { color: var(--chrome-fg); }
+    .git-1 { color: var(--c-bright-yellow); }
+    .git-2 { color: var(--c-bright-green); }
+    .git-3 { color: var(--c-bright-cyan); }
+</style>

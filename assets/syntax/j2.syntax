@@ -1,0 +1,17 @@
+# j2 scripts (JZero extensions)
+name = j2
+ext = j2
+comment = //
+comment = /* */
+region = string r#" "# multiline
+region = string r" " multiline
+string = " " escape
+string = ` ` escape multiline
+keyword = let const fn use pub
+control = if else while for in match return break continue
+plain = variable
+constant = true false nil
+builtin = print len str split push pop keys type int float
+after = function fn
+call = true
+capitalized = type

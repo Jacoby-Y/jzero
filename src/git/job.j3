@@ -1,0 +1,72 @@
+module jzero.git.job;
+
+use j3.game.idleWake;
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.text.Text;
+use j3.thread;
+use j3.thread.Thread;
+
+// One program run on a worker (push, pull, `gh repo create`: they touch the network). Main starts
+// it and polls `finished` each frame; the worker owns `mem` until it reports done.
+// Must not move once started (keep it in an arena).
+// Git never prompts: there is no terminal to answer in.
+const ENV: [1]string = ["GIT_TERMINAL_PROMPT=0"];
+
+pub struct Job {
+    mem: &Arena;
+    argv: List<string>;
+    code: int = 0;
+    out: string = "";     // stderr then stdout, in `mem`
+    what: int = 0;        // the caller's tag for this run
+    running: bool = false;
+    done: int = 0;        // atomic: the worker finished
+    thread: Thread;
+
+    // Run `argv` (copied) in the background. False while another run is going.
+    fn start(this: &Job, argv: []string, what: int): bool {
+        if this.running { return false; }
+        this.mem.destroy();
+        *this.mem = Arena.create(65536);
+        this.argv = List<string>.new(this.mem);
+        for a in argv { this.argv.push(Text.new(this.mem).add(a).str()); }
+        this.what = what;
+        this.done = 0;
+        this.running = true;
+        thread.spawn(&this.thread, "git-job", work, this as ptr);
+        return true;
+    }
+
+    // Main, each frame: true once, when the run has ended (`code` and `out` are then readable).
+    fn finished(this: &Job): bool {
+        if !this.running || @atomicLoad(&this.done) == 0 { return false; }
+        thread.join(&this.thread);
+        this.running = false;
+        return true;
+    }
+}
+
+pub fn create(parent: &Arena): &Job {
+    let j = &parent.alloc::<Job>(1)[0];
+    let mem = &parent.alloc::<Arena>(1)[0];
+    *mem = Arena.create(1024);
+    *j = Job { mem: mem, argv: List<string>.new(mem), thread: Thread { f: work } };
+    return j;
+}
+
+fn work(arg: ptr) {
+    let j = arg as &Job;
+    match proc.runEnv(j.argv.items[0..j.argv.len], "", ENV[:], j.mem) {
+        Result.Ok(o) {
+            j.code = o.code;
+            j.out = Text.new(j.mem).add(o.errStr()).add(o.outStr()).str();
+        }
+        Result.Err(_) {
+            j.code = -1;
+            j.out = Text.new(j.mem).add("Could not run ").add(j.argv.items[0]).str();
+        }
+    }
+    @atomicStore(&j.done, 1);
+    idleWake();
+}

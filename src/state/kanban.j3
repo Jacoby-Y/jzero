@@ -1,0 +1,26 @@
+module jzero.state;
+
+// State part: the kanban view (taskbar button above notes), boards in `<data>/kanban`
+// (`kanban/boards.j3`). Shown in place of the ocean or island, like the notes view.
+
+extend State {
+    fn toggleKanban(this: &State) {
+        if this.kanbanOpen { this.hideKanban(); return; }
+        this.hideNotes();
+        this.kanban.refresh();
+        this.kanbanOpen = true;
+    }
+
+    fn hideKanban(this: &State) {
+        this.kanban.save();
+        this.kanbanOpen = false;
+    }
+
+    // Notes or kanban replaces the ocean / island.
+    fn viewOpen(this: &State): bool { return this.notesOpen || this.kanbanOpen; }
+
+    fn hideViews(this: &State) {
+        this.hideNotes();
+        this.hideKanban();
+    }
+}

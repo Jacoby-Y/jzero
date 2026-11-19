@@ -1,0 +1,31 @@
+<script>
+    // Inline runs of one markdown block: styled text (flags nest), links, images, breaks.
+    use jzero.explorer.explorer.Explorer;
+    use jzero.explorer.mddoc;
+    use jzero.explorer.mddoc.Run;
+    props { ex: &Explorer; runs: []Run; }
+</script>
+
+<span class="runs">
+    {#each runs as r}
+        {#match r.kind}
+        {:case mddoc.R_IMAGE}
+            {#if r.width.len > 0}<img src={r.href} alt={r.text} style:width="{r.width}" />
+            {:else}<img src={r.href} alt={r.text} />{/if}
+        {:case mddoc.R_COLOR}<span style:color="{r.href}">{r.text}</span>
+        {:case mddoc.R_BREAK}<br />
+        {:else}
+            {#if r.link}<a class:b={r.bold} class:i={r.italic} class:c={r.code} class:s={r.small} title={r.href} on:click={ex.follow(r.href, r.wiki)}>{r.text}</a>
+            {:else}<span class:b={r.bold} class:i={r.italic} class:c={r.code} class:s={r.small}>{r.text}</span>{/if}
+        {/match}
+    {/each}
+</span>
+
+<style>
+    .b { font-weight: bold; color: var(--c-bright-white); }
+    .i { font-style: italic; }
+    .c { font-family: "Mono"; background: var(--chrome-bg); padding: 0 0.214em; }
+    .s { font-size: 0.857em; }
+    a { color: var(--c-bright-blue); text-decoration: underline; cursor: pointer; }
+    img { max-width: 100%; vertical-align: middle; }
+</style>

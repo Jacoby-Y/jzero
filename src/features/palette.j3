@@ -1,0 +1,137 @@
+module jzero.features.palette;
+
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.shells.Found;
+
+pub const ACTION = 0;
+pub const THEME = 1;
+pub const ISLAND = 2;
+pub const PANE = 3;
+pub const SSH = 4;
+pub const TEMPLATE = 5;
+pub const FOUND = 6;     // a "search everything" hit (id: its index in State.found)
+pub const EXT = 7;       // an extension (id: its index in State.ext)
+pub const SHELL = 8;     // a detected shell (id: its index in `shells`)
+
+// What the palette lists: actions and the rest (fuzzy filtered), or search-everything hits.
+pub const NORMAL = 0;
+
+pub struct Entry {
+    kind: int;
+    id: int;       // action id, theme index, island index, SSH: index into `hosts`
+    sub: int = -1; // PANE: the leaf node index
+    label: Text;
+    score: int = 0;
+}
+
+// The palette's entries and the current filtered, ranked view of them.
+pub struct Palette {
+    all: List<Entry>;
+    shown: List<int>;   // indices into `all`, best first
+    query: Text;        // what `shown` was filtered by
+    hosts: List<string>; // ssh hosts, read when the palette opens
+    names: List<string>; // template names, read when the palette opens
+    hostMem: &Arena;    // holds `hosts` and `names`; rewound on each open
+    shells: List<Found>; // shells on this machine, detected at the first open
+    mode: int = 0;      // NORMAL or FOUND
+    count: int = 0;     // live entries in `all` (kept to reuse their Texts)
+
+    fn clear(this: &Palette) { this.count = 0; }
+
+    // Next entry slot (its label cleared), reusing old ones.
+    fn add(this: &Palette, kind: int, id: int, sub: int): &Text {
+        if this.count == this.all.len {
+            this.all.push(Entry { kind: kind, id: id, label: Text.new(this.all.arena) });
+        }
+        let e = &this.all.items[this.count];
+        this.count += 1;
+        e.kind = kind;
+        e.id = id;
+        e.sub = sub;
+        e.label.clear();
+        return &e.label;
+    }
+
+    fn get(this: &Palette, k: int): &Entry { return &this.all.items[this.shown.items[k]]; }
+
+    // Show every entry in order (already matched elsewhere); `query` is what they match.
+    fn showAll(this: &Palette, query: string) {
+        this.query.clear();
+        this.query.pushStr(query);
+        this.shown.len = 0;
+        for i in 0..this.count { this.shown.push(i); }
+    }
+
+    // Keep the entries matching `query` (fuzzy, case-insensitive), best first.
+    fn filter(this: &Palette, query: string) {
+        this.query.clear();
+        this.query.pushStr(query);
+        this.shown.len = 0;
+        for i in 0..this.count {
+            let e = &this.all.items[i];
+            e.score = score(e.label.str(), query);
+            if e.score < 0 { continue; }
+            // insertion by score; stable for ties (entry order)
+            this.shown.push(i);
+            let j = this.shown.len - 1;
+            while j > 0 && this.all.items[this.shown.items[j - 1]].score < e.score {
+                this.shown.items[j] = this.shown.items[j - 1];
+                j -= 1;
+            }
+            this.shown.items[j] = i;
+        }
+    }
+}
+
+pub fn create(mem: &Arena): Palette {
+    let hostMem = &mem.alloc::<Arena>(1)[0];
+    *hostMem = Arena.create(16384);
+    return Palette {
+        all: List<Entry>.new(mem), shown: List<int>.new(mem), query: Text.new(mem),
+        hosts: List<string>.new(hostMem), names: List<string>.new(hostMem), hostMem: hostMem, shells: List<Found>.new(mem),
+    };
+}
+
+// -1 when `q` is not a subsequence of `s`; else higher for runs and word starts.
+pub fn score(s: string, q: string): int {
+    if q.len == 0 { return 0; }
+    let total = 0;
+    let qi = 0;
+    let run = 0;
+    for i in 0..s.len {
+        if qi >= q.len { break; }
+        if lower(s[i]) == lower(q[qi]) {
+            run += 1;
+            total += run * 2;
+            if i == 0 || s[i - 1] == 32 || s[i - 1] == 47 { total += 5; }
+            qi += 1;
+        } else {
+            run = 0;
+        }
+    }
+    if qi < q.len { return -1; }
+    return total;
+}
+
+fn lower(c: u8): u8 {
+    if c >= 65 && c <= 90 { return c + 32; }
+    return c;
+}
+
+// Self-check: subsequence matching, ranking.
+pub fn selfTest(mem: &Arena) {
+    check(score("Split right", "spr") > 0 && score("Split right", "xyz") < 0, "match");
+    check(score("Split right", "split") > score("Close pane", "sp"), "rank");
+    let p = create(mem);
+    p.add(ACTION, 1, -1).pushStr("Close pane");
+    p.add(ACTION, 2, -1).pushStr("Split right");
+    p.add(ACTION, 3, -1).pushStr("Split down");
+    p.filter("sd");
+    check(p.shown.len == 1 && p.get(0).id == 3, "filter");
+    p.filter("");
+    check(p.shown.len == 3 && p.get(0).id == 1, "empty query keeps order");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`palette selfTest: {what}`); } }

@@ -1,0 +1,200 @@
+<script>
+    use jzero.state.State;
+    use jzero.git.repo;
+    use jzero.features.links;
+    use jzero.session.paths;
+    use j3.text;
+    use jzero.util.resize;
+    use jzero.util.resize.Resize;
+    props { state: &State; }
+
+    let msg: string = "";      // commit message
+    let branchName: string = "";
+    let pubName: string = "";
+    let pubDesc: string = "";
+    let pubPrivate = true;
+    let size: Resize = resize.create(900.0, 600.0, 480.0, 320.0);
+
+    fn onFrame(dt: f32) { size.step(); }
+
+    fn onMount() { pubName = state.git.dirName(); }
+
+    fn commit() {
+        state.git.commit(msg);
+        if !state.git.bad { msg = ""; }
+    }
+
+    fn newBranch() {
+        state.git.newBranch(branchName);
+        if !state.git.bad { branchName = ""; }
+    }
+
+    // Diff line color by its first character.
+    fn lineClass(l: string): string {
+        if text.startsWith(l, "+++") || text.startsWith(l, "---") || text.startsWith(l, "diff ") || text.startsWith(l, "index ") { return "meta"; }
+        if text.startsWith(l, "+") { return "add"; }
+        if text.startsWith(l, "-") { return "del"; }
+        if text.startsWith(l, "@@") { return "hunk"; }
+        return "";
+    }
+</script>
+
+{#let g = &state.git}
+<dialog modal closedby="any" class="git" style:width="{size.w}px" style:height="{size.h}px" on:close={state.gitOpen = false}>
+    <header class="head">
+        <h2>Git</h2>
+        <span class="dir">{paths.tilde(g.dir.str())}</span>
+        {#if g.isRepo()}
+            <span class="branch">{g.branch}</span>
+            {#if g.upstream.len > 0}
+                <span class="ab">↑{g.ahead} ↓{g.behind}</span>
+            {/if}
+        {/if}
+    </header>
+
+    {#if g.note.len() > 0}
+        <pre class="note" class:bad={g.bad}>{g.note.str()}</pre>
+    {/if}
+
+    {#if !g.isRepo()}
+        <div class="empty">
+            <p>This folder is not a git repository.</p>
+            <button class="primary" on:click={g.init()}>Initialize repository</button>
+        </div>
+    {:else}
+        <div class="sync">
+            {#if g.remote.len > 0}
+                <span class="remote" title={g.remote}>{g.remote}</span>
+                <button class="act" title="Open in browser" on:click={links.open(g.remote, state.mem)}>Open</button>
+                <button class="act" disabled={g.busy()} on:click={g.pull()}>Pull</button>
+                <button class="act primary" disabled={g.busy()} on:click={g.push()}>Push</button>
+            {:else if !g.ghReady}
+                <span class="remote">No remote. Log in to GitHub to publish.</span>
+                <button class="act primary" on:click={state.gitLogin()}>Log in to GitHub</button>
+            {:else}
+                <input type="text" class="field name" placeholder="Repository name" bind:value={pubName} />
+                <input type="text" class="field desc" placeholder="Description (optional)" bind:value={pubDesc} />
+                <label class="check"><input type="checkbox" bind:checked={pubPrivate} />Private</label>
+                <button class="act primary" disabled={g.busy()} on:click={g.publish(pubName, pubDesc, pubPrivate)}>Publish to GitHub</button>
+            {/if}
+        </div>
+
+        <div class="body">
+            <div class="left">
+                <div class="title">
+                    <span>Changes ({g.changes.len})</span>
+                    <span class="gap"></span>
+                    {#if g.changes.len > 0}
+                        <button class="small" on:click={g.stageAll()}>Stage all</button>
+                    {/if}
+                </div>
+                <div class="list changes">
+                    {#each 0..g.changes.len as i}
+                        {#let c = &g.changes.items[i]}
+                        <div class="row" class:on={g.diffPath.str() == c.path}>
+                            <input type="checkbox" checked={repo.staged(c)} title="Staged" on:click={g.toggle(i)} />
+                            <span class="kind k-{repo.kind(c)}">{repo.kind(c)}</span>
+                            <button class="path" title="Show diff" on:click={g.showDiff(c.path)}>{c.path}</button>
+                        </div>
+                    {/each}
+                    {#if g.changes.len == 0}
+                        <p class="none">Nothing changed.</p>
+                    {/if}
+                </div>
+                <div class="commit">
+                    <input type="text" class="field" placeholder="Commit message" bind:value={msg} on:submit={commit()} />
+                    <button class="act primary" on:click={commit()}>Commit</button>
+                </div>
+                <div class="title"><span>Branches</span></div>
+                <div class="list branches">
+                    {#each g.branches.items[0..g.branches.len] as b}
+                        <button class="row br" class:on={b == g.branch} on:click={g.switchTo(b)}>{b}</button>
+                    {/each}
+                </div>
+                <div class="commit">
+                    <input type="text" class="field" placeholder="New branch" bind:value={branchName} on:submit={newBranch()} />
+                    <button class="act" on:click={newBranch()}>Create</button>
+                </div>
+            </div>
+
+            <div class="right">
+                {#if g.diffPath.len() > 0}
+                    <div class="title">
+                        <span>{g.diffPath.str()}</span>
+                        <span class="gap"></span>
+                        <button class="small" on:click={g.showDiff(g.diffPath.str())}>History</button>
+                    </div>
+                    <div class="list mono">
+                        {#each g.diff.items[0..g.diff.len] as l}
+                            <pre class="ln {lineClass(l)}">{l}</pre>
+                        {/each}
+                        {#if g.diff.len == 0}
+                            <p class="none">No diff.</p>
+                        {/if}
+                    </div>
+                {:else}
+                    <div class="title"><span>History</span></div>
+                    <div class="list">
+                        {#each g.log.items[0..g.log.len] as cm}
+                            <div class="row"><span class="hash">{cm.hash}</span><span class="subj">{cm.subject}</span></div>
+                        {/each}
+                        {#if g.log.len == 0}
+                            <p class="none">No commits yet.</p>
+                        {/if}
+                    </div>
+                {/if}
+            </div>
+        </div>
+    {/if}
+    <div class="grip" on:mousedown|stop={size.grab()}></div>
+</dialog>
+
+<style>
+    .grip { position: absolute; right: 0; bottom: 0; width: 12px; height: 12px; cursor: move; background: var(--chrome-hover); }
+    .git { position: relative; padding: 16px; display: flex; flex-direction: column; gap: 10px; background: var(--chrome-bg); color: var(--chrome-fg); }
+    .head { display: flex; flex-direction: row; align-items: center; gap: 12px; }
+    h2 { font-size: 16px; color: var(--c-bright-white); }
+    .dir { color: var(--c-bright-black); flex: 1; min-width: 0; white-space: pre; overflow: hidden; }
+    .branch { color: var(--c-bright-green); }
+    .ab { color: var(--c-bright-black); }
+    .note { padding: 6px 10px; max-height: 96px; overflow-y: auto; background: var(--chrome-hover); white-space: pre-wrap; }
+    .note.bad { color: var(--chrome-danger); }
+    .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
+    .sync { display: flex; flex-direction: row; align-items: center; gap: 8px; }
+    .remote { flex: 1; min-width: 0; overflow: hidden; white-space: pre; color: var(--c-bright-blue); }
+    .field { height: 30px; padding: 0 8px; background: var(--term-bg); color: var(--chrome-fg); }
+    .name { width: 200px; }
+    .desc { flex: 1; min-width: 0; }
+    .check { display: flex; flex-direction: row; align-items: center; gap: 6px; }
+    input[type="checkbox"] { accent-color: var(--chrome-active); }
+    .act { height: 30px; padding: 0 12px; background: var(--chrome-hover); }
+    .primary { height: 30px; padding: 0 12px; background: var(--chrome-active); color: var(--c-bright-white); }
+    button:disabled { color: var(--c-bright-black); cursor: default; }
+    .body { flex: 1; min-height: 0; display: flex; flex-direction: row; gap: 12px; }
+    .left { width: 340px; display: flex; flex-direction: column; gap: 6px; }
+    .right { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+    .title { height: 26px; display: flex; flex-direction: row; align-items: center; color: var(--c-bright-white); }
+    .gap { flex: 1; }
+    .small { height: 24px; padding: 0 10px; background: var(--chrome-hover); }
+    .list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; background: var(--divider); }
+    .branches { flex: 0; flex-shrink: 0; height: 110px; }
+    .row { height: 26px; padding: 0 8px; display: flex; flex-direction: row; align-items: center; gap: 8px; flex-shrink: 0; }
+    .row.on { background: var(--chrome-hover); }
+    .br { text-align: left; justify-content: flex-start; }
+    .kind { width: 34px; color: var(--c-bright-black); }
+    .k-new, .k-add { color: var(--c-bright-green); }
+    .k-mod, .k-ren { color: var(--c-bright-yellow); }
+    .k-del, .k-conf { color: var(--c-bright-red); }
+    .path { flex: 1; min-width: 0; height: 26px; text-align: left; justify-content: flex-start; display: flex; align-items: center; white-space: pre; overflow: hidden; }
+    .commit { display: flex; flex-direction: row; gap: 6px; }
+    .commit .field { flex: 1; min-width: 0; }
+    .none { padding: 8px; color: var(--c-bright-black); }
+    .hash { color: var(--c-bright-yellow); font-family: "Mono"; }
+    .subj { flex: 1; min-width: 0; white-space: pre; overflow: hidden; }
+    .mono { font-family: "Mono"; font-size: 13px; }
+    .ln { padding: 0 8px; white-space: pre; flex-shrink: 0; }
+    .ln.add { color: var(--c-bright-green); }
+    .ln.del { color: var(--c-bright-red); }
+    .ln.hunk { color: var(--c-bright-cyan); }
+    .ln.meta { color: var(--c-bright-black); }
+</style>

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>JZero Remote</title>
+<style>
+/* Tango (GNOME Terminal) tokens; swap here for another theme. */
+:root {
+  --bg: #2e3436; --fg: #d3d7cf; --dim: #888a85; --panel: #3a4042;
+  --accent: #3465a4; --warn: #c4a000; --err: #cc0000; --ok: #4e9a06;
+}
+* { box-sizing: border-box; margin: 0; }
+html, body { height: 100%; background: var(--bg); color: var(--fg); font: 15px system-ui, sans-serif; }
+body { display: flex; flex-direction: column; }
+header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: var(--panel); }
+header b { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+button { background: var(--panel); color: var(--fg); border: 0; padding: 10px 12px; font: inherit; min-width: 44px; }
+button:active { background: var(--accent); }
+header button { background: var(--bg); }
+#list { flex: 1; overflow-y: auto; }
+.pane { display: flex; flex-direction: column; width: 100%; text-align: left; padding: 12px; border: 0; background: none; border-bottom: 1px solid var(--panel); }
+.pane .top { display: flex; gap: 8px; }
+.pane .prog { flex: 1; font-weight: 600; }
+.pane .cwd { color: var(--dim); font-size: 13px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wants { color: var(--bg); background: var(--warn); padding: 0 6px; font-size: 13px; }
+#view { flex: 1; display: none; flex-direction: column; min-height: 0; }
+pre { flex: 1; overflow: auto; padding: 8px; font: 12px/1.3 ui-monospace, monospace; white-space: pre; background: #000; }
+.keys { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; }
+.keys button { flex: 1 0 auto; padding: 10px 8px; }
+form { display: flex; gap: 4px; padding: 4px; padding-bottom: max(4px, env(safe-area-inset-bottom)); }
+input { flex: 1; min-width: 0; background: #000; color: var(--fg); border: 0; padding: 10px; font: 15px ui-monospace, monospace; }
+#msg { padding: 6px 12px; color: var(--err); display: none; }
+.empty { padding: 24px 12px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <button id="back" hidden>&larr;</button>
+  <b id="title">JZero</b>
+  <button id="more" hidden title="Screen or scrollback">Screen</button>
+  <button id="newIsland" title="New shell island">+</button>
+</header>
+<div id="msg"></div>
+<div id="list"></div>
+<div id="view">
+  <pre id="screen"></pre>
+  <div class="keys" id="keys"></div>
+  <form id="form">
+    <input id="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type, then Send (Enter) or Type">
+    <button type="button" id="type">Type</button>
+    <button type="submit">Send</button>
+  </form>
+</div>
+<script>
+const token = location.hash.slice(1);
+const $ = id => document.getElementById(id);
+const KEYS = [["Enter","enter"],["Esc","esc"],["Tab","tab"],["^C","ctrl+c"],["↑","up"],["↓","down"],["←","left"],["→","right"],["⌫","backspace"],["^D","ctrl+d"],["1","=1"],["2","=2"],["3","=3"],["y","=y"],["n","=n"]];
+let pane = null, lines = 0, timer = 0;
+
+// One jzctl command; resolves to the reply body, throws with the error text.
+async function ctl(...args) {
+  const r = await fetch("/ctl", { method: "POST", headers: { "X-Token": token }, body: JSON.stringify(args.map(String)) });
+  const t = await r.text();
+  const nl = t.indexOf("\n");
+  const status = nl < 0 ? t : t.slice(0, nl), body = nl < 0 ? "" : t.slice(nl + 1);
+  if (status !== "ok") throw new Error(body.trim() || status);
+  return body;
+}
+
+function show(err) { $("msg").textContent = err ? String(err.message || err) : ""; $("msg").style.display = err ? "block" : "none"; }
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+async function loadList() {
+  try {
+    const panes = JSON.parse(await ctl("ls", "--json")).filter(p => p.program !== "explorer");
+    const list = $("list");
+    list.replaceChildren();
+    if (!panes.length) list.append(el("div", "empty", "No terminal panes in open islands."));
+    for (const p of panes) {
+      const b = el("button", "pane"), top = el("div", "top");
+      top.append(el("span", "prog", p.program), el("span", null, p.island));
+      if (p.wants) top.append(el("span", "wants", "needs you"));
+      b.append(top, el("div", "cwd", p.cwd));
+      b.onclick = () => open(p);
+      list.append(b);
+    }
+    show(null);
+  } catch (e) { show(e); }
+}
+
+async function loadScreen() {
+  if (!pane) return;
+  const s = $("screen");
+  const atBottom = s.scrollTop + s.clientHeight >= s.scrollHeight - 20;
+  try {
+    const args = ["read", pane.id, "--json"];
+    if (lines) args.push("--lines", lines);
+    const text = JSON.parse(await ctl(...args)).text;
+    if (s.textContent !== text) { s.textContent = text; if (atBottom) s.scrollTop = s.scrollHeight; }
+    show(null);
+  } catch (e) { show(e); }
+}
+
+function poll(fn, ms) { clearInterval(timer); fn(); timer = setInterval(() => { if (!document.hidden) fn(); }, ms); }
+
+function open(p) {
+  pane = p; lines = 0;
+  $("title").textContent = p.program + " · " + p.island;
+  $("list").style.display = "none"; $("view").style.display = "flex";
+  $("back").hidden = false; $("more").hidden = false; $("more").textContent = "Screen";
+  $("screen").textContent = "";
+  poll(loadScreen, 1000);
+}
+
+function home() {
+  pane = null;
+  $("title").textContent = "JZero";
+  $("view").style.display = "none"; $("list").style.display = "block";
+  $("back").hidden = true; $("more").hidden = true;
+  poll(loadList, 3000);
+}
+
+async function act(...args) { try { await ctl(...args); setTimeout(loadScreen, 150); } catch (e) { show(e); } }
+
+for (const [label, key] of KEYS) {
+  const b = el("button", null, label);
+  b.onclick = () => key[0] === "=" ? act("send", pane.id, key.slice(1)) : act("key", pane.id, key);
+  $("keys").append(b);
+}
+$("form").onsubmit = e => { e.preventDefault(); const t = $("text").value; $("text").value = ""; t ? act("send", pane.id, t, "--enter") : act("key", pane.id, "enter"); };
+$("type").onclick = () => { const t = $("text").value; $("text").value = ""; if (t) act("send", pane.id, t); };
+$("back").onclick = home;
+$("more").onclick = () => { lines = lines ? 0 : 500; $("more").textContent = lines ? "History" : "Screen"; loadScreen(); };
+$("newIsland").onclick = async () => { try { const id = (await ctl("new", "island")).trim(); await loadList(); open({ id, program: "shell", island: "new" }); } catch (e) { show(e); } };
+
+if (!token) show("Missing token: open the full link `jzctl serve` printed.");
+home();
+</script>
+</body>
+</html>

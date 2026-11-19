@@ -1,0 +1,123 @@
+module jzero.term.shellsetup;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.desktop;
+use jzero.platform.os;
+use jzero.platform.shells;
+use jzero.session.paths;
+
+// Shell integration snippets (`assets/shell/`), copied to `<data>/shell/` at startup and loaded into each
+// shell without touching the user's rc files. They send OSC 7 (cwd), 133;A (prompt) and
+// 633;E (the command line) for `shellint.j3`. `bin/0` (JZero commands) and
+// `bin/jzctl` (control command) go on each shell's PATH; cmd and PowerShell find them as
+// `0.cmd` (which runs `zero.ps1`) and `jzctl.cmd`.
+
+// The snippet files, under `assets/shell/` (copied to the data dir so shells get absolute paths).
+const FILES: [10]string = ["jzero.bash", "zsh/.zshenv", "zsh/.zshrc", "jzero.fish", "jzero.ps1", "bin/0", "bin/jzctl", "bin/0.cmd", "bin/zero.ps1", "bin/jzctl.cmd"];
+
+// cmd.exe has no hooks, only its prompt: `$E` is ESC, `$P` the directory, `$G` is `>`. It
+// marks the prompt (133;A) and reports the directory (OSC 7); commands are not seen.
+const CMD_PROMPT = "PROMPT=$E]7;file://localhost/$P$E\\$E]133;A$E\\$P$G";
+
+pub fn install(mem: &Arena) {
+    io.makeDirs(shellDir("zsh"));
+    io.makeDirs(shellDir("bin"));
+    for f in FILES {
+        let src = Text.new(mem);
+        src.pushStr("assets/shell/");
+        src.pushStr(f);
+        match io.readFile(src.str(), mem) {
+            Result.Ok(bytes) { io.writeFile(shellDir(f), bytes); }
+            Result.Err(_) {}
+        }
+    }
+    // Windows has no chmod (and needs none): not finding it is fine.
+    let chmod: [4]string = ["chmod", "755", keep(mem, shellDir("bin/0")), shellDir("bin/jzctl")];
+    match proc.run(chmod[:], "", mem) {
+        Result.Ok(_) {}
+        Result.Err(_) {}
+    }
+}
+
+// Argv that runs the `0` command (`assets/shell/bin/`) from the data dir, into `out` (in `mem`).
+pub fn zero(mem: &Arena, out: &List<string>) { shells.zero(shellDir("bin"), mem, out); }
+
+// Argv and env for `shell` with integration loaded (bash, zsh, fish, PowerShell, cmd; others
+// run plain). Strings live in `mem`.
+pub fn prepare(shell: string, mem: &Arena, argv: &List<string>, env: &List<string>) {
+    argv.push(shell);
+    let name = shells.kind(shell);
+    let bin = Text.new(mem);
+    bin.pushStr("JZERO_BIN=");
+    // Git Bash on Windows wants `/c/...` (a `:` would split its PATH); the rest native paths.
+    bin.pushStr(if name == shells.BASH { os.toMsys(shellDir("bin")) } else { os.native(shellDir("bin")) });
+    env.push(bin.str());
+    let exe = Text.new(mem);
+    exe.add("JZERO_EXE=").add(os.native(os.exe()));  // what `bin/jzctl` runs
+    env.push(exe.str());
+    if name == shells.BASH {
+        argv.push("--rcfile");
+        argv.push(keep(mem, shellDir("jzero.bash")));
+    } else if name == shells.ZSH {
+        env.push(keep(mem, `JZERO_ZDOTDIR={sys.env("ZDOTDIR")}`));
+        let t = Text.new(mem);
+        t.pushStr("ZDOTDIR=");
+        t.pushStr(shellDir("zsh"));
+        env.push(t.str());
+    } else if name == shells.FISH {
+        argv.push("--init-command");
+        let t = Text.new(mem);
+        t.pushStr("source ");
+        t.pushStr(shellDir("jzero.fish"));
+        argv.push(t.str());
+    } else if name == shells.POWERSHELL {
+        // Read and run the text: dot-sourcing a file needs an execution policy that allows scripts.
+        argv.push("-NoExit");
+        argv.push("-Command");
+        let t = Text.new(mem);
+        t.pushStr("Invoke-Expression (Get-Content -Raw -LiteralPath ");
+        desktop.psQuote(os.native(shellDir("jzero.ps1")), &t);
+        t.push(41);
+        argv.push(t.str());
+    } else if name == shells.CMD {
+        env.push(CMD_PROMPT);
+        let t = Text.new(mem);
+        t.add("PATH=").add(os.native(shellDir("bin"))).add(";").add(sys.env("PATH"));
+        env.push(t.str());
+    }
+}
+
+// A fresh random token (16 hex digits, in `mem`): a shell's `$JZERO_TOKEN`, which its `0`
+// requests must carry, so printed text (`cat` of a file) cannot run commands.
+pub fn token(mem: &Arena): string {
+    let raw: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    os.random(raw[:]);
+    let mix = sys.monotonicMs() * 7919 + sys.getpid();  // ponytail: only if the OS gives no random bytes
+    let t = Text.new(mem);
+    for i in 0..8 {
+        let b = int(raw[i]) ^ ((mix >> (i * 4)) & 255);
+        t.push(u8(hexDigit(b >> 4)));
+        t.push(u8(hexDigit(b & 15)));
+    }
+    return t.str();
+}
+
+fn hexDigit(v: int): int { if v < 10 { return 48 + v; } return 87 + v; }
+
+fn shellDir(name: string): string {
+    let t = paths.dir();
+    t.pushStr("/shell/");
+    t.pushStr(name);
+    return t.str();
+}
+
+fn keep(mem: &Arena, s: string): string {
+    let t = Text.new(mem);
+    t.pushStr(s);
+    return t.str();
+}

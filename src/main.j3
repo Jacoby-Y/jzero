@@ -1,0 +1,196 @@
+module jzero;
+
+use jzero.actions;
+use jzero.devhook;
+use jzero.explorer.explorer;
+use jzero.explorer.highlight;
+use jzero.explorer.markdown;
+use jzero.explorer.mddoc;
+use jzero.explorer.mdhtml;
+use jzero.explorer.image;
+use jzero.explorer.thumbs;
+use jzero.explorer.kinds;
+use jzero.explorer.ops;
+use jzero.features.links;
+use jzero.features.palette;
+use jzero.features.ssh;
+use jzero.features.zerocmds;
+use jzero.ext.api;
+use jzero.ext.save;
+use jzero.features.quick;
+use jzero.features.ctl;
+use jzero.features.ctlhelp;
+use jzero.remote.serve;
+use j3.instance.Request;
+use j3.game.hotkey.Hotkey;
+use j3.instance;
+use jzero.input.keymap;
+use jzero.input.keymap.Keymap;
+use jzero.input.keynames;
+use jzero.input.keynames.KeyNames;
+use jzero.config.config;
+use jzero.config.draft;
+use jzero.layout.split;
+use jzero.session.store;
+use jzero.state;
+use jzero.kanban.board;
+use jzero.git.repo;
+use jzero.features.everything;
+use jzero.features.status;
+use jzero.term.procinfo;
+use jzero.term.search;
+use jzero.term.selection;
+use jzero.term.session;
+use jzero.platform.os;
+use jzero.platform.desktop;
+use jzero.platform.fileops;
+use jzero.platform.shells;
+use jzero.term.shellint;
+use jzero.term.linemap;
+use jzero.theme.files;
+use jzero.state.State;
+use jzero.ui.{ Screen, ScreenProps };
+use j3.app.App;
+use j3.game.windowSize;
+use j3.memory.{ Arena, List };
+use j3.io.printLn;
+use j3.sys;
+use j3.text.Text;
+
+struct World {
+    state: State;
+    keys: Keymap;
+    defKeys: Keymap;   // the defaults alone, for the settings screen's "reset"
+    root: Screen;
+    quickKey: Hotkey;  // global show/hide (config `quick-terminal-key`)
+}
+
+fn boot(mem: &Arena): World {
+    return World { state: state.create(mem), keys: keymap.create(mem), defKeys: keymap.create(mem), root: Screen.new(mem), quickKey: Hotkey {} };
+}
+
+fn start(w: &World) {
+    w.state.start();
+    // This run's own arguments (`jzero -e htop`); later launches arrive through `onMessage`.
+    let args = List<string>.new(w.state.mem);
+    for i in 0..sys.argCount() { args.push(sys.arg(i)); }
+    w.state.launch(args.items[0..args.len]);
+}
+
+// A later `jzero` handed its arguments over: `--toggle`, a launch, or just bring us up.
+fn onArgs(w: &World, args: []string) {
+    if w.state.launch(args) { quick.raise(); return; }
+    quick.onArgs(args);
+}
+
+// A `jzctl ls/send/...` control command from another process (`state/ctl.j3`).
+fn onRequest(w: &World, req: Request) { w.state.request(req); }
+
+fn stop(w: &World) { w.state.shutdown(); }
+
+fn draw(w: &World) {
+    if w.quickKey.pressed() { quick.toggle(); }
+    let a = w.keys.poll();
+    // Behind a dialog or the palette only the palette key works (it closes the palette).
+    if w.state.overlayOpen() && !(w.state.paletteOpen && a == actions.PALETTE) { a = actions.NONE; }
+    w.state.keysEaten = a != actions.NONE;
+    actions.run(&w.state, a);
+    devhook.frame(&w.state);
+    devhook.ui(&w.root.dom, &w.state.keyNames);
+    w.state.update();
+    if w.state.cfgReloaded { loadKeys(w); }
+    w.root.render(windowSize(), ScreenProps { state: &w.state });
+    if w.state.wantFrame { w.root.dom.requestFrame(); }  // the visual bell fades out
+}
+
+// Keybinds from the config, and the shortcut text the palette and menu show.
+fn loadKeys(w: &World) {
+    w.state.cfgReloaded = false;
+    keymap.load(&w.keys, w.state.cfg.keybinds, &w.state.keyNames);
+    quick.bind(&w.quickKey, w.state.cfg.quickKey, &w.state.keyNames);
+    let s = &w.state;
+    fill(&s.hints, &w.keys, &s.keyNames, true);
+    fill(&s.binds, &w.keys, &s.keyNames, false);
+    fill(&s.defBinds, &w.defKeys, &s.keyNames, false);
+}
+
+// The combo of every action id into `out` (for people or in config syntax).
+fn fill(out: &List<Text>, k: &Keymap, names: &KeyNames, people: bool) {
+    while out.len < actions.COUNT { out.push(Text.new(out.arena)); }
+    for id in 0..actions.COUNT {
+        out.items[id].clear();
+        keymap.hint(k, names, id, &out.items[id], people);
+    }
+}
+
+fn main() {
+    // `JZERO_SELFTEST=1 ./target/jzero`: run the logic self-checks, no window.
+    if sys.env("JZERO_SELFTEST") == "1" {
+        let a = Arena.create(1048576);
+        os.selfTest();
+        desktop.selfTest(&a);
+        fileops.selfTest(&a);
+        shells.selfTest(&a);
+        split.selfTest(&a);
+        selection.selfTest(&a);
+        config.selfTest(&a);
+        keynames.selfTest(&a);
+        draft.selfTest(&a);
+        store.selfTest(&a);
+        shellint.selfTest(&a);
+        zerocmds.selfTest(&a);
+        linemap.selfTest(&a);
+        search.selfTest(&a);
+        everything.selfTest(&a);
+        session.selfTest(&a);
+        procinfo.selfTest();
+        ctl.selfTest(&a);
+        serve.selfTest(&a);
+        status.selfTest();
+        files.selfTest(&a);
+        links.selfTest(&a);
+        palette.selfTest(&a);
+        explorer.selfTest(&a);
+        ops.selfTest(&a);
+        highlight.selfTest(&a);
+        markdown.selfTest(&a);
+        mdhtml.selfTest();
+        mddoc.selfTest(&a);
+        image.selfTest(&a);
+        thumbs.selfTest(&a);
+        kinds.selfTest();
+        ssh.selfTest(&a);
+        api.selfTest(&a);
+        save.selfTest(&a);
+        state.selfTest(&a);
+        board.selfTest(&a);
+        repo.selfTest(&a);
+        printLn("selftest ok");
+        return;
+    }
+    // `jzctl ls`, `jzctl send 3 hi`, ...: talk to the running copy, no window.
+    if ctlhelp.wanted() { ctlhelp.print(); return; }
+    if serve.wanted() { serve.serve(); return; }  // the phone page (`remote/serve.j3`)
+    if ctl.isCommand() { ctl.run(); return; }
+    // One copy per window class: a later `jzero` (or `jzero --toggle`) hands its arguments to
+    // this one and exits; `jzero --class work` is a window of its own, grouped by the desktop as
+    // `work`. Headless runs (tests) stay separate so they never poke a real window, unless
+    // `JZERO_CTL` names a test instance.
+    os.appStart();
+    let cls = ctl.classArg();
+    let argMem = Arena.create(256);
+    let headless = sys.env("SDL_VIDEODRIVER") == "offscreen" && sys.env("JZERO_CTL").len == 0;
+    if !headless && !instance.claim(ctl.serveName(&argMem)) { return; }
+    let app = App<World>.create("JZero", 1100, 680, boot);
+    if cls.len > 0 { app.windowClass(cls); }
+    app.onMessage(onArgs);
+    app.onRequest(onRequest);
+    app.useGl();
+    if config.seeThrough() { app.transparent(); }
+    app.undecorated();
+    app.hiDpi();
+    app.startup(start);
+    app.shutdown(stop);
+    app.draw(draw);
+    app.run();
+}

@@ -1,0 +1,69 @@
+<script>
+    use jzero.state.State;
+    use jzero.kanban.boards.{ EDIT_NONE, EDIT_CARD, EDIT_COLUMN, EDIT_BOARD };
+    props { state: &State; }
+
+    let name: string = "";
+    let body: string = "";
+    let refused = false;
+    let confirmDelete = false;
+
+    fn onMount() {
+        let kb = &state.kanban;
+        if kb.edit == EDIT_BOARD { name = kb.cur.str(); }
+        else if kb.edit == EDIT_COLUMN { name = kb.board.col(kb.editCol).name.str(); }
+        else {
+            let card = kb.board.card(kb.editCol, kb.editCard);
+            name = card.title.str();
+            body = card.body.str();
+        }
+    }
+
+    fn done() { refused = !state.kanban.apply(name, body); }
+
+    fn heading(kind: int): string {
+        if kind == EDIT_BOARD { return "Board"; }
+        if kind == EDIT_COLUMN { return "Column"; }
+        return "Card";
+    }
+</script>
+
+{#let kb = &state.kanban}
+<dialog modal autoselect class="edit" on:close={kb.edit = EDIT_NONE}>
+    <h2>{heading(kb.edit)}</h2>
+    <input type="text" bind:value={name} on:input={refused = false} />
+    {#if refused}
+        <p class="err">That name is empty, taken, or has a "/".</p>
+    {/if}
+    {#if kb.edit == EDIT_CARD}
+        <textarea class="body" bind:value={body} rows="8" placeholder="Details" />
+    {/if}
+    <div class="acts">
+        <button class="small del" on:click={confirmDelete = true}>Delete</button>
+        <div class="spacer"></div>
+        <button class="small" on:click={kb.edit = EDIT_NONE}>Cancel</button>
+        <button class="small ok" default on:click={done()}>Done</button>
+    </div>
+    {#if confirmDelete}
+        <dialog modal class="confirm" on:close={confirmDelete = false}>
+            <p>Delete this {heading(kb.edit)}?{if kb.edit == EDIT_COLUMN { " Its cards go too." } else { "" }}</p>
+            <div class="acts">
+                <button class="small" on:click={confirmDelete = false}>Cancel</button>
+                <button class="small del" default on:click={confirmDelete = false; kb.removeEdited()}>Delete</button>
+            </div>
+        </dialog>
+    {/if}
+</dialog>
+
+<style>
+    .edit { width: 460px; padding: 16px; display: flex; flex-direction: column; gap: 10px; background: var(--chrome-bg); color: var(--chrome-fg); }
+    h2 { font-size: 16px; color: var(--c-bright-white); }
+    input, .body { padding: 6px 8px; background: var(--term-bg); color: var(--c-bright-white); border: none; }
+    .err { color: var(--chrome-danger); }
+    .acts { display: flex; flex-direction: row; gap: 8px; }
+    .spacer { flex: 1; }
+    .small { height: 30px; padding: 0 14px; background: var(--chrome-hover); }
+    .ok { background: var(--chrome-active); color: var(--c-bright-white); }
+    .del { color: var(--chrome-danger); }
+    .confirm { width: 340px; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--chrome-bg); color: var(--chrome-fg); }
+</style>

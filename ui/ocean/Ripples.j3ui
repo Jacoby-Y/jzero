@@ -1,0 +1,111 @@
+<script>
+    // Ocean backdrop: moving the pointer drops faint dot rings; a press or drag drops bold `*` rings.
+    // Cells match the JZERO wordmark (`.line` in Ocean.j3ui): mono.ttf at clamp(14px, 2.6vw, 40px).
+    use j3.game;
+    use j3.game.{ Font, mousePos, mouseDown, Mouse, windowSize };
+    use j3.gfx.paint;
+    use j3.math.{ sqrt, abs };
+    use j3.ui.css.{ P_COLOR };
+    use j3.ui.dom.colorOf;
+    use jzero.theme.theme.withAlpha;
+
+    const MAX = 64;          // live rings; a new one replaces the oldest
+    const GAP: f32 = 0.03;   // min seconds between rings, so MAX * GAP > LIFE and live rings never get replaced
+    const LIFE: f32 = 1.2;   // seconds a ring lasts
+    const SPEED: f32 = 9.0;  // cells per second the ring grows
+    const BOLD: [4]string = ["*", "*", "+", "."];  // pressed rings, young → old
+    const SOFT_ALPHA: f32 = 0.45;  // hover rings: dots at this peak alpha
+
+    let el: int = -1;
+    let px: int = 0;
+    let font: Font = Font { raw: 0 as ptr };
+    let cw: f32 = 1.0;  // cell width
+    let rx: [64]f32 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let ry: [64]f32 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let bold: [64]bool = [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let age: [64]f32 = [99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0];
+    let next: int = 0;
+    let lastX: f32 = -1000.0;
+    let lastY: f32 = -1000.0;
+    let wasDown = false;
+    let since: f32 = 99.0;  // seconds since the last ring
+
+    fn onFrame(dt: f32) {
+        for k in 0..MAX { age[k] = age[k] + dt; }
+        since = since + dt;
+        if el < 0 || font.raw == 0 as ptr { return; }
+        let m = mousePos();
+        let x = m.x - d.absX(el);
+        let y = m.y - d.absY(el);
+        let down = mouseDown(Mouse.Left);
+        let pressed = down && !wasDown;
+        wasDown = down;
+        let dx = x - lastX;
+        let dy = y - lastY;
+        if !pressed && (since < GAP || dx * dx + dy * dy < f32(px * px)) { return; }
+        since = 0.0;
+        lastX = x;
+        lastY = y;
+        rx[next] = x;
+        ry[next] = y;
+        bold[next] = down;
+        age[next] = 0.0;
+        next = (next + 1) % MAX;
+    }
+
+    fn onDestroy() { if font.raw != 0 as ptr { game.destroyFont(font); } }
+
+    // Reload the font when the window width moves the size.
+    fn fit() {
+        let want = int(windowSize().x * 0.026);
+        if want < 14 { want = 14; }
+        if want > 40 { want = 40; }
+        if want == px { return; }
+        if font.raw != 0 as ptr { game.destroyFont(font); }
+        px = want;
+        font = game.tryLoadFont("assets/mono.ttf", px);
+        cw = game.textSize(font, "M").x;
+        if cw < 1.0 { cw = 1.0; }
+    }
+
+    // ponytail: scans each ring's bounding box of cells; fine at MAX rings.
+    fn drawRipples(size: Vec2) {
+        fit();
+        let id = d.node(el);
+        if id < 0 || font.raw == 0 as ptr { return; }
+        let rgb = colorOf(d, d.nodes.items[id].style, P_COLOR);
+        let ch = f32(px);
+        let cols = int(size.x / cw) + 1;
+        let rows = int(size.y / ch) + 1;
+        for k in 0..MAX {
+            let t = age[k];
+            if t >= LIFE { continue; }
+            let r = SPEED * t;  // radius in cells
+            let fade = 1.0 - t / LIFE;
+            let g = ".";
+            if bold[k] { g = BOLD[int(t / LIFE * 4.0)]; } else { fade = fade * SOFT_ALPHA; }
+            let c = withAlpha((rgb >> 8) & 0xFFFFFF, int(255.0 * fade));
+            let ccx = rx[k] / cw;
+            let ccy = ry[k] / ch;
+            let ca = int(ccx - r - 1.0); let cb = int(ccx + r + 1.0);
+            let ra = int(ccy - r - 1.0); let rb = int(ccy + r + 1.0);
+            if ca < 0 { ca = 0; } if ra < 0 { ra = 0; }
+            if cb > cols { cb = cols; } if rb > rows { rb = rows; }
+            for cy in ra..rb {
+                for cx in ca..cb {
+                    let ex = f32(cx) + 0.5 - ccx;
+                    let ey = (f32(cy) + 0.5 - ccy) * ch / cw;  // round in pixels, not cells
+                    let dist = sqrt(ex * ex + ey * ey);
+                    if abs(dist - r) > 0.6 { continue; }
+                    paint.text(font, Vec2 { x: f32(cx) * cw, y: f32(cy) * ch }, g, c);
+                }
+            }
+        }
+    }
+</script>
+
+<canvas class="ripples" bind:this={el} on:draw={drawRipples(size)}></canvas>
+
+<style>
+    .ripples { position: absolute; left: 0; top: 0; right: 0; bottom: 0; pointer-events: none; color: var(--ocean-ripple); }
+</style>

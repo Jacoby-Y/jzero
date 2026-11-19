@@ -1,0 +1,119 @@
+module jzero.features.everything;
+
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.text.Text;
+
+pub const OUTPUT = 0;
+pub const COMMAND = 1;
+
+// One searchable text: a pane's scrollback or its command list.
+pub struct Doc {
+    island: int;
+    leaf: int;
+    kind: int;      // OUTPUT or COMMAND
+    text: string;   // in Found.mem
+}
+
+// "Search everything": every pane's scrollback and commands, open islands and closed ones,
+// gathered once when the search opens (`State.gatherAll`), then matched on each keystroke.
+pub struct Found {
+    mem: &Arena;
+    docs: List<Doc>;
+    hits: List<int>;   // doc, line start, line end per hit, newest first within a doc
+
+    fn reset(this: &Found) {
+        this.mem.destroy();
+        *this.mem = Arena.create(1048576);
+        this.docs = List<Doc>.new(this.mem);
+        this.hits = List<int>.new(this.mem);
+    }
+
+    fn add(this: &Found, island: int, leaf: int, kind: int, text: string) {
+        if text.len == 0 { return; }
+        let t = Text.new(this.mem);
+        t.pushStr(text);
+        this.docs.push(Doc { island: island, leaf: leaf, kind: kind, text: t.str() });
+    }
+
+    // Lines containing `q` (ASCII case-insensitive), commands first, at most `max`.
+    fn find(this: &Found, q: string, max: int) {
+        this.hits.len = 0;
+        if q.len < 2 { return; }
+        for kind in 0..2 {
+            let want = COMMAND - kind;
+            for d in 0..this.docs.len {
+                let doc = this.docs.items[d];
+                if doc.kind != want { continue; }
+                let s = doc.text;
+                let end = s.len;
+                // newest (last) lines first
+                while end > 0 {
+                    let start = end;
+                    while start > 0 && s[start - 1] != 10 { start -= 1; }
+                    if contains(s[start..end], q) {
+                        this.hits.push(d);
+                        this.hits.push(start);
+                        this.hits.push(end);
+                        if this.hits.len >= max * 3 { return; }
+                    }
+                    end = start - 1;
+                    if end < 0 { end = 0; }
+                }
+            }
+        }
+    }
+
+    fn count(this: &Found): int { return this.hits.len / 3; }
+    fn doc(this: &Found, k: int): Doc { return this.docs.items[this.hits.items[k * 3]]; }
+    fn line(this: &Found, k: int): string {
+        let d = this.doc(k);
+        return d.text[this.hits.items[k * 3 + 1]..this.hits.items[k * 3 + 2]];
+    }
+}
+
+pub fn create(mem: &Arena): Found {
+    let a = &mem.alloc::<Arena>(1)[0];
+    *a = Arena.create(4096);
+    return on(a);
+}
+
+// A Found in `a`, an arena the caller made (it outlives the Found; `reset` remakes it in place).
+pub fn on(a: &Arena): Found {
+    return Found { mem: a, docs: List<Doc>.new(a), hits: List<int>.new(a) };
+}
+
+// `q` in `s`, ASCII case-insensitive.
+pub fn contains(s: string, q: string): bool {
+    if q.len > s.len { return false; }
+    for i in 0..s.len - q.len + 1 {
+        let ok = true;
+        for j in 0..q.len {
+            if lower(s[i + j]) != lower(q[j]) { ok = false; break; }
+        }
+        if ok { return true; }
+    }
+    return false;
+}
+
+fn lower(c: u8): u8 {
+    if c >= 65 && c <= 90 { return c + 32; }
+    return c;
+}
+
+// Self-check: commands before output, newest line first, the cap.
+pub fn selfTest(mem: &Arena) {
+    let f = create(mem);
+    f.reset();
+    f.add(0, 1, OUTPUT, "make all\nok\nmake test\n");
+    f.add(2, 3, COMMAND, "ls\nMAKE deploy\n");
+    f.find("make", 10);
+    check(f.count() == 3 && f.doc(0).kind == COMMAND && f.line(0) == "MAKE deploy", "order");
+    check(f.line(1) == "make test" && f.line(2) == "make all", "newest first");
+    f.find("make", 2);
+    check(f.count() == 2, "cap");
+    f.find("m", 10);
+    check(f.count() == 0, "short query");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`search-all selfTest: {what}`); } }

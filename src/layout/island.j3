@@ -1,0 +1,93 @@
+module jzero.layout.island;
+
+use j3.memory.{ Arena, List };
+use j3.text.Text;
+use jzero.layout.icons;
+use jzero.layout.split;
+use jzero.layout.split.Panes;
+
+pub fn iconName(i: int): string { return icons.name(i); }
+// Color tags (0 none, then the ANSI colors red..cyan: `.tag-N` in the UI).
+pub const TAG_COUNT = 7;
+
+// A named multi-pane session: a split tree of shells (`panes`, empty while closed).
+pub struct Island {
+    name: Text;
+    icon: int = 0;
+    x: f32 = 0.0;   // position on the ocean, px
+    y: f32 = 0.0;
+    open: bool = false;
+    panes: Panes;
+    fontPx: int = 0;        // font size of this island's shells (0: the config's)
+    tag: int = 0;           // color tag, 0 none
+    used: int = 0;          // when it was last shown (State.useClock), for sorting
+    broadcast: bool = false; // typing goes to every shell of the island (not saved)
+    unseen: bool = false;   // output arrived while another island showed (not saved)
+    temp: bool = false;     // from `jzero -e`: not saved, deleted when it closes
+}
+
+pub struct Islands {
+    list: List<Island>;
+
+    fn add(this: &Islands, mem: &Arena, name: string, icon: int, x: f32, y: f32): int {
+        let t = Text.new(mem);
+        t.pushStr(name);
+        this.list.push(Island { name: t, icon: icon, x: x, y: y, panes: split.create(mem) });
+        return this.list.len - 1;
+    }
+
+    fn all(this: &Islands): []Island { return this.list.items[0..this.list.len]; }
+
+    fn get(this: &Islands, i: int): &Island { return &this.list.items[i]; }
+
+    fn count(this: &Islands): int { return this.list.len; }
+
+    fn rename(this: &Islands, i: int, name: string) {
+        let isl = this.get(i);
+        isl.name.clear();
+        isl.name.pushStr(name);
+    }
+
+    // Some island's tile would overlap one placed at (x, y).
+    fn near(this: &Islands, x: f32, y: f32): bool {
+        for i in 0..this.list.len {
+            let isl = this.get(i);
+            if absF(isl.x - x) < 96.0 && absF(isl.y - y) < 96.0 { return true; }
+        }
+        return false;
+    }
+
+    fn remove(this: &Islands, i: int) { this.list.remove(i); }
+
+    // Move island `from` to index `to`, shifting the ones between.
+    fn move(this: &Islands, from: int, to: int) {
+        let step = if to > from { 1 } else { -1 };
+        let k = from;
+        while k != to {
+            let tmp = this.list.items[k];
+            this.list.items[k] = this.list.items[k + step];
+            this.list.items[k + step] = tmp;
+            k = k + step;
+        }
+    }
+
+    // Island indices by `used`, most recent first, into `out`.
+    fn byUse(this: &Islands, out: &List<int>) {
+        out.len = 0;
+        for i in 0..this.list.len {
+            out.push(i);
+            let j = out.len - 1;
+            while j > 0 && this.get(out.items[j - 1]).used < this.get(i).used {
+                out.items[j] = out.items[j - 1];
+                j -= 1;
+            }
+            out.items[j] = i;
+        }
+    }
+}
+
+pub fn create(mem: &Arena): Islands {
+    return Islands { list: List<Island>.new(mem) };
+}
+
+fn absF(v: f32): f32 { if v < 0.0 { return -v; } return v; }

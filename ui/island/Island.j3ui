@@ -1,0 +1,88 @@
+<script>
+    use jzero.state.State;
+    use jzero.layout.island.Island;
+    use jzero.layout.split;
+    use jzero.layout.split.{ Node, Panes };
+    use j3.game.{ mousePos, mouseDown, Mouse };
+    props { state: &State; isl: &Island; }
+
+    let el = -1;        // the island box, for divider drags
+    let dragging = -1;  // split node whose divider is held
+
+    fn onFrame(dt: f32) {
+        // A focused shell owns the keyboard: no UI element may hold focus (a button would take
+        // Enter/Space, a text box every key). An explorer pane keeps its own text boxes.
+        if d.focused() >= 0 && !state.overlayOpen() && focusedIsShell() && !searching() { d.focusNode(-1); }
+        if dragging < 0 { return; }
+        if !mouseDown(Mouse.Left) { dragging = -1; return; }
+        let m = mousePos();
+        let sz = d.size(el);
+        let fx = (m.x - d.absX(el)) / sz.x;
+        let fy = (m.y - d.absY(el)) / sz.y;
+        let n = isl.panes.get(dragging);
+        if n.kind == split.RIGHT { isl.panes.setRatio(dragging, (fx - n.x) / n.w); }
+        else { isl.panes.setRatio(dragging, (fy - n.y) / n.h); }
+    }
+
+    fn focusedIsShell(): bool {
+        let f = isl.panes.focus;
+        return f >= 0 && isl.panes.get(f).pane == split.TERMINAL;
+    }
+
+    // The focused shell's search box is open (it keeps the keyboard).
+    fn searching(): bool {
+        let f = isl.panes.focus;
+        return f >= 0 && isl.panes.get(f).hasTerm() && isl.panes.get(f).session().find.open;
+    }
+
+    // `background-opacity` below 100: the gaps between panes show the desktop.
+    fn clear(): bool { return state.cfg.backgroundOpacity < 100; }
+
+    // A pane's box: its own rect, or the whole island while it is zoomed.
+    fn left(n: &Node, i: int): f32 { if isl.panes.zoomed == i { return 0.0; } return n.x * 100.0; }
+    fn top(n: &Node, i: int): f32 { if isl.panes.zoomed == i { return 0.0; } return n.y * 100.0; }
+    fn width(n: &Node, i: int): f32 { if isl.panes.zoomed == i { return 100.0; } return n.w * 100.0; }
+    fn height(n: &Node, i: int): f32 { if isl.panes.zoomed == i { return 100.0; } return n.h * 100.0; }
+
+    // Position of a split's divider line, as a fraction of the island.
+    fn cut(n: &Node): f32 {
+        if n.kind == split.RIGHT { return (n.x + n.w * n.ratio) * 100.0; }
+        return (n.y + n.h * n.ratio) * 100.0;
+    }
+</script>
+
+<div class="island" class:clear={clear()} bind:this={el}>
+    {#each isl.panes.all() as &n, i (i : int)}
+        {#if n.alive && n.kind == split.LEAF && !isl.panes.shows(i)}
+        {:else if n.alive && n.kind == split.LEAF && n.pane == split.EXPLORER}
+            {#if n.hasExplorer()}
+                <explorer.Explorer ex={n.explorer()} clip={&state.clip} focused={isl.panes.focus == i} scale={state.zoomScale(isl)}
+                    style:left="calc({left(n, i)}% + 1px)" style:top="calc({top(n, i)}% + 1px)"
+                    style:width="calc({width(n, i)}% - 2px)" style:height="calc({height(n, i)}% - 2px)"
+                    on:focus={isl.panes.focus = i} on:menu={state.openMenu(event.x, event.y)} />
+            {/if}
+        {:else if n.alive && n.kind == split.LEAF}
+            <island.Pane node={n} leaf={i} focused={isl.panes.focus == i} keys={!state.keysEaten && !state.overlayOpen()} pointer={!state.overlayOpen()}
+                broadcast={isl.broadcast} alpha={f32(state.cfg.backgroundOpacity) / 100.0}
+                style:left="calc({left(n, i)}% + 1px)" style:top="calc({top(n, i)}% + 1px)"
+                style:width="calc({width(n, i)}% - 2px)" style:height="calc({height(n, i)}% - 2px)"
+                on:focus={isl.panes.focus = i} on:menu={state.openMenu(event.x, event.y)}
+                on:swap={state.swapPanes(event.from, i)} />
+        {:else if isl.panes.zoomed >= 0}
+        {:else if n.alive && n.kind == split.RIGHT}
+            <div class="div v" style:left="calc({cut(n)}% - 3px)" style:top="{n.y * 100.0}%"
+                style:height="{n.h * 100.0}%" on:mousedown={dragging = i}></div>
+        {:else if n.alive}
+            <div class="div h" style:top="calc({cut(n)}% - 3px)" style:left="{n.x * 100.0}%"
+                style:width="{n.w * 100.0}%" on:mousedown={dragging = i}></div>
+        {/if}
+    {/each}
+</div>
+
+<style>
+    .island { flex: 1; min-height: 0; position: relative; background: var(--divider); }
+    .island.clear { background: transparent; }
+    .div { position: absolute; z-index: 2; }
+    .v { width: 6px; cursor: col-resize; }
+    .h { height: 6px; cursor: row-resize; }
+</style>

@@ -1,0 +1,110 @@
+// tui: drawing helpers for JZero extensions. `use tui;` then `tui.box(...)`.
+// Built on the host's natives (write, at, color, invert, reset). Colors are the theme's
+// 16 terminal slots, so they follow the theme; -1 is the default color.
+
+pub const BLACK = 0;
+pub const RED = 1;
+pub const GREEN = 2;
+pub const YELLOW = 3;
+pub const BLUE = 4;
+pub const MAGENTA = 5;
+pub const CYAN = 6;
+pub const WHITE = 7;
+pub const GRAY = 8;   // bright black; 9..15 are the other bright colors
+
+// `s` repeated `n` times.
+pub fn rep(s, n) {
+    let out = "";
+    for i in 0..n { out += s; }
+    return out;
+}
+
+// `s` cut or padded with spaces to exactly `w` columns.
+pub fn fit(s, w) {
+    if w <= 0 { return ""; }
+    let c = cut(s, w);
+    return c + rep(" ", w - width(c));
+}
+
+// Text at (x, y) in colors fg on bg.
+pub fn text(x, y, s, fg, bg) {
+    at(x, y);
+    color(fg, bg);
+    write(s);
+    reset();
+}
+
+// A rectangle of background color bg.
+pub fn fill(x, y, w, h, bg) {
+    let row = rep(" ", w);
+    color(-1, bg);
+    for r in 0..h {
+        at(x, y + r);
+        write(row);
+    }
+    reset();
+}
+
+// A frame w x h at (x, y) with `title` ("" for none) in its top edge.
+pub fn box(x, y, w, h, title, fg) {
+    if w < 2 || h < 2 { return; }
+    color(fg, -1);
+    at(x, y);
+    write("┌" + rep("─", w - 2) + "┐");
+    for r in 1..h - 1 {
+        at(x, y + r);
+        write("│");
+        at(x + w - 1, y + r);
+        write("│");
+    }
+    at(x, y + h - 1);
+    write("└" + rep("─", w - 2) + "┘");
+    if len(title) > 0 && w > 6 {
+        at(x + 2, y);
+        write(" " + fit(title, w - 6) + " ");
+    }
+    reset();
+}
+
+// Rows of `items` (strings) from index `top`, `h` rows of width `w`; row `sel` inverted.
+pub fn list(x, y, w, h, items, sel, top) {
+    for r in 0..h {
+        let i = top + r;
+        at(x, y + r);
+        if i < len(items) {
+            if i == sel { invert(true); }
+            write(fit(items[i], w));
+            reset();
+        } else {
+            write(rep(" ", w));
+        }
+    }
+}
+
+// The `top` that keeps row `sel` visible in `h` rows.
+pub fn scrollTo(sel, top, h) {
+    if sel < top { return sel; }
+    if sel >= top + h { return sel - h + 1; }
+    return top;
+}
+
+// A one-line bar across the pane at row `y`, inverted.
+pub fn bar(pane, y, s) {
+    at(0, y);
+    invert(true);
+    write(fit(s, pane.cols));
+    reset();
+}
+
+// A clickable `[ label ]` at (x, y), inverted; a left click on it calls `f(pane)`, then `draw`.
+// Call it from `draw` (the host empties `pane.buttons` before each draw). Gives its width.
+pub fn button(pane, x, y, label, f) {
+    let s = "[ " + label + " ]";
+    let w = width(s);
+    at(x, y);
+    invert(true);
+    write(s);
+    reset();
+    pane.buttons.push({ x: x, y: y, w: w, f: f });
+    return w;
+}

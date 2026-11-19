@@ -1,0 +1,6 @@
+#!/bin/sh
+# Register JZero as a terminal emulator (x-terminal-emulator).
+set -e
+if [ "$1" = configure ]; then
+    update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator /usr/bin/jzero 40
+fi

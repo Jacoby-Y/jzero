@@ -1,0 +1,54 @@
+module jzero.features.quick;
+
+use j3.game;
+use j3.game.Key;
+use j3.game.hotkey;
+use j3.game.hotkey.Hotkey;
+use j3.io.printLn;
+use j3.result.Result;
+use jzero.input.keynames;
+use jzero.input.keynames.KeyNames;
+use jzero.input.mods;
+
+// Quick terminal: a global hotkey (X11, config `quick-terminal-key`) or `jzero --toggle` (any
+// desktop: bind it in the compositor) hides the window, or shows and raises it.
+
+pub fn toggle() {
+    if game.windowShown() && game.windowFocused() { game.hideWindow(); return; }
+    game.showWindow();
+    game.raiseWindow();
+}
+
+// Arguments of a later `jzero` launch: `--toggle` toggles, anything else brings this window up.
+pub fn onArgs(args: []string) {
+    for i in 1..args.len { if args[i] == "--toggle" { toggle(); return; } }
+    raise();
+}
+
+pub fn raise() {
+    game.showWindow();
+    game.raiseWindow();
+}
+
+// Grab `combo` ("" for none) instead of what `hk` held. A bad or taken combo is reported once.
+pub fn bind(hk: &Hotkey, combo: string, names: &KeyNames) {
+    hk.unregister();
+    *hk = Hotkey {};
+    if combo.len == 0 { return; }
+    let m = 0;
+    let key = Key.A;
+    if !keynames.parseCombo(names, combo, &m, &key) { printLn(`config: bad quick-terminal-key "{combo}"`); return; }
+    match hotkey.register(key, hotkeyMods(m)) {
+        Result.Ok(h) { *hk = h; }
+        Result.Err(_) { printLn(`quick-terminal-key "{combo}": no global hotkey here (Wayland, headless or taken); bind "jzero --toggle" instead`); }
+    }
+}
+
+fn hotkeyMods(m: int): int {
+    let r = hotkey.NONE;
+    if (m & mods.CTRL) != 0 { r += hotkey.CTRL; }
+    if (m & mods.SHIFT) != 0 { r += hotkey.SHIFT; }
+    if (m & mods.ALT) != 0 { r += hotkey.ALT; }
+    if (m & mods.SUPER) != 0 { r += hotkey.SUPER; }
+    return r;
+}

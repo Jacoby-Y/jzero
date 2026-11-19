@@ -1,0 +1,63 @@
+// ParticleTester: click anywhere for an ascii explosion in a random color. Copy this folder to
+// ~/.config/jzero/extensions/particletester, then Command palette → "Extension: ParticleTester".
+pub let title = "ParticleTester";
+
+const BRIGHT = [9, 10, 11, 12, 13, 14, 15];   // bright slot; its dim one is slot - 8
+const GLYPHS = ["@", "*", "+", ":", "."];     // full life → almost gone
+
+pub fn open(pane) {
+    pane.parts = [];
+    // right-click menu entries
+    pane.menu = [{ label: "Big explosion", f: fn(p) { burst(p, p.cols / 2, p.rows / 2, 300, 60); } }];
+}
+
+pub fn click(pane, col, row, button) { if button == 0 { burst(pane, col, row, 40, 22); } }
+
+// `n` particles from col,row, speeds up to `speed` cells/s.
+fn burst(pane, col, row, n, speed) {
+    let c = pick(BRIGHT);
+    for i in 0..n {
+        let a = rand(0, math.pi * 2);
+        let s = rand(4, speed);
+        let life = rand(0.3, 1.6);   // random lifetime = random fade
+        // x speed doubled: cells are about twice as tall as wide
+        pane.parts.push({ x: col, y: row, vx: math.cos(a) * s * 2, vy: math.sin(a) * s, life: life, max: life, c: c });
+    }
+    pane.last = ms();
+    pane.every = 33;
+}
+
+pub fn tick(pane) {
+    let now = ms();
+    let dt = (now - pane.last) / 1000.0;
+    pane.last = now;
+    let alive = [];
+    for p in pane.parts {
+        p.life -= dt;
+        if p.life <= 0 { continue; }
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vx *= 0.92;
+        p.vy = p.vy * 0.92 + 6 * dt;   // drag + a little gravity
+        alive.push(p);
+    }
+    pane.parts = alive;
+    if len(alive) == 0 { pane.every = nil; }
+}
+
+pub fn draw(pane) {
+    clear();
+    if len(pane.parts) == 0 { at(1, 0); write("click anywhere"); return; }
+    for p in pane.parts {
+        let x = math.floor(p.x);
+        let y = math.floor(p.y);
+        if x < 0 || y < 0 || x >= pane.cols || y >= pane.rows { continue; }
+        let t = p.life / p.max;   // 1 → 0
+        let fg = p.c;
+        if t < 0.5 { fg = p.c - 8; }
+        if t < 0.2 { fg = 8; }
+        color(fg, -1);
+        at(x, y);
+        write(GLYPHS[math.min(4, math.floor((1 - t) * 5))]);
+    }
+}

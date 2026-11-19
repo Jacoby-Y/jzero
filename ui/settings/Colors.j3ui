@@ -1,0 +1,35 @@
+<script>
+    use jzero.state.State;
+    use jzero.config.draft;
+    use jzero.theme.theme.{ BG, FG, SEL, CURSOR };
+    props { state: &State; }
+    // Slots by row: the four specials, then the 16 ANSI colors.
+    const ORDER: [20]int = [16, 17, 19, 18, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    const NAMES: [20]string = [
+        "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White",
+        "Bright black", "Bright red", "Bright green", "Bright yellow", "Bright blue", "Bright magenta", "Bright cyan", "Bright white",
+        "Background", "Foreground", "Selection", "Cursor",
+    ];
+</script>
+{#let dr = &state.draft}
+<div class="tab">
+    <p class="note">Changes override the theme ({state.themes.title(dr.base)}). Reset puts a color back to the theme's.</p>
+    {#each 0..20 as i}
+        {#let k = ORDER[i]}
+        <settings.Row name={NAMES[k]}>
+            <input type="color" bind:value={dr.colors.items[k]} />
+            <span class="hex">{dr.colors.items[k]}</span>
+            {#if draft.overridden(dr, &state.themes, k)}
+                <button class="reset" title="Back to the theme's color" on:click={draft.resetColor(dr, &state.themes, k)}><icon name="arrow-counterclockwise" /></button>
+            {/if}
+        </settings.Row>
+    {/each}
+    <button class="all" on:click={draft.resetColors(dr, &state.themes)}>Reset all colors</button>
+</div>
+<style>
+    .note { color: var(--c-bright-black); font-size: 12px; margin-bottom: 6px; }
+    input[type="color"] { width: 48px; height: 24px; flex-shrink: 0; }
+    .hex { width: 80px; color: var(--c-bright-white); }
+    .reset { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; }
+    .all { height: 30px; padding: 0 12px; margin-top: 8px; background: var(--chrome-hover); }
+</style>

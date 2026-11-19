@@ -1,0 +1,583 @@
+module jzero.term.session;
+
+use jzero.platform.os;
+use jzero.platform.shells;
+use jzero.term.fonts.Face;
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.sys;
+use j3.term.ansi.{ Parser, feed };
+use j3.term.grid.Grid;
+use j3.term.pty;
+use j3.term.pty.Pty;
+use j3.term.view.View;
+use j3.text.Text;
+use j3.option.Option;
+use j3.game;
+use j3.game.Mouse;
+use j3.math.Vec2;
+use j3.term.grid.{ MODE_CURSOR, MODE_MOUSE_ANY, lineText };
+use j3.io;
+use j3.term.input.{ encodePaste, encodeKey, encodeMouse, MB_NONE, MB_LEFT, MB_MIDDLE, MB_RIGHT, MA_MOVE, MOD_SHIFT, MOD_ALT, MOD_CTRL };
+use jzero.config.config;
+use jzero.config.config.Config;
+use jzero.input.mods;
+use jzero.term.search;
+use jzero.term.search.Search;
+use jzero.term.selection.Selection;
+use jzero.theme.theme;
+use jzero.features.links;
+use jzero.term.procinfo;
+use jzero.term.reader;
+use jzero.term.shellint;
+use jzero.term.shellsetup;
+use jzero.term.shellint.Tap;
+use jzero.term.linemap;
+use jzero.term.linemap.LineMap;
+use jzero.term.reader.Reader;
+use jzero.features.zerocmds.ZeroCmds;
+
+const READ_BYTES = 65536;
+const MAX_READS = 16;  // per frame, so a flood (`yes`) cannot stall the UI
+const BLINK_MS = 530;  // xterm's
+const BELL_MS = 120;
+const SEARCH_EVERY_MS = 250;  // re-search new output at most this often
+const DRAG_SCROLL_MS = 30;    // drag-select past an edge scrolls this often
+const GUTTER: f32 = 3.0;          // px of a failed-command mark, left of the text
+
+// One shell on a pty, its screen model and its view. Lives in its own arena so `close` frees
+// everything. Main thread only (View is GL).
+pub struct Session {
+    mem: &Arena;
+    cfg: &Config;           // look settings, read live (padding, cursor, dimming)
+    pty: Pty;
+    parser: Parser;
+    grid: Grid;
+    tap: Tap;               // parser -> tap -> grid: reads shell integration OSCs
+    view: View;
+    reader: Reader;         // wakes the idle loop on output
+    sel: Selection;
+    find: Search;           // Ctrl+Shift+F
+    lines: LineMap;         // keeps the tap's grid lines through a reflowing resize
+    isCommand: bool;        // runs a program (ssh, `-e`), not a shell
+    scrollback: int;        // lines the grid keeps
+    themeAt: int = -1;      // theme version the View palette was last set from
+    linkLine: int = -1;     // link under the pointer while Ctrl is held (grid line, -1 none)
+    linkLo: int = 0;
+    linkHi: int = 0;
+    out: Text;              // bytes for the pty this frame
+    typed: Text;            // what the keyboard sent this frame (for broadcast input)
+    selText: Text;          // the selection as text, for copy and PRIMARY (reused)
+    buf: []u8;
+    w: f32 = 0.0;           // last drawn canvas size
+    h: f32 = 0.0;
+    padX: int = -1;         // padding the grid was fitted with
+    padY: int = -1;
+    lineHeight: int = 100;  // percent of the font's line
+    shape: int = -1;        // cursor shape we set (DECSCUSR value); a program's own wins
+    activeAt: int = 0;      // ms of the last key or output: the cursor shows solid after it
+    outAt: int = 0;         // ms of the last output (`jzctl wait --idle`)
+    droppedTotal: int = 0;  // lines that fell off the scrollback ring so far: grid line + this = a line number that stays put (`jzctl watch`)
+    badge: Text;            // `jzctl badge` text shown on the pane ("" none); typing in the pane clears it
+    bells: int = 0;         // grid bells already seen
+    bellAt: int = -100000;  // ms of the last bell (visual bell)
+    rang: bool = false;     // a bell since the owner last looked
+    wants: bool = false;    // a bell or notification the user has not answered (`jzctl ls --json`, phone page)
+    searchAt: int = 0;      // ms of the last search run
+    zero: &ZeroCmds;        // JZero commands, for completing `0 <name>` (`session/zero.j3`)
+    zeroHits: List<int>;    // the matches showing (indices into `zero`)
+    zeroQ: Text;            // the name typed so far
+    inMark: int = -1;       // prompt line the input start below belongs to
+    inX: int = 0;           // where the user's input starts: column and grid line
+    inLine: int = -1;
+    dragScrollAt: int = 0;
+    motionCell: int = -1;   // last cell a mouse motion report went out for
+    focusClick: bool = false;  // a button went down while unfocused: its drag isn't the program's
+    // Extension pane (`openExt`): no pty. A j2 script (`ext/host.j3`) writes `inbox` (shown as
+    // output) and reads `keysIn` (what would have gone to a program).
+    ext: bool = false;
+    extDone: bool = false;  // the script asked to close
+    inbox: Text;
+    keysIn: Text;
+
+    // Read what the shell wrote and feed the grid; answer its queries. Every frame, visible or
+    // not. True when there was output.
+    fn pump(this: &Session): bool {
+        let snapped = false;
+        // Scrolled back (reading, or dragging a selection): output keeps the view on the same
+        // lines instead of jumping to the bottom, like Ghostty.
+        let off = this.view.off(&this.grid);
+        let count0 = this.grid.sbCount;
+        let head0 = this.grid.sbHead;
+        if this.ext {
+            if this.inbox.len() > 0 {
+                feed(&this.parser, this.inbox.str(), &this.tap);
+                this.inbox.clear();
+                snapped = true;
+            }
+        } else {
+            for _ in 0..MAX_READS {
+                let bytes = this.pty.tryRead(this.buf);
+                if bytes.len == 0 { break; }
+                feed(&this.parser, bytes, &this.tap);
+                snapped = true;
+            }
+        }
+        if snapped {
+            // Lines that fell off the top of a full scrollback ring, and lines pushed in total.
+            // ponytail: more than a whole ring in one frame reads as fewer; the selection is gone then anyway.
+            let dropped = 0;
+            if this.grid.sbCap > 0 { dropped = (this.grid.sbHead - head0 + this.grid.sbCap) % this.grid.sbCap; }
+            let pushed = this.grid.sbCount - count0 + dropped;
+            if this.grid.sbCount < count0 || this.grid.altScreen() { this.sel.clear(); }  // scrollback cleared, or a full-screen app redrew
+            else { this.sel.shift(&this.grid, dropped); }
+            this.droppedTotal += dropped;
+            if off > 0 && !this.grid.altScreen() && pushed >= 0 { this.view.scroll(&this.grid, off + pushed - this.view.off(&this.grid)); }
+            else { this.view.snap(); }
+        }
+        if this.grid.reply.len() > 0 {
+            if !this.ext { this.pty.write(this.grid.reply.bytes[0..this.grid.reply.len()]); }  // an extension asks nothing
+            this.grid.reply.clear();
+        }
+        if this.grid.bells != this.bells {
+            this.bells = this.grid.bells;
+            this.bellAt = game.ticks();
+            this.rang = true;
+            this.wants = true;
+        }
+        if snapped { this.activeAt = game.ticks(); this.outAt = this.activeAt; }
+        if !this.ext { this.reader.consumed(); }
+        return snapped;
+    }
+
+    // Feed saved text into the grid as output, one `\r\n` per line.
+    fn replay(this: &Session, text: string) {
+        if text.len == 0 { return; }
+        let start = 0;
+        for i in 0..text.len + 1 {
+            if i < text.len && text[i] != 10 { continue; }
+            feed(&this.parser, text[start..i], &this.grid);
+            feed(&this.parser, "\r\n", &this.grid);
+            start = i + 1;
+        }
+    }
+
+    fn alive(this: &Session): bool {
+        if this.ext { return !this.extDone; }
+        return !this.pty.eof;
+    }
+
+    // Input for the program: the pty, or an extension's `keysIn`.
+    fn write(this: &Session, bytes: []u8) {
+        if this.ext { this.keysIn.pushStr(bytes as string); return; }
+        this.pty.write(bytes);
+    }
+
+    // Write `bytes` as if typed (broadcast input from another pane).
+    fn send(this: &Session, bytes: string) {
+        this.write(bytes as []u8);
+        this.view.snap();
+    }
+
+    // Draw into a canvas of `w` x `h` px at its 0,0 (`origin` is that corner in window
+    // coordinates). `focused`: the pane has focus (solid cursor; else a hollow one); `keys`:
+    // read keys this frame. `mouse` is canvas-local; `pointer` false while something covers
+    // the canvas (a menu).
+    fn draw(this: &Session, w: f32, h: f32, focused: bool, keys: bool, mouse: Vec2, pointer: bool, origin: Vec2) {
+        let px = f32(this.cfg.padX);
+        let py = f32(this.cfg.padY);
+        if w != this.w || h != this.h || this.cfg.padX != this.padX || this.cfg.padY != this.padY { this.resize(w, h); }
+        if this.themeAt != theme.version() { this.applyTheme(); }
+        let m = Vec2 { x: mouse.x - px, y: mouse.y - py };
+        let gw = f32(this.grid.cols() * this.view.cellW);
+        let gh = f32(this.grid.rows() * this.view.cellH);
+        if pointer { this.mouseSelect(m, gw, gh, mouse.x >= 0.0 && mouse.y >= 0.0 && mouse.x < w && mouse.y < h); }
+        this.typed.clear();
+        if focused && keys && !this.find.open {
+            // The UI turns SDL text input off when one of its text boxes blurs; a shell needs it on.
+            game.textInput(true);
+            if !this.ext { this.findZero(); }
+            // The View reports the mouse from window coords minus ox/oy; `draw` sets those
+            // canvas-local, so point them at the grid's window corner for `input`.
+            this.view.ox = origin.x + px;
+            this.view.oy = origin.y + py;
+            this.view.input(&this.grid, &this.out);
+            if this.out.len() > 0 {
+                this.completeZero();
+                this.noteInputStart();
+                this.write(this.out.bytes[0..this.out.len()]);
+                this.typed.pushStr(this.out.str());
+                this.out.clear();
+                this.activeAt = game.ticks();
+            }
+            if pointer { this.reportMotion(m, gw, gh); }
+        } else {
+            this.motionCell = -1;
+            this.focusClick = game.mouseDown(Mouse.Left) || game.mouseDown(Mouse.Middle) || game.mouseDown(Mouse.Right);
+        }
+        if this.find.open { this.refreshSearch(); }
+        this.drawPadding(w, h, gw, gh);
+        this.applyCursorStyle();
+        let showCursor = this.grid.cursorVisible() && this.view.off(&this.grid) == 0;
+        let hollow = !focused && showCursor;
+        // The View blinks the blinking cursor shapes (see `applyCursorStyle`); only in the focused pane of a focused window.
+        this.view.ligatures = this.cfg.fontLigatures && game.textShaping();
+        this.view.blinkMs = 0;
+        if focused && game.windowFocused() { this.view.blinkMs = BLINK_MS; }
+        if hollow { this.grid.modes &= ~MODE_CURSOR; }
+        this.view.draw(&this.grid, px, py);
+        if hollow { this.grid.modes |= MODE_CURSOR; }
+        if hollow { this.drawHollowCursor(px, py); }
+        this.drawMarks(px, py);
+        this.drawSearch(px, py);
+        this.drawSelection(px, py);
+        this.drawLink(px, py);
+        if focused && keys && !this.find.open { this.drawZero(px, py, w); } else { this.zeroHits.len = 0; }
+        if focused && keys && !this.find.open { this.drawCompose(px, py, origin); }
+        this.drawOverlay(w, h, focused);
+    }
+
+    fn setFont(this: &Session, face: Face, lineHeight: int) {
+        this.view.setFont(face.regular);
+        this.view.italic = face.italic;
+        this.lineHeight = lineHeight;
+        this.view.setLineHeight(lineHeight);  // text centered in the taller cell
+        this.w = 0.0;      // re-fit cols/rows on the next draw
+        this.themeAt = -1;
+    }
+
+    fn applyTheme(this: &Session) {
+        this.themeAt = theme.version();
+        for i in 0..16 { this.view.pal[i] = theme.ansi(i); }
+        this.view.defaultBg = theme.bg();
+        this.view.defaultFg = theme.fg();
+        this.view.cursorColor = theme.cursorRgb();
+        this.grid.markAllDirty();
+    }
+
+    // Grid line of the top screen row as shown (scrollback included).
+    fn topLine(this: &Session): int { return this.grid.scrollbackLen() - this.view.off(&this.grid); }
+
+    // Grid line under grid-local y.
+    fn lineAt(this: &Session, y: f32): int {
+        let row = int(y / f32(this.view.cellH));
+        return this.topLine() + row;
+    }
+
+    // Scroll so the previous (`dir` -1) or next (1) prompt is the top line. Past the last
+    // prompt it goes back to the live screen.
+    fn jumpPrompt(this: &Session, dir: int) {
+        let sb = this.grid.scrollbackLen();
+        let off = this.view.off(&this.grid);
+        let target = this.tap.prompt(sb - off, dir);
+        if target < 0 {
+            if dir > 0 { this.view.snap(); }
+            return;
+        }
+        this.view.scroll(&this.grid, (sb - target) - off);
+    }
+
+    // Selected text to the clipboard. False when nothing is selected.
+    fn copy(this: &Session): bool {
+        if !this.sel.on { return false; }
+        game.setClipboard(this.selectionText());
+        return true;
+    }
+
+    // The last command's output (shell integration) to the clipboard. False when there is none.
+    fn copyLastOutput(this: &Session): bool {
+        this.selText.clear();
+        if !this.lastOutput(&this.selText) { return false; }
+        if this.selText.len() > 0 { this.selText.pop(); }  // no newline after the last line
+        game.setClipboard(this.selText.str());
+        return true;
+    }
+
+    // The last finished command's output lines into `out`, `\n` after each. False when there is none.
+    fn lastOutput(this: &Session, out: &Text): bool {
+        let lo = this.tap.outLo;
+        let hi = this.tap.outHi;
+        if lo < 0 || hi <= lo || this.tap.runStart >= 0 { return false; }
+        for l in lo..hi {
+            lineText(out, this.grid.line(l), false);
+            out.push(10);
+        }
+        return true;
+    }
+
+    // Grid lines the program is done writing: everything above the cursor (none past the
+    // scrollback on the alternate screen).
+    fn doneLines(this: &Session): int {
+        if this.grid.altScreen() { return this.grid.scrollbackLen(); }
+        return this.grid.scrollbackLen() + this.grid.cursorY();
+    }
+
+    // Grid lines `from..to` into `out`, `\n` after each.
+    fn linesText(this: &Session, from: int, to: int, out: &Text) {
+        for i in from..to {
+            lineText(out, this.grid.line(i), false);
+            out.push(10);
+        }
+    }
+
+    // The selection to PRIMARY (copy on select; middle click pastes it).
+    fn toPrimary(this: &Session) {
+        game.setPrimarySelection(this.selectionText());
+    }
+
+    fn selectionText(this: &Session): string {
+        this.selText.clear();
+        this.sel.text(&this.grid, &this.selText);
+        return this.selText.str();
+    }
+
+    fn paste(this: &Session) { this.pasteText(game.clipboard()); }
+
+    fn pasteText(this: &Session, clip: string) {
+        if clip.len == 0 { return; }
+        encodePaste(clip, this.grid.modes, &this.out);
+        this.noteInputStart();
+        this.write(this.out.bytes[0..this.out.len()]);
+        this.typed.pushStr(this.out.str());
+        this.out.clear();
+        this.view.snap();
+    }
+
+    // Press one key (`j3.term.input.KEY_*`) as the program asked keys to be sent.
+    fn pressKey(this: &Session, key: int, mods: int, cp: i32) {
+        encodeKey(key, mods, cp, this.grid.modes, &this.out);
+        this.write(this.out.bytes[0..this.out.len()]);
+        this.out.clear();
+        this.view.snap();
+    }
+
+    fn resize(this: &Session, w: f32, h: f32) {
+        this.w = w;
+        this.h = h;
+        this.padX = this.cfg.padX;
+        this.padY = this.cfg.padY;
+        let cols = this.view.colsFor(w - f32(2 * this.padX));
+        let rows = this.view.rowsFor(h - f32(2 * this.padY));
+        if cols != this.grid.cols() || rows != this.grid.rows() { this.reflow(cols, rows); }
+        if !this.ext { this.pty.resizePx(cols, rows, this.view.cellW, this.view.cellH); }  // pixels: kitty image tools need them
+    }
+
+    // Resize the grid (it reflows); the tap's prompt and output lines, the selection and an open
+    // search follow.
+    fn reflow(this: &Session, cols: int, rows: int) {
+        // ponytail: on the alt screen the tap's lines are left as they are (the primary reflows under it).
+        let track = !this.grid.altScreen();
+        if track { this.lines.begin(&this.grid); this.tap.remap(&this.lines, true); }
+        this.grid.resize(cols, rows);
+        if track { this.lines.begin(&this.grid); this.tap.remap(&this.lines, false); }
+        this.sel.clear();  // its line coordinates are stale
+        if this.find.open { this.find.run(&this.grid, -1); }
+    }
+
+    // The shell's working directory, appended to `out`: from /proc, else what the shell last
+    // reported (OSC 7; all there is on Windows). Nothing when unknown.
+    fn cwd(this: &Session, out: &Text) {
+        if this.ext { return; }
+        let before = out.len();
+        procinfo.cwd(this.pty.pid, this.buf, out);
+        if out.len() == before { out.pushStr(this.tap.cwd.str()); }
+    }
+
+    // What runs in the foreground other than an idle shell ("" when the shell waits at its
+    // prompt). A program pane (ssh, `-e`) is always busy while it runs.
+    fn busy(this: &Session): string {
+        if !this.alive() || this.ext { return ""; }
+        if !procinfo.available() { return this.busyByMarks(false); }
+        return procinfo.busy(this.pty.pid, this.isCommand, this.buf);
+    }
+
+    // `busy` without /proc (Windows), from shell integration: a program pane is always busy;
+    // a shell is unless it sits at a prompt (OSC 133). ponytail: a shell without integration
+    // never says so and always counts as busy; cmd.exe marks prompts only and never does.
+    fn busyByMarks(this: &Session, always: bool): string {
+        if this.isCommand || !this.tap.atPrompt { return "a program"; }
+        return if always { "the shell" } else { "" };
+    }
+
+    // What runs in the foreground, the shell's own name when it waits.
+    fn program(this: &Session): string {
+        if this.ext { return "extension"; }
+        if !procinfo.available() { return this.busyByMarks(true); }
+        return procinfo.busy(this.pty.pid, true, this.buf);
+    }
+
+    // Write the lines above the cursor (scrollback and screen; the live prompt line and
+    // anything below are left out, the next shell draws a new one) to `path`.
+    fn saveScrollback(this: &Session, path: string) {
+        let t = Text.new(this.mem);
+        this.linesText(0, this.doneLines(), &t);
+        io.writeFile(path, trimBlankTail(t.str()) as []u8);
+    }
+
+    // Every line (scrollback and screen) as text into `out`, `\n` after each.
+    fn allText(this: &Session, out: &Text) { this.linesText(0, this.grid.lineCount(), out); }
+
+    // The last `n` lines up to the last non-blank one (scrollback included), or with `n` <= 0
+    // the screen's, into `out`, `\n` after each.
+    fn tailText(this: &Session, n: int, out: &Text) {
+        let line = Text.scratch();
+        let end = this.grid.lineCount();
+        while end > 0 {
+            line.clear();
+            lineText(line, this.grid.line(end - 1), false);
+            if line.len() > 0 { break; }
+            end -= 1;
+        }
+        let from = this.grid.scrollbackLen();
+        if n > 0 { from = maxI(0, end - n); }
+        this.linesText(from, end, out);
+    }
+
+    // Closing many sessions at once: `beginClose` all, `hangUp` all, then `close` each, so the
+    // reader joins and the shells' exits overlap instead of adding up.
+    fn beginClose(this: &Session) { if !this.ext { this.reader.requestStop(); } }
+    fn hangUp(this: &Session) {
+        if this.ext { return; }
+        this.reader.stopAndJoin();
+        this.pty.close();  // SIGHUP; `wait` in `close` reaps
+    }
+
+    // Hang up the shell, reap it, free everything. `this` is gone afterwards.
+    fn close(this: &Session) {
+        if !this.ext {
+            this.reader.stopAndJoin();
+            this.pty.wait();  // closes the master first
+        }
+        this.grid.destroy();  // screens + scrollback live outside `mem`
+        this.mem.destroy();
+    }
+}
+
+// Start `shellIn` ("" for the config's, else this OS's default: `platform/shells.j3`) in `cwd` ("" keeps ours), keeping
+// `cfg.scrollback` lines. None when it cannot start.
+// Call after the window exists (View measures the font).
+// `slot` is an arena header the session owns (`close` frees its arena; the header can be reused).
+// `histfile` becomes `$HISTFILE` ("" leaves it); `restore` is earlier output shown above the
+// first prompt (plain text, `\n` lines).
+// A non-empty `command` runs that argv instead of a shell (e.g. `ssh host`); the pane closes
+// when it exits. `extraEnv` (`NAME=value`) goes to its environment. `cfg` must outlive the session (State's config).
+pub fn open(slot: &Arena, cwd: string, face: Face, cfg: &Config, zero: &ZeroCmds, histfile: string, restore: string, shellIn: string, command: []string, extraEnv: []string): Option<&Session> {
+    let mem = slot;
+    *mem = Arena.create(1048576);
+    let shell = shellIn;
+    if shell.len == 0 { shell = cfg.shell.str(); }
+    if shell.len == 0 { shell = shells.fallback(mem); }
+    let argv = List<string>.new(mem);
+    let env = List<string>.new(mem);
+    if command.len > 0 { for a in command { argv.push(a); } }
+    else if cfg.shellIntegration { shellsetup.prepare(shell, mem, &argv, &env); }
+    else { argv.push(shell); }
+    let token = shellsetup.token(mem);
+    let tk = Text.new(mem);
+    tk.pushStr("JZERO_TOKEN=");
+    tk.pushStr(token);
+    env.push(tk.str());
+    for e in extraEnv { env.push(e); }
+    if histfile.len > 0 {
+        let h = Text.new(mem);
+        h.pushStr("HISTFILE=");
+        h.pushStr(histfile);
+        env.push(h.str());
+    }
+    match pty.spawn(argv.items[0..argv.len], cwd, env.items[0..env.len], 80, 24, mem) {
+        Result.Ok(p) {
+            let s = &mem.alloc::<Session>(1)[0];
+            *s = Session {
+                mem: mem, cfg: cfg, pty: p, parser: Parser.new(mem), grid: Grid.new(mem, 80, 24, cfg.scrollback), tap: shellint.create(mem, &s.grid),
+                view: View.new(mem, face.regular), reader: reader.create(mem, &s.pty), sel: Selection {}, find: search.create(mem), lines: linemap.create(mem), isCommand: command.len > 0,
+                scrollback: cfg.scrollback, out: Text.new(mem), typed: Text.new(mem), selText: Text.new(mem), buf: mem.alloc::<u8>(READ_BYTES),
+                zero: zero, zeroHits: List<int>.new(mem), zeroQ: Text.new(mem), inbox: Text.new(mem), keysIn: Text.new(mem), badge: Text.new(mem),
+            };
+            s.tap.token.pushStr(token);
+            s.setFont(face, cfg.lineHeight);
+            s.activeAt = game.ticks();
+            s.replay(restore);
+            s.reader.start();
+            return Option.Some(s);
+        }
+        Result.Err(_) {
+            mem.destroy();
+            return Option.None;
+        }
+    }
+}
+
+// An extension pane: the screen and view of a session with no program behind it (see
+// `Session.ext`). Same arena rules as `open`.
+pub fn openExt(slot: &Arena, face: Face, cfg: &Config, zero: &ZeroCmds): &Session {
+    let mem = slot;
+    *mem = Arena.create(1048576);
+    let s = &mem.alloc::<Session>(1)[0];
+    *s = Session {
+        mem: mem, cfg: cfg, pty: Pty { fd: -1, pid: 0, eof: true, pend: Text.new(mem) }, parser: Parser.new(mem), grid: Grid.new(mem, 80, 24, cfg.scrollback),
+        tap: shellint.create(mem, &s.grid), view: View.new(mem, face.regular), reader: reader.create(mem, &s.pty), sel: Selection {}, find: search.create(mem),
+        lines: linemap.create(mem), isCommand: true, scrollback: cfg.scrollback, out: Text.new(mem), typed: Text.new(mem), selText: Text.new(mem),
+        buf: mem.alloc::<u8>(1), zero: zero, zeroHits: List<int>.new(mem), zeroQ: Text.new(mem), ext: true, inbox: Text.new(mem), keysIn: Text.new(mem), badge: Text.new(mem),
+    };
+    s.setFont(face, cfg.lineHeight);
+    s.activeAt = game.ticks();
+    return s;
+}
+
+// `s` in single quotes for a POSIX shell (`'` becomes `'\''`); plain when nothing needs quoting.
+// Windows: in double quotes (cmd and PowerShell both take them), `\` and all.
+pub fn quote(s: string, out: &Text) {
+    if os.windows() {
+        let bare = s.len > 0;
+        for i in 0..s.len { if s[i] <= 32 || s[i] == 38 || s[i] == 39 || s[i] == 40 || s[i] == 41 || s[i] == 59 { bare = false; } }
+        if !bare { out.push(34); }
+        out.pushStr(s);
+        if !bare { out.push(34); }
+        return;
+    }
+    let plain = s.len > 0;
+    for i in 0..s.len {
+        let c = s[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 47 || c == 46 || c == 45 || c == 95 || c == 43 || c == 44 || c == 58 || c == 64 || c >= 128;
+        if !ok { plain = false; }
+    }
+    if plain { out.pushStr(s); return; }
+    out.push(39);
+    for i in 0..s.len {
+        if s[i] == 39 { out.pushStr("'\\''"); } else { out.push(s[i]); }
+    }
+    out.push(39);
+}
+
+fn clampI(v: int, lo: int, hi: int): int {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+fn maxF(a: f32, b: f32): f32 { if a > b { return a; } return b; }
+
+// `s` without trailing newlines and spaces, plus one newline (empty stays empty).
+fn trimBlankTail(s: string): string {
+    let n = s.len;
+    while n > 0 && (s[n - 1] == 10 || s[n - 1] == 32) { n -= 1; }
+    if n == 0 { return ""; }
+    return s[0..n];
+}
+
+// Self-check: shell quoting.
+pub fn selfTest(mem: &Arena) {
+    let t = Text.new(mem);
+    if os.windows() {
+        quote("C:\\a b\\c.txt", &t);
+        check(t.str() == "\"C:\\a b\\c.txt\"", t.str());
+        return;
+    }
+    quote("/tmp/a-b.txt", &t);
+    check(t.str() == "/tmp/a-b.txt", t.str());
+    t.clear();
+    quote("/tmp/it's here", &t);
+    check(t.str() == "'/tmp/it'\\''s here'", t.str());
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`session selfTest: {what}`); } }

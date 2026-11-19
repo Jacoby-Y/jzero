@@ -1,0 +1,65 @@
+@font-face { font-family: "Ui"; src: url("../assets/font.ttf"); }
+@font-face { font-family: "Mono"; src: url("../assets/mono.ttf"); }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* Theme tokens. Default: classic GNOME Terminal (Tango dark). Swap this block to retheme. */
+:root {
+  /* terminal palette */
+  --term-bg: #2e3436;
+  --term-fg: #d3d7cf;
+  --c-black: #2e3436;   --c-bright-black: #555753;
+  --c-red: #cc0000;     --c-bright-red: #ef2929;
+  --c-green: #4e9a06;   --c-bright-green: #8ae234;
+  --c-yellow: #c4a000;  --c-bright-yellow: #fce94f;
+  --c-blue: #3465a4;    --c-bright-blue: #729fcf;
+  --c-magenta: #75507b; --c-bright-magenta: #ad7fa8;
+  --c-cyan: #06989a;    --c-bright-cyan: #34e2e2;
+  --c-white: #d3d7cf;   --c-bright-white: #eeeeec;
+
+  /* chrome */
+  --chrome-bg: #1f2324;
+  --chrome-fg: #babdb6;
+  --chrome-hover: #393f41;
+  --chrome-active: #3465a4;
+  --chrome-danger: #cc0000;
+  --divider: #1f2324;
+  --ocean-bg: #16262f;
+  --ocean-tile: #2b3d47;
+  --ocean-art: #20313b;
+  --ocean-ripple: #2e4552;
+
+  font-family: "Ui";
+  font-size: 14px;
+  color: var(--chrome-fg);
+}
+
+/* Bundled themes: the class on .app (src/theme/theme.j3 names). Terminal palettes live in
+   theme.j3; these are the chrome tokens. Keep both in step. */
+.theme-catppuccin-mocha {
+  --term-bg: #1e1e2e; --term-fg: #cdd6f4;
+  --c-bright-black: #6c7086; --c-bright-blue: #89b4fa; --c-bright-green: #a6e3a1; --c-bright-white: #cdd6f4;
+  --chrome-bg: #181825; --chrome-fg: #bac2de; --chrome-hover: #313244; --chrome-active: #45475a;
+  --chrome-danger: #f38ba8; --divider: #181825; --ocean-bg: #11111b; --ocean-tile: #313244; --ocean-art: #21212f; --ocean-ripple: #34344c;
+}
+.theme-gruvbox-dark {
+  --term-bg: #282828; --term-fg: #ebdbb2;
+  --c-bright-black: #928374; --c-bright-blue: #83a598; --c-bright-green: #b8bb26; --c-bright-white: #fbf1c7;
+  --chrome-bg: #1d2021; --chrome-fg: #d5c4a1; --chrome-hover: #3c3836; --chrome-active: #504945;
+  --chrome-danger: #cc241d; --divider: #1d2021; --ocean-bg: #1d2021; --ocean-tile: #3c3836; --ocean-art: #2c2c2b; --ocean-ripple: #45403b;
+}
+.theme-tokyonight {
+  --term-bg: #1a1b26; --term-fg: #c0caf5;
+  --c-bright-black: #565f89; --c-bright-blue: #7aa2f7; --c-bright-green: #9ece6a; --c-bright-white: #c0caf5;
+  --chrome-bg: #16161e; --chrome-fg: #a9b1d6; --chrome-hover: #292e42; --chrome-active: #3d59a1;
+  --chrome-danger: #f7768e; --divider: #16161e; --ocean-bg: #13131a; --ocean-tile: #292e42; --ocean-art: #1e202e; --ocean-ripple: #2c3048;
+}
+
+button { border: none; background: transparent; color: var(--chrome-fg); font: inherit; cursor: pointer; }
+button:hover { background: var(--chrome-hover); }
+button:focus-visible { outline: 2px solid var(--chrome-active); outline-offset: -2px; }
+
+/* Settings screen controls (ui/settings/) */
+.settings select, .settings input[type="text"] { flex: 1; min-width: 0; height: 28px; padding: 0 8px; background: var(--chrome-hover); color: var(--c-bright-white); border: none; }
+.settings input[type="checkbox"] { accent-color: var(--chrome-active); }
+.settings input[type="range"] { flex: 1; accent-color: var(--chrome-active); }
+.settings .tab { display: flex; flex-direction: column; }

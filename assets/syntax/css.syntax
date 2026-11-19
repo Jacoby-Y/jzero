@@ -1,0 +1,14 @@
+name = CSS
+ext = css scss sass less
+comment = /* */
+comment = // alone
+string = " " escape
+string = ' ' escape
+prefix = annotation @
+prefix = number #
+prefix = variable --
+prefix = variable $
+word-chars = -
+keyword = important inherit initial unset auto none
+call = true
+key = : anywhere

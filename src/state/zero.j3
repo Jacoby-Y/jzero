@@ -1,0 +1,60 @@
+module jzero.state;
+
+// State part: JZero commands. `0 <name>` (`assets/shell/bin/0`) runs functions from
+// `<config>/commands.sh`; a `split` or `island` one asks here (OSC 7770, `shellint.j3`) for a
+// pane running `0 --pane <name> [args]` in the asking shell's directory.
+
+extend State {
+    // The frame's `0` request, if any. Runs after every shell is pumped: a new island can move
+    // the island list.
+    fn runZero(this: &State) {
+        let mode = this.zeroMode;
+        if mode == 0 { return; }
+        this.zeroMode = 0;
+        let mem = Arena.create(65536);
+        let argv = List<string>.new(&mem);
+        shellsetup.zero(&mem, &argv);
+        let first = argv.len + 1;  // the command's name: after `--pane`
+        argv.push("--pane");
+        let a = this.zeroArgs.str();
+        let start = 0;
+        for k in 0..a.len {
+            if a[k] == 0 { argv.push(a[start..k]); start = k + 1; }
+        }
+        if argv.len > first {
+            let cmd = argv.items[0..argv.len];
+            if mode == shellint.RUN_ISLAND { this.commandIsland(`0 {argv.items[first]}`, this.zeroCwd.str(), cmd); }
+            else { this.zeroSplit(cmd); }
+        }
+        mem.destroy();
+    }
+
+    // Split the asking pane (when it is still there) with `cmd`.
+    fn zeroSplit(this: &State, cmd: []string) {
+        let at = this.findPane(this.zeroPane);
+        if at.island != this.zeroIsland { return; }
+        this.splitPane(at, this.zeroCwd.str(), cmd);
+    }
+
+    // Split pane `at` to the right with `cmd` (a shell when empty) in `cwd`. The new pane id.
+    fn splitPane(this: &State, at: PaneAt, cwd: string, cmd: []string): int {
+        let isl = this.islands.get(at.island);
+        isl.panes.focus = at.leaf;
+        let id = this.newPaneId();
+        isl.panes.split(split.RIGHT, this.openCommand(isl, id, cwd, cmd), id);
+        return id;
+    }
+
+    // Where pane `id` is in the open islands (`island` -1 when nowhere).
+    fn findPane(this: &State, id: int): PaneAt {
+        for i in 0..this.islands.count() {
+            let isl = this.islands.get(i);
+            if !isl.open { continue; }
+            let p = &isl.panes;
+            for j in 0..p.nodes.len {
+                if p.isLeaf(j) && p.get(j).id == id { return PaneAt { island: i, leaf: j }; }
+            }
+        }
+        return PaneAt {};
+    }
+}

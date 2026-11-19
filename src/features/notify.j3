@@ -1,0 +1,8 @@
+module jzero.features.notify;
+
+use jzero.platform.desktop;
+
+// Desktop notifications (`platform/desktop.j3`), titled "JZero" when the sender gave none.
+pub fn send(title: string, body: string) {
+    desktop.notify(if title.len == 0 { "JZero" } else { title }, body);
+}

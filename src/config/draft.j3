@@ -1,0 +1,324 @@
+module jzero.config.draft;
+
+use j3.game.Key;
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.text.Text;
+use jzero.config.config;
+use jzero.config.config.Config;
+use jzero.config.parse.trim;
+use jzero.input.keynames;
+use jzero.input.keynames.KeyNames;
+use jzero.theme.files;
+use jzero.theme.theme;
+use jzero.theme.theme.{ Themes, SLOTS };
+
+// The settings screen's edits, as its inputs bind them. `apply` writes them into the live
+// Config every frame (preview); only Save writes the file, Cancel reloads it.
+pub struct Draft {
+    mem: &Arena;              // every string here; rewound on each open
+    theme: string = "";
+    fontFamily: string = "";
+    fontSize: int = 14;
+    lineHeight: f32 = 100.0;
+    padX: f32 = 10.0;
+    padY: f32 = 5.0;
+    ligatures: bool = true;
+    cursor: string = "";
+    cursorBlink: bool = true;
+    unfocused: f32 = 100.0;
+    bgOpacity: f32 = 100.0;
+    colors: List<string>;     // `#rrggbb` per theme slot as shown: the theme's, or an override
+    base: int = 0;            // theme the colors that are not overrides follow
+    scrollback: string = "";
+    shell: string = "";
+    shellIntegration: bool = true;
+    confirmClose: bool = true;
+    visualBell: bool = true;
+    notifications: bool = true;
+    notifyAfter: string = "";
+    clipboardWrite: bool = true;
+    explorerHidden: bool = false;
+    notesDir: string = "";
+    quickKey: string = "";
+    binds: List<string>;      // combo per action id in config syntax, "" unbound
+    loaded: List<string>;     // binds as opened: the Keys tab rewrites keybinds only when they differ
+    defaults: List<string>;   // default combo per action id
+    names: List<string>;      // action config name per id (`split_right`), set by the screen
+    titles: List<string>;     // action title per id
+    message: Text;            // the last `check` error
+    applied: int = 0;         // hash of what needed `applyConfig` last frame
+}
+
+pub fn create(mem: &Arena): Draft {
+    return Draft {
+        mem: mem, colors: List<string>.new(mem), binds: List<string>.new(mem), loaded: List<string>.new(mem),
+        defaults: List<string>.new(mem), names: List<string>.new(mem), titles: List<string>.new(mem), message: Text.new(mem),
+    };
+}
+
+// Fill `d` from the config in use. `binds` / `defaults`: combo per action id (config syntax).
+pub fn load(d: &Draft, c: &Config, ts: &Themes, binds: List<Text>, defaults: List<Text>) {
+    d.mem.destroy();
+    *d.mem = Arena.create(16384);
+    *d = create(d.mem);
+    d.theme = own(d, c.themeName);
+    d.fontFamily = own(d, c.fontFamily);
+    d.fontSize = c.fontSize;
+    d.lineHeight = f32(c.lineHeight);
+    d.padX = f32(c.padX);
+    d.padY = f32(c.padY);
+    d.ligatures = c.fontLigatures;
+    d.cursor = config.cursorName(c.cursorStyle);
+    d.cursorBlink = c.cursorBlink;
+    d.unfocused = f32(c.unfocusedOpacity);
+    d.bgOpacity = f32(c.backgroundOpacity);
+    d.base = c.theme;
+    for k in 0..SLOTS { d.colors.push(hexOf(d, effective(c, ts, k))); }
+    d.scrollback = numOf(d, c.scrollback);
+    d.shell = own(d, c.shell.str());
+    d.shellIntegration = c.shellIntegration;
+    d.confirmClose = c.confirmClose;
+    d.visualBell = c.visualBell;
+    d.notifications = c.notifications;
+    d.notifyAfter = numOf(d, c.notifyAfter);
+    d.clipboardWrite = c.clipboardWrite;
+    d.explorerHidden = c.explorerHidden;
+    d.notesDir = own(d, c.notesDir);
+    d.quickKey = own(d, c.quickKey);
+    for id in 0..binds.len {
+        let b = own(d, binds.items[id].str());
+        d.binds.push(b);
+        d.loaded.push(b);
+        d.defaults.push(own(d, defaults.items[id].str()));
+    }
+}
+
+// Write `d` into `c` (all but font-family and keybinds, which only Save writes: a family
+// loads fonts, keybinds need `check`). True when the theme, colors or font size changed
+// since the last call, so the caller runs `applyConfig`; the rest is read live.
+pub fn apply(d: &Draft, c: &Config, ts: &Themes): bool {
+    if d.colors.len < SLOTS { return false; }  // not loaded yet (onFrame runs before onMount)
+    let t = ts.byName(d.theme);
+    if t >= 0 && t != d.base { rebase(d, ts, t); }
+    c.themeName = d.theme;
+    c.theme = d.base;
+    c.fontSize = d.fontSize;
+    c.lineHeight = int(d.lineHeight);
+    c.padX = int(d.padX);
+    c.padY = int(d.padY);
+    c.fontLigatures = d.ligatures;
+    let cur = config.cursorByName(d.cursor);
+    if cur >= 0 { c.cursorStyle = cur; }
+    c.cursorBlink = d.cursorBlink;
+    c.unfocusedOpacity = int(d.unfocused);
+    c.backgroundOpacity = int(d.bgOpacity);
+    keepSyntax(&c.colors);
+    let h = d.base * 31 + c.fontSize * 7 + c.lineHeight;
+    for k in 0..SLOTS {
+        let v = files.hex(d.colors.items[k]);
+        h = h * 31 + v;
+        if v >= 0 && v != ts.color(d.base, k) { c.colors.push(k); c.colors.push(v); }
+    }
+    ts.over = c.colors;
+    let n = digits(d.scrollback);
+    if n >= 0 { c.scrollback = n; }
+    c.shell.clear();
+    c.shell.pushStr(trim(d.shell));
+    c.shellIntegration = d.shellIntegration;
+    c.confirmClose = d.confirmClose;
+    c.visualBell = d.visualBell;
+    c.notifications = d.notifications;
+    n = digits(d.notifyAfter);
+    if n >= 0 { c.notifyAfter = n; }
+    c.clipboardWrite = d.clipboardWrite;
+    c.explorerHidden = d.explorerHidden;
+    c.notesDir = trim(d.notesDir);
+    c.quickKey = trim(d.quickKey);
+    if h == d.applied { return false; }
+    d.applied = h;
+    return true;
+}
+
+// Everything for Save: `apply`, then font-family and (when the Keys tab changed) keybinds.
+pub fn finish(d: &Draft, c: &Config, ts: &Themes) {
+    apply(d, c, ts);
+    c.fontFamily = trim(d.fontFamily);
+    if !keysEdited(d) { return; }
+    // ponytail: rewrites every keybind line from the table, so a second combo bound to one
+    // action is dropped; keep a list per action if people want several.
+    c.keybinds = List<string>.new(d.mem);
+    for id in 1..d.binds.len {
+        let b = trim(d.binds.items[id]);
+        let def = d.defaults.items[id];
+        if b != def && def.len > 0 { c.keybinds.push(join(d, def, "none")); }
+    }
+    for id in 1..d.binds.len {
+        let b = trim(d.binds.items[id]);
+        if b != d.defaults.items[id] && b.len > 0 { c.keybinds.push(join(d, b, d.names.items[id])); }
+    }
+}
+
+fn keysEdited(d: &Draft): bool {
+    for id in 0..d.binds.len { if trim(d.binds.items[id]) != d.loaded.items[id] { return true; } }
+    return false;
+}
+
+// "" when `d` can be saved, else what is wrong (also in `d.message`).
+pub fn check(d: &Draft, names: &KeyNames): string {
+    d.message.clear();
+    if digits(d.scrollback) < 0 { d.message.pushStr("Scrollback must be a whole number"); }
+    else if digits(d.notifyAfter) < 0 { d.message.pushStr("Notify after must be a whole number of seconds"); }
+    else if !comboOk(names, d.quickKey) { combo(d, "Quick terminal key", d.quickKey); }
+    else { checkBinds(d, names); }
+    return d.message.str();
+}
+
+fn checkBinds(d: &Draft, names: &KeyNames) {
+    for i in 1..d.binds.len {
+        let b = trim(d.binds.items[i]);
+        if !comboOk(names, b) { combo(d, d.titles.items[i], b); return; }
+        for j in 1..i {
+            if b.len > 0 && sameCombo(names, b, trim(d.binds.items[j])) {
+                d.message.pushStr(d.titles.items[j]);
+                d.message.pushStr(" and ");
+                d.message.pushStr(d.titles.items[i]);
+                d.message.pushStr(" use the same keys");
+                return;
+            }
+        }
+    }
+}
+
+fn combo(d: &Draft, what: string, s: string) {
+    d.message.pushStr(what);
+    d.message.pushStr(": \"");
+    d.message.pushStr(trim(s));
+    d.message.pushStr("\" is not a key combo (like ctrl+shift+o)");
+}
+
+fn comboOk(names: &KeyNames, s: string): bool {
+    let t = trim(s);
+    let m = 0;
+    let k = Key.A;
+    return t.len == 0 || keynames.parseCombo(names, t, &m, &k);
+}
+
+fn sameCombo(names: &KeyNames, a: string, b: string): bool {
+    let ma = 0;
+    let ka = Key.A;
+    let mb = 0;
+    let kb = Key.A;
+    if !keynames.parseCombo(names, a, &ma, &ka) || !keynames.parseCombo(names, b, &mb, &kb) { return false; }
+    return ma == mb && ka == kb;
+}
+
+// Slot `k` back to the theme's color.
+pub fn resetColor(d: &Draft, ts: &Themes, k: int) { d.colors.items[k] = hexOf(d, ts.color(d.base, k)); }
+
+pub fn resetColors(d: &Draft, ts: &Themes) { for k in 0..SLOTS { resetColor(d, ts, k); } }
+
+// Slot `k` differs from the theme.
+pub fn overridden(d: &Draft, ts: &Themes, k: int): bool { return files.hex(d.colors.items[k]) != ts.color(d.base, k); }
+
+// Action `id` back to its default combo.
+pub fn resetBind(d: &Draft, id: int) { d.binds.items[id] = d.defaults.items[id]; }
+
+pub fn resetBinds(d: &Draft) { for id in 0..d.binds.len { resetBind(d, id); } }
+
+// A new theme: colors that followed the old one follow `t`; overrides stay.
+fn rebase(d: &Draft, ts: &Themes, t: int) {
+    for k in 0..SLOTS { if !overridden(d, ts, k) { d.colors.items[k] = hexOf(d, ts.color(t, k)); } }
+    d.base = t;
+}
+
+// Slot `k` as the config shows it: the theme's color unless overridden.
+fn effective(c: &Config, ts: &Themes, k: int): int {
+    let v = ts.color(c.theme, k);
+    let o = 0;
+    while o + 1 < c.colors.len {
+        if c.colors.items[o] == k { v = c.colors.items[o + 1]; }
+        o += 2;
+    }
+    return v;
+}
+
+fn own(d: &Draft, s: string): string {
+    let t = Text.new(d.mem);
+    t.pushStr(s);
+    return t.str();
+}
+
+fn join(d: &Draft, a: string, b: string): string {
+    let t = Text.new(d.mem);
+    t.pushStr(a);
+    t.push(61);
+    t.pushStr(b);
+    return t.str();
+}
+
+fn hexOf(d: &Draft, c: int): string {
+    let t = Text.new(d.mem);
+    files.pushHex(&t, c);
+    return t.str();
+}
+
+fn numOf(d: &Draft, n: int): string {
+    let t = Text.new(d.mem);
+    t.pushInt(n);
+    return t.str();
+}
+
+// The whole number in `s` (spaces trimmed), -1 when it is not one.
+fn digits(s: string): int {
+    let t = trim(s);
+    if t.len == 0 || t.len > 9 { return -1; }
+    let v = 0;
+    for i in 0..t.len {
+        if t[i] < 48 || t[i] > 57 { return -1; }
+        v = v * 10 + int(t[i] - 48);
+    }
+    return v;
+}
+
+// Self-check: numbers, combos, duplicate keys, keybinds written only for changes.
+pub fn selfTest(mem: &Arena) {
+    expect(digits(" 42 ") == 42 && digits("4x") == -1 && digits("") == -1, "digits");
+    let names = keynames.create(mem);
+    let d = create(mem);
+    d.scrollback = "100";
+    d.notifyAfter = "0";
+    for id in 0..3 { d.binds.push(""); d.loaded.push(""); d.defaults.push(""); d.names.push("n"); d.titles.push("t"); }
+    d.defaults.items[1] = "ctrl+shift+c";
+    d.loaded.items[1] = "ctrl+shift+c";
+    d.binds.items[1] = "ctrl+shift+x";
+    d.binds.items[2] = "ctrl+shift+x";
+    expect(check(&d, &names).len > 0, "duplicate");
+    d.binds.items[2] = "ctrl+nope";
+    expect(check(&d, &names).len > 0, "bad combo");
+    d.binds.items[2] = "";
+    expect(check(&d, &names).len == 0, "ok");
+    expect(keysEdited(&d), "edited");
+    let c = config.create(mem);
+    let ts = theme.create(mem);
+    d.names.items[1] = "copy";
+    finish(&d, &c, &ts);
+    expect(c.keybinds.len == 2 && c.keybinds.items[0] == "ctrl+shift+c=none" && c.keybinds.items[1] == "ctrl+shift+x=copy", "keybinds");
+}
+
+fn expect(ok: bool, what: string) { if !ok { sys.panic(`draft selfTest: {what}`); } }
+
+// Drop the theme-slot overrides from `colors`, keeping editor syntax ones (the draft has none).
+fn keepSyntax(colors: &List<int>) {
+    let n = 0;
+    let o = 0;
+    while o + 1 < colors.len {
+        if colors.items[o] >= SLOTS {
+            colors.items[n] = colors.items[o];
+            colors.items[n + 1] = colors.items[o + 1];
+            n += 2;
+        }
+        o += 2;
+    }
+    colors.len = n;
+}

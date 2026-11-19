@@ -1,0 +1,468 @@
+module jzero.ext.host;
+
+// Extensions: j2 scripts at `<config>/extensions/<name>/main.j2`, each one an app shown in a
+// pane (a `Session` with no pty, `session.openExt`). One VM on the main thread runs them all;
+// a script error shows in its pane and stops only that pane. A changed `main.j2` reloads and
+// its panes start over. What scripts can call: `api.j3`; how to write one: `docs/extensions.md`.
+
+use j3.game;
+use j3.io;
+use j3.j2;
+use j3.j2.{ Limits, Ref, Value, Vm };
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.text.Text;
+use j3.term.input.{ Decoder, Event, EV_KEY, EV_PASTE, EV_MOUSE, MA_PRESS, MA_MOVE };
+use jzero.config.config;
+use jzero.ext.api;
+use jzero.ext.api.Target;
+use jzero.ext.save;
+use jzero.session.paths;
+use jzero.term.session.Session;
+
+const SCAN_MS = 1000;   // how often the folder and the files' mtimes are checked
+const ESC_WAIT_MS = 60; // a lone Esc is held this long by the decoder
+
+// One extension: a folder with a `main.j2`.
+struct Ext {
+    name: Text;     // folder name (what an EXT pane saves)
+    title: Text;    // its `pub let title`, else the name
+    mod: Ref;       // exports, none while it fails to load
+    mtime: int = -1;
+    err: Text;      // load error ("" when loaded)
+}
+
+// One extension pane.
+struct Inst {
+    s: &Session;
+    id: int;        // the pane's id (its `pane.saved` file)
+    ext: int;
+    pane: Ref;      // the table the script gets: cols, rows, every, saved, and its own fields
+    mouse: bool = false;  // clicks reported (it has `click` or drew a `tui.button`)
+    cols: int = 0;
+    rows: int = 0;
+    tickAt: int = 0;
+    dead: bool = false;  // failed: shows `err` until the file changes
+    err: Text;
+    dec: Decoder;
+}
+
+pub struct Host {
+    mem: &Arena;
+    scanMem: &Arena;   // folder listings, rewound per scan
+    vm: &Vm;           // in `mem`: it must not move
+    target: &Target;   // `vm.host`: the pane a call draws into
+    exts: List<Ext>;
+    insts: List<Inst>;
+    scannedAt: int = -100000;
+    keyBuf: Text;
+
+    // Find new extensions and reload changed ones (at most once a second unless `force`).
+    fn refresh(this: &Host, force: bool) {
+        let now = game.ticks();
+        if !force && now - this.scannedAt < SCAN_MS { return; }
+        this.scannedAt = now;
+        this.scanMem.destroy();
+        *this.scanMem = Arena.create(8192);
+        match io.listDir(dir(), this.scanMem) {
+            Result.Ok(entries) {
+                for e in entries {
+                    if !e.isDir || this.find(e.name) >= 0 || !hasMain(e.name) { continue; }  // syntax-only folders aren't panes
+                    this.exts.push(Ext { name: keepText(this.mem, e.name), title: keepText(this.mem, e.name), mod: j2.none(), err: Text.new(this.mem) });
+                }
+            }
+            Result.Err(_) {}
+        }
+        for i in 0..this.exts.len {
+            let m = mtimeOf(this.mainPath(i));
+            if m != this.exts.items[i].mtime { this.reload(i, m); }
+        }
+    }
+
+    // Rescan the folder and reload every extension, changed or not; open panes start over.
+    fn reloadAll(this: &Host) {
+        this.refresh(true);
+        for i in 0..this.exts.len { this.reload(i, mtimeOf(this.mainPath(i))); }
+    }
+
+    fn count(this: &Host): int { return this.exts.len; }
+    fn name(this: &Host, i: int): string { return this.exts.items[i].name.str(); }
+    fn title(this: &Host, i: int): string { return this.exts.items[i].title.str(); }
+
+    fn find(this: &Host, name: string): int {
+        for i in 0..this.exts.len { if this.exts.items[i].name.str() == name { return i; } }
+        return -1;
+    }
+
+    fn mainPath(this: &Host, i: int): string {
+        let t = Text.scratch();
+        t.pushStr(dir());
+        t.push(47);
+        t.pushStr(this.exts.items[i].name.str());
+        t.pushStr("/main.j2");
+        return t.str();
+    }
+
+    // (Re)load extension `i`; its open panes start over.
+    fn reload(this: &Host, i: int, mtime: int) {
+        let x = &this.exts.items[i];
+        x.mtime = mtime;
+        this.vm.release(x.mod);
+        x.mod = j2.none();
+        x.err.clear();
+        x.title.clear();
+        x.title.pushStr(x.name.str());
+        match this.vm.loadFile(x.name.str(), this.mainPath(i)) {
+            Result.Ok(exports) {
+                x.mod = this.vm.keep(exports);
+                let t = this.vm.get(x.mod).getStr("title", "");
+                if t.len > 0 { x.title.clear(); x.title.pushStr(t); }
+            }
+            Result.Err(e) { x.err.pushStr(e.message); }
+        }
+        for k in 0..this.insts.len { if this.insts.items[k].ext == i { this.start(k); } }
+    }
+
+    // Run extension `name` in `s` (an `openExt` session) for pane `id`.
+    fn open(this: &Host, s: &Session, id: int, name: string) {
+        this.refresh(this.find(name) < 0);
+        let i = this.find(name);
+        this.insts.push(Inst { s: s, id: id, ext: i, pane: j2.none(), dec: Decoder.new(s.mem), err: Text.new(s.mem) });
+        if i < 0 {
+            let inst = &this.insts.items[this.insts.len - 1];
+            inst.err.pushStr("No extension folder named ");
+            inst.err.pushStr(name);
+            inst.err.pushStr(" in ");
+            inst.err.pushStr(dir());
+            fail(inst);
+            return;
+        }
+        this.start(this.insts.len - 1);
+    }
+
+    // A fresh pane table (keeping `saved`: from the old table on a reload, else the pane's
+    // file), then `open` and `draw`.
+    fn start(this: &Host, k: int) {
+        let inst = &this.insts.items[k];
+        let x = &this.exts.items[inst.ext];
+        let saved = this.vm.get(inst.pane).get("saved");
+        if this.vm.value(inst.pane).isNil() { saved = save.read(this.vm, paths.ext(inst.id)); }
+        let keepSaved = this.vm.keep(saved);
+        this.vm.release(inst.pane);
+        inst.mouse = false;
+        inst.dead = false;
+        inst.s.inbox.clear();
+        inst.s.keysIn.clear();
+        if x.err.len() > 0 {
+            inst.err.clear();
+            inst.err.pushStr(x.err.str());
+            fail(inst);
+            return;
+        }
+        inst.cols = inst.s.grid.cols();
+        inst.rows = inst.s.grid.rows();
+        let t = this.vm.newTable();
+        t.set("cols", j2.int(inst.cols));
+        t.set("rows", j2.int(inst.rows));
+        t.set("saved", this.vm.value(keepSaved));
+        this.vm.release(keepSaved);
+        inst.pane = this.vm.keep(t.value());
+        // Full-screen app: the alternate screen (no scrollback), no cursor; clicks reported when it wants them.
+        csis(&inst.s.inbox, "?1049h ?25l 2J H");
+        if !this.fnOf(inst.ext, "click").isNil() { this.mouseOn(k); }
+        if !this.fnOf(inst.ext, "move").isNil() { this.mouseOn(k); csis(&inst.s.inbox, "?1003h"); }
+        inst.tickAt = game.ticks();
+        this.call(k, "open");
+        this.draw(k);
+    }
+
+    fn mouseOn(this: &Host, k: int) {
+        let inst = &this.insts.items[k];
+        if inst.mouse { return; }
+        inst.mouse = true;
+        csis(&inst.s.inbox, "?1000h ?1006h");
+    }
+
+    // `draw(pane)` with a fresh `pane.buttons` for `tui.button` to fill; buttons turn the mouse on.
+    fn draw(this: &Host, k: int) {
+        let t = this.vm.get(this.insts.items[k].pane);
+        t.set("buttons", this.vm.newArray(4).value());
+        this.call(k, "draw");
+        let b = this.vm.get(this.insts.items[k].pane).get("buttons");
+        if b.tag == j2.T_ARRAY && j2.arrOf(b).len > 0 { this.mouseOn(k); }
+    }
+
+    // A left press on a `tui.button` (`{x, y, w, f}` in `pane.buttons`) calls its `f(pane)`.
+    fn pressButton(this: &Host, k: int, col: int, row: int): bool {
+        let b = this.vm.get(this.insts.items[k].pane).get("buttons");
+        if b.tag != j2.T_ARRAY { return false; }
+        let n = j2.arrOf(b).len;
+        for i in 0..n {
+            let bt = j2.arrOf(b).get(i).asTable();
+            let x = int(bt.getNum("x", -1.0));
+            if row != int(bt.getNum("y", -1.0)) || col < x || col >= x + int(bt.getNum("w", 0.0)) { continue; }
+            let args: [1]Value = [this.vm.value(this.insts.items[k].pane)];
+            this.runFn(k, bt.get("f"), args[:]);
+            return true;
+        }
+        return false;
+    }
+
+    // `pane.menu` of extension pane `s`: right-click menu entries `{ label, f }` (nil when none).
+    fn menuOf(this: &Host, s: &Session): Value {
+        let k = this.instOf(s);
+        if k < 0 || this.insts.items[k].dead { return j2.nil(); }
+        let m = this.vm.get(this.insts.items[k].pane).get("menu");
+        if m.tag != j2.T_ARRAY { return j2.nil(); }
+        return m;
+    }
+
+    fn menuLen(this: &Host, s: &Session): int {
+        let m = this.menuOf(s);
+        if m.isNil() { return 0; }
+        return j2.arrOf(m).len;
+    }
+
+    // Entry `i`'s label (frame scratch).
+    fn menuLabel(this: &Host, s: &Session, i: int): string {
+        let m = this.menuOf(s);
+        if m.isNil() || i >= j2.arrOf(m).len { return ""; }
+        let e = j2.arrOf(m).get(i);
+        if e.tag != j2.T_TABLE { return "?"; }
+        let t = Text.scratch();
+        t.pushStr(e.asTable().getStr("label", "?"));
+        return t.str();
+    }
+
+    // Entry `i` picked: `f(pane)`, then `draw`.
+    fn menuPick(this: &Host, s: &Session, i: int) {
+        let m = this.menuOf(s);
+        if m.isNil() || i >= j2.arrOf(m).len { return; }
+        let e = j2.arrOf(m).get(i);
+        if e.tag != j2.T_TABLE { return; }
+        let k = this.instOf(s);
+        let args: [1]Value = [this.vm.value(this.insts.items[k].pane)];
+        this.runFn(k, e.asTable().get("f"), args[:]);
+        this.draw(k);
+    }
+
+    // Each frame for an extension pane, before `Session.pump`: size changes, keys, clicks,
+    // ticks; `draw` after any of them.
+    fn step(this: &Host, s: &Session) {
+        let k = this.instOf(s);
+        if k < 0 { return; }
+        let inst = &this.insts.items[k];
+        let now = game.ticks();
+        if inst.dead {
+            s.keysIn.clear();
+            if s.grid.cols() != inst.cols || s.grid.rows() != inst.rows { fail(inst); }  // the alt screen does not reflow
+            return;
+        }
+        let dirty = false;
+        if s.grid.cols() != inst.cols || s.grid.rows() != inst.rows {
+            inst.cols = s.grid.cols();
+            inst.rows = s.grid.rows();
+            let t = this.vm.get(inst.pane);
+            t.set("cols", j2.int(inst.cols));
+            t.set("rows", j2.int(inst.rows));
+            this.call(k, "resize");
+            dirty = true;
+        }
+        if s.keysIn.len() > 0 {
+            inst.dec.feed(s.keysIn.bytes[0..s.keysIn.len()], now);
+            s.keysIn.clear();
+        }
+        let ev = Event {};
+        while !this.insts.items[k].dead && this.insts.items[k].dec.next(now, &ev) {
+            if ev.kind == EV_KEY {
+                api.keyName(&ev, &this.keyBuf);
+                if this.keyBuf.len() > 0 { this.callStr(k, "key", this.keyBuf.str()); dirty = true; }
+            } else if ev.kind == EV_PASTE {
+                this.callStr(k, "paste", ev.text);
+                dirty = true;
+            } else if ev.kind == EV_MOUSE && ev.action == MA_PRESS {
+                if ev.button != 0 || !this.pressButton(k, ev.x, ev.y) { this.callXY(k, ev.x, ev.y, ev.button); }
+                dirty = true;
+            } else if ev.kind == EV_MOUSE && ev.action == MA_MOVE {
+                this.callMove(k, ev.x, ev.y);
+                dirty = true;
+            }
+        }
+        inst = &this.insts.items[k];
+        if inst.dec.buf.len() > inst.dec.pos { game.wakeAt(now + ESC_WAIT_MS); }
+        let every = int(this.vm.get(inst.pane).getNum("every", 0.0));
+        if every > 0 {
+            if now >= inst.tickAt {
+                inst.tickAt = now + every;
+                this.call(k, "tick");
+                dirty = true;
+            }
+            game.wakeAt(this.insts.items[k].tickAt);
+        }
+        if dirty { this.draw(k); }
+    }
+
+    // Forget `s` (its session is about to close), writing its `pane.saved`.
+    fn drop(this: &Host, s: &Session) {
+        let k = this.instOf(s);
+        if k < 0 { return; }
+        let inst = &this.insts.items[k];
+        if !this.vm.value(inst.pane).isNil() { save.write(paths.ext(inst.id), this.vm.get(inst.pane).get("saved")); }
+        this.vm.release(this.insts.items[k].pane);
+        this.insts.items[k] = this.insts.items[this.insts.len - 1];
+        this.insts.len -= 1;
+    }
+
+    fn instOf(this: &Host, s: &Session): int {
+        for k in 0..this.insts.len { if this.insts.items[k].s == s { return k; } }
+        return -1;
+    }
+
+    fn fnOf(this: &Host, ext: int, name: string): Value {
+        let x = &this.exts.items[ext];
+        if x.err.len() > 0 { return j2.nil(); }
+        return this.vm.get(x.mod).get(name);
+    }
+
+    // `name(pane)`, when the script has it.
+    fn call(this: &Host, k: int, name: string) {
+        let args: [1]Value = [this.vm.value(this.insts.items[k].pane)];
+        this.run(k, name, args[:]);
+    }
+
+    fn callStr(this: &Host, k: int, name: string, s: string) {
+        let args: [2]Value = [this.vm.value(this.insts.items[k].pane), j2.str(this.vm, s)];
+        this.run(k, name, args[:]);
+    }
+
+    // `click(pane, col, row, button)`: 0-based cell, button 0 left, 1 middle, 2 right, 4/5 wheel.
+    fn callXY(this: &Host, k: int, x: int, y: int, button: int) {
+        let args: [4]Value = [this.vm.value(this.insts.items[k].pane), j2.int(x), j2.int(y), j2.int(button)];
+        this.run(k, "click", args[:]);
+    }
+
+    // `move(pane, col, row)`: the pointer entered another cell (`?1003` any-motion).
+    fn callMove(this: &Host, k: int, x: int, y: int) {
+        let args: [3]Value = [this.vm.value(this.insts.items[k].pane), j2.int(x), j2.int(y)];
+        this.run(k, "move", args[:]);
+    }
+
+    fn run(this: &Host, k: int, name: string, args: []Value) {
+        if this.insts.items[k].dead { return; }
+        this.runFn(k, this.fnOf(this.insts.items[k].ext, name), args);
+    }
+
+    fn runFn(this: &Host, k: int, f: Value, args: []Value) {
+        let inst = &this.insts.items[k];
+        if inst.dead || f.isNil() { return; }
+        this.target.s = inst.s;
+        this.target.on = true;
+        this.target.cols = inst.s.grid.cols();
+        match this.vm.call(f, args) {
+            Result.Ok(_) {}
+            Result.Err(e) {
+                inst.err.clear();
+                inst.err.pushStr(e.message);
+                inst.err.push(10);
+                inst.err.pushStr(e.trace);
+                fail(inst);
+            }
+        }
+        this.target.on = false;
+    }
+}
+
+pub fn create(mem: &Arena): Host {
+    let scanMem = &mem.alloc::<Arena>(1)[0];
+    *scanMem = Arena.create(8192);
+    let target = &mem.alloc::<Target>(1)[0];
+    let vm = &mem.alloc::<Vm>(1)[0];
+    *vm = Vm.new(mem, Limits { heapBytes: 32 << 20, stepsPerCall: 2000000 });
+    let h = Host {
+        mem: mem, scanMem: scanMem, vm: vm, target: target,
+        exts: List<Ext>.new(mem), insts: List<Inst>.new(mem), keyBuf: Text.new(mem),
+    };
+    target.tui = j2.none();
+    target.on = false;
+    h.vm.openLibs(j2.LIB_ALL);
+    api.bind(h.vm);
+    h.vm.host = target as ptr;
+    h.vm.resolver = resolve;
+    h.vm.resolverCtx = target as ptr;
+    return h;
+}
+
+// `<config>/extensions` (frame scratch).
+pub fn dir(): string {
+    let t = config.dir();
+    t.pushStr("/extensions");
+    return t.str();
+}
+
+// `use tui;`: the bundled helpers (`assets/ext/tui.j2`), loaded once.
+fn resolve(ctx: ptr, vm: &Vm, name: string): Value {
+    let t = ctx as &Target;
+    if name != "tui" { return vm.raise("unknown module (only `tui` is bundled)"); }
+    if vm.value(t.tui).isNil() {
+        match vm.loadFile("tui", "assets/ext/tui.j2") {
+            Result.Ok(v) { t.tui = vm.keep(v); }
+            Result.Err(e) {
+                let m = Text.scratch();
+                m.pushStr(e.message);
+                return vm.raise(m.str());
+            }
+        }
+    }
+    return vm.value(t.tui);
+}
+
+// Stop `inst`: its error on a cleared screen, in red, until the file changes.
+fn fail(inst: &Inst) {
+    inst.dead = true;
+    inst.cols = inst.s.grid.cols();
+    inst.rows = inst.s.grid.rows();
+    let t = &inst.s.inbox;
+    csis(t, "?1049h ?25l 0m 2J H 31m");
+    crlf(t, inst.err.str());
+    csis(t, "0m");
+    t.pushStr("\r\nSave the file to reload.");
+}
+
+// `ESC [ x` for each space-separated `x` of `seqs`.
+fn csis(t: &Text, seqs: string) {
+    t.push(27);
+    t.push(91);
+    for i in 0..seqs.len {
+        if seqs[i] == 32 { t.push(27); t.push(91); } else { t.push(seqs[i]); }
+    }
+}
+
+fn crlf(t: &Text, s: string) {
+    for i in 0..s.len {
+        if s[i] == 10 { t.push(13); }
+        t.push(s[i]);
+    }
+    t.pushStr("\r\n");
+}
+
+fn keepText(mem: &Arena, s: string): Text {
+    let t = Text.new(mem);
+    t.pushStr(s);
+    return t;
+}
+
+fn hasMain(name: string): bool {
+    let t = Text.scratch();
+    t.pushStr(dir());
+    t.push(47);
+    t.pushStr(name);
+    t.pushStr("/main.j2");
+    return io.exists(t.str());
+}
+
+fn mtimeOf(p: string): int {
+    match io.stat(p) {
+        Result.Ok(e) { return e.mtime; }
+        Result.Err(_) { return -1; }
+    }
+}

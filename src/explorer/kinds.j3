@@ -1,0 +1,43 @@
+module jzero.explorer.kinds;
+
+use j3.sys;
+
+// What view a file opens in, by extension. A new format: a kind here and a view for it.
+pub const TEXT = 0;
+pub const MARKDOWN = 1;
+pub const IMAGE = 2;
+
+const MD_EXTS: [2]string = ["md", "markdown"];
+// Formats SDL_image reads (PNG also without it).
+const IMAGE_EXTS: [12]string = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tga", "tif", "tiff", "svg", "avif", "qoi"];
+
+pub fn of(path: string): int {
+    let k = path.len;
+    while k > 0 && path[k - 1] != 46 && path[k - 1] != 47 { k -= 1; }
+    if k == 0 || path[k - 1] != 46 { return TEXT; }
+    let ext = path[k..path.len];
+    for e in MD_EXTS { if sameNoCase(ext, e) { return MARKDOWN; } }
+    for e in IMAGE_EXTS { if sameNoCase(ext, e) { return IMAGE; } }
+    return TEXT;
+}
+
+pub fn isImage(path: string): bool { return of(path) == IMAGE; }
+
+// `a` equals lowercase `b`, ignoring ASCII case.
+fn sameNoCase(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len {
+        let c = a[i];
+        if c >= 65 && c <= 90 { c += 32; }
+        if c != b[i] { return false; }
+    }
+    return true;
+}
+
+pub fn selfTest() {
+    check(of("/a/b.md") == MARKDOWN && of("x.Markdown") == MARKDOWN, "markdown");
+    check(of("p.PNG") == IMAGE && of("/d/a.jpeg") == IMAGE, "image");
+    check(of("a.txt") == TEXT && of("/a.png/readme") == TEXT && of("md") == TEXT, "text");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`kinds selfTest: {what}`); } }

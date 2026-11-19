@@ -1,0 +1,20 @@
+<script>
+    // One setting: its name on the left, the control(s) after it, an optional note below.
+    props { name: string; note: string = ""; }
+</script>
+<div class="setting">
+    <div class="line">
+        <span class="name">{name}</span>
+        <div class="field"><slot /></div>
+    </div>
+    {#if note.len > 0}
+        <p class="note">{note}</p>
+    {/if}
+</div>
+<style>
+    .setting { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+    .line { display: flex; flex-direction: row; align-items: center; gap: 8px; min-height: 32px; }
+    .name { width: 170px; }
+    .field { flex: 1; min-width: 0; display: flex; flex-direction: row; align-items: center; gap: 8px; }
+    .note { margin-left: 178px; color: var(--c-bright-black); font-size: 12px; overflow-wrap: anywhere; }
+</style>

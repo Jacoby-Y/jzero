@@ -1,0 +1,17 @@
+name = Python
+ext = py pyw pyi
+comment = #
+region = string """ """ escape multiline
+region = string ''' ''' escape multiline
+string = " " escape
+string = ' ' escape
+prefix = annotation @
+keyword = and as class def del global in is lambda nonlocal not or self
+control = assert async await break continue elif else except finally for from if import pass raise return try while with yield match case
+plain = variable
+constant = True False None
+builtin = print len range str int float list dict set tuple open isinstance super enumerate zip map filter sorted type any all min max sum abs repr
+after = function def
+after = type class
+call = true
+capitalized = type

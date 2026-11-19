@@ -1,0 +1,14 @@
+// MouseTracker: draws a "0" wherever the mouse is. Copy this folder to
+// ~/.config/jzero/extensions/mousetracker, then Command palette → "Extension: MouseTracker".
+pub let title = "MouseTracker";
+
+pub fn open(pane) { pane.x = -1; pane.y = -1; }
+
+pub fn move(pane, col, row) { pane.x = col; pane.y = row; }
+
+pub fn draw(pane) {
+    clear();
+    if pane.x < 0 { return; }
+    at(pane.x, pane.y);
+    write("0");
+}

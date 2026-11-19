@@ -1,0 +1,92 @@
+<script>
+    use jzero.state.State;
+    use jzero.layout.island.TAG_COUNT;
+    use jzero.layout.icons;
+    use jzero.layout.split;
+    props { state: &State; x: f32; y: f32; }
+    events { close; }
+
+    let draft: string = "";
+    let shownIdx = -1;
+    let confirmDelete = false;
+
+    // Refill the name box when a different island gets selected.
+    fn onFrame(dt: f32) {
+        if shownIdx != state.selected {
+            shownIdx = state.selected;
+            draft = state.islands.get(shownIdx).name.str();
+        }
+    }
+
+    fn rename() { state.islands.rename(state.selected, draft); }
+</script>
+
+{#let sel = state.islands.get(state.selected)}
+<aside class="panel" popover left={x} top={y} on:close={emit close}>
+    <label class="lbl">Name</label>
+    <input type="text" class="name" bind:value={draft} on:input={rename()} />
+    <label class="lbl">Icon</label>
+    <div class="grid">
+        {#each 0..icons.COUNT as k}
+            <button class="pick" class:on={sel.icon == k} on:click={sel.icon = k}><IslandIcon icon={k} /></button>
+        {/each}
+    </div>
+    <label class="lbl">Tag</label>
+    <div class="grid">
+        {#each 0..TAG_COUNT as k}
+            <button class="pick tag-{k}" class:on={sel.tag == k} title={if k == 0 { "No tag" } else { "Tag" }} on:click={sel.tag = k}>
+                {#if k == 0}<icon name="slash-circle" />{:else}<icon name="circle-fill" />{/if}
+            </button>
+        {/each}
+    </div>
+    <div class="row">
+        {#if sel.open}
+            <button class="act" on:click={state.requestCloseIsland(state.selected)}>Close</button>
+        {:else}
+            <button class="act" on:click={state.openIsland(state.selected)}>Open</button>
+        {/if}
+        <button class="act danger" on:click={confirmDelete = true}>Delete</button>
+    </div>
+    <button class="act" title="Saves the layout, folders and each pane's last command" on:click={state.saveTemplate(state.selected)}>Save as template</button>
+    {#if confirmDelete}
+        <dialog modal class="confirm" on:close={confirmDelete = false}>
+            <p>Delete {sel.name.str()}? Its panes, scrollback and history are removed.</p>
+            <div class="row">
+                <button class="act" on:click={confirmDelete = false}>Cancel</button>
+                <button class="act del" default on:click={confirmDelete = false; state.deleteIsland(state.selected)}>Delete</button>
+            </div>
+        </dialog>
+    {/if}
+    {#if !sel.panes.empty()}
+        <label class="lbl">Preview</label>
+        <div class="preview">
+            {#each sel.panes.all() as &n, i (i : int)}
+                {#if n.alive && n.kind == split.LEAF}
+                    <div class="mini" style:left="calc({n.x * 100.0}% + 1px)" style:top="calc({n.y * 100.0}% + 1px)"
+                        style:width="calc({n.w * 100.0}% - 2px)" style:height="calc({n.h * 100.0}% - 2px)">
+                        <pre class="cmds">{n.recentCmds(6)}</pre>
+                    </div>
+                {/if}
+            {/each}
+        </div>
+    {/if}
+</aside>
+
+<style>
+    .panel { width: 220px; padding: 12px; display: flex; flex-direction: column; gap: 8px; background: var(--chrome-bg); }
+    .lbl { color: var(--c-bright-black); }
+    .name { padding: 6px 8px; background: var(--term-bg); color: var(--c-bright-white); }
+    .grid { display: flex; flex-direction: row; flex-wrap: wrap; gap: 4px; }
+    .pick { width: 32px; height: 32px; font-size: 16px; display: flex; align-items: center; justify-content: center; background: var(--ocean-tile); }
+    .pick.on { background: var(--chrome-active); color: var(--c-bright-white); }
+    .tag-1 { color: var(--c-red); } .tag-2 { color: var(--c-green); } .tag-3 { color: var(--c-yellow); }
+    .tag-4 { color: var(--c-blue); } .tag-5 { color: var(--c-magenta); } .tag-6 { color: var(--c-cyan); }
+    .row { display: flex; flex-direction: row; gap: 8px; margin-top: 4px; }
+    .act { flex: 1; padding: 6px 0; background: var(--ocean-tile); }
+    .preview { position: relative; height: 130px; background: var(--ocean-bg); }
+    .mini { position: absolute; overflow: hidden; padding: 3px 5px; background: var(--chrome-active); }
+    .cmds { font-family: "Mono"; font-size: 10px; line-height: 13px; color: var(--c-bright-white); }
+    .confirm { width: 320px; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--chrome-bg); color: var(--chrome-fg); }
+    .del { background: var(--chrome-danger); color: var(--c-bright-white); }
+    .danger:hover { background: var(--chrome-danger); color: var(--c-bright-white); }
+</style>

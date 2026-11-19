@@ -1,0 +1,593 @@
+module jzero.explorer.explorer;
+
+use j3.game;
+use j3.game.{ Mouse, Texture };
+use j3.io;
+use j3.io.DirEntry;
+use j3.io.watch.{ Event, Kind, Watcher };
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, find };
+use j3.ui.spans.Span;
+use jzero.explorer.highlight;
+use jzero.explorer.highlight.Highlighter;
+use jzero.explorer.image;
+use jzero.explorer.image.Viewer;
+use jzero.explorer.kinds;
+use jzero.explorer.mddoc;
+use jzero.explorer.mddoc.Doc;
+use jzero.explorer.thumbs;
+use jzero.explorer.thumbs.Thumbs;
+use jzero.features.links;
+use jzero.input.mods;
+use jzero.platform.fileops;
+use jzero.platform.os;
+
+pub const TREE = 0;
+pub const EDIT = 1;
+
+// Git status of a row (`git status --porcelain`): a folder takes the strongest of what is inside.
+pub const GIT_NONE = 0;
+pub const GIT_MODIFIED = 1;
+pub const GIT_ADDED = 2;
+pub const GIT_UNTRACKED = 3;
+
+const MAX_EDIT_BYTES = 4194304;  // larger files are not opened in the editor
+
+// One visible line of the file tree.
+pub struct Row {
+    path: Text;
+    name: string;     // view into `path`
+    depth: int;
+    isDir: bool;
+    open: bool = false;
+    git: int = 0;     // GIT_*
+    size: int = 0;    // bytes (files)
+    items: int = 0;   // entries listed inside (folders)
+    sel: bool = false; // picked (multi-select; `select.j3`)
+}
+
+// A file explorer pane: a lazily listed tree under `root`, and a small editor for one file.
+// Owns `mem` (an arena of its own). Row paths and listings live in `tree`, emptied by `refresh`;
+// file reads in `load`, emptied by each read. Folders shown and the open file are watched (`pollWatch`).
+pub struct Explorer {
+    mem: &Arena;
+    tree: &Arena;
+    load: &Arena;
+    root: Text;
+    rows: List<Row>;
+    opened: List<string>;  // paths of open folders, kept across refreshes
+    selected: int = -1;
+    mode: int = 0;         // TREE or EDIT
+    kind: int = 0;         // kinds.* of `file`
+    file: Text;            // file in the editor
+    text: string = "";     // the editor's text (bound to the textarea)
+    saved: Text;           // text as last loaded/saved, for `dirty`
+    swapA: Text;           // replace-all output, alternating so the new text never overwrites
+    swapB: Text;           // the one it was built from (and the textarea sees a new string)
+    swapped: bool = false;
+    message: Text;         // last error or note, shown in the pane
+    find: string = "";
+    replace: string = "";
+    showFind: bool = false;
+    hl: Highlighter;
+    spans: []Span;         // the editor's colors (bound to the textarea), from `rehighlight`
+    showHidden: bool = false; // dotfiles listed
+    editRequest: Text;     // a file to open in $EDITOR (State splits a pane for it)
+    gitTop: Text;          // the repository `root` is in ("" none)
+    gitPaths: List<string>; // changed paths under gitTop, with their GIT_* in gitKinds
+    gitKinds: List<int>;
+    dragOut: Text;         // path of the row being dragged in the window ("" none)
+    editedAt: int = 0;     // ms of the last edit
+    notesDir: Text;        // files under it autosave ("" none)
+    gotoByte: int = -1;    // put the editor's caret here next frame (`gotoLine`; -1 none)
+    viewer: Viewer;        // the image modal (`viewing`), over the tree or editor
+    image: Text;           // its file
+    doc: Doc;              // markdown preview of `text`
+    preview: bool = true;  // markdown opens rendered (kept for the pane)
+    grid: bool = false;    // the file list as thumbnail tiles
+    thumbs: Thumbs;
+    watcher: Watcher;
+    evs: List<Event>;
+    watchPaths: List<string>; // watched folders, ids in watchIds
+    watchIds: List<int>;
+    fileWatch: int = -1;      // the open file's watch
+    hlPending: bool = false;  // rehighlight next frame (after the textarea's own spans binding settles)
+    menuRow: int = -1;        // row the last right-click was on (-1 none)
+    selPath: Text;            // the selected row's path across a refresh
+    pickKeep: Text;           // picked rows' paths across a refresh, one per line
+    anchor: int = -1;         // Shift+click ranges start here
+    lastPress: int = -1;      // row of the last press, for double clicks
+    lastPressAt: int = 0;
+    props: Text;              // Properties dialog: `label\tvalue` lines ("" closed)
+    propLines: List<string>;  // its lines
+
+    // A row drag that reaches the window edge becomes an OS drag (files into Discord, a file manager).
+    // ponytail: X11/XWayland only (game.dragFiles returns false elsewhere, the in-app drag carries on).
+    fn stepDragOut(this: &Explorer) {
+        if this.dragOut.len() == 0 { return; }
+        if !game.mouseDown(Mouse.Left) { this.dragOut.clear(); return; }
+        let p = game.mousePos();
+        let w = game.windowSize();
+        if p.x > 0.0 && p.y > 0.0 && p.x < w.x - 1.0 && p.y < w.y - 1.0 { return; }
+        game.dragFiles([this.dragOut.str()]);
+        this.dragOut.clear();
+    }
+
+    fn setDragOut(this: &Explorer, path: string) {
+        this.dragOut.clear();
+        this.dragOut.pushStr(path);
+    }
+
+    // Open the selected file in $EDITOR in a new split.
+    fn openInEditor(this: &Explorer) {
+        if this.selected < 0 || this.rows.items[this.selected].isDir { return; }
+        this.editRequest.clear();
+        this.editRequest.pushStr(this.rows.items[this.selected].path.str());
+    }
+
+    fn toggleHidden(this: &Explorer) {
+        this.showHidden = !this.showHidden;
+        this.refresh();
+    }
+
+    // Show the parent of `root` instead (open folders stay open where they still show).
+    fn up(this: &Explorer) {
+        let r = this.root.str();
+        let k = os.parent(r).len;
+        if k == 0 || k == r.len { return; }
+        this.root.remove(k, r.len - k);
+        this.selected = -1;
+        this.thumbs.clear();
+        this.refresh();
+    }
+
+    // List `root` again, keeping open folders open.
+    fn refresh(this: &Explorer) {
+        this.selPath.clear();
+        if this.selected >= 0 && this.selected < this.rows.len { this.selPath.pushStr(this.rows.items[this.selected].path.str()); }
+        this.pickKeep.clear();
+        for k in 0..this.rows.len { if this.rows.items[k].sel { this.pickKeep.pushStr(this.rows.items[k].path.str()); this.pickKeep.push(10); } }
+        fresh(this.tree);
+        this.readGit();
+        this.rows.len = 0;
+        this.listInto(this.root.str(), 0, 0);
+        let i = 0;
+        while i < this.rows.len {
+            let r = &this.rows.items[i];
+            if r.isDir && this.wasOpen(r.path.str()) { this.expand(i); }
+            i += 1;
+        }
+        if this.selPath.len() > 0 {
+            for k in 0..this.rows.len { if this.rows.items[k].path.str() == this.selPath.str() { this.selected = k; break; } }
+        }
+        if this.selected >= this.rows.len { this.selected = this.rows.len - 1; }
+        // ponytail: O(rows × picked) path match; a set if huge picks get slow.
+        if this.pickKeep.len() > 0 { for k in 0..this.rows.len { this.rows.items[k].sel = hasLine(this.pickKeep.str(), this.rows.items[k].path.str()); } }
+        this.anchor = this.selected;
+        if this.menuRow >= this.rows.len { this.menuRow = -1; }
+        this.syncWatches();
+    }
+
+    // Changes on disk: entries added/removed/renamed in a shown folder relist the tree; the open file reloads.
+    // ponytail: one full refresh (and git status) per frame with changes; per-folder relist if big trees stutter.
+    // True when something had changed.
+    fn pollWatch(this: &Explorer): bool {
+        if this.watcher.poll(&this.evs) == 0 { return false; }
+        let tree = false;
+        let file = false;
+        for i in 0..this.evs.len {
+            let e = this.evs.items[i];
+            if e.kind == Kind.Overflow { tree = true; file = true; }
+            else if e.id == this.fileWatch { file = true; }
+            else if e.kind != Kind.Modify { tree = true; }
+        }
+        this.evs.len = 0;
+        if tree { this.refresh(); }
+        if file { this.reloadFile(); }
+        return true;
+    }
+
+    // Watch `root` and every open folder, and nothing else.
+    fn syncWatches(this: &Explorer) {
+        let k = 0;
+        while k < this.watchPaths.len {
+            if this.shows(this.watchPaths.items[k]) { k += 1; continue; }
+            this.watcher.remove(this.watchIds.items[k]);
+            this.watchPaths.remove(k);
+            this.watchIds.remove(k);
+        }
+        this.watchDir(this.root.str());
+        for i in 0..this.rows.len {
+            let r = &this.rows.items[i];
+            if r.isDir && r.open { this.watchDir(r.path.str()); }
+        }
+    }
+
+    fn shows(this: &Explorer, dir: string): bool {
+        if dir == this.root.str() { return true; }
+        for i in 0..this.rows.len {
+            let r = &this.rows.items[i];
+            if r.open && r.path.str() == dir { return true; }
+        }
+        return false;
+    }
+
+    fn watchDir(this: &Explorer, dir: string) {
+        for i in 0..this.watchPaths.len { if this.watchPaths.items[i] == dir { return; } }
+        match this.watcher.add(dir) {
+            Result.Ok(id) {
+                this.watchPaths.push(this.keep(dir));
+                this.watchIds.push(id);
+            }
+            Result.Err(_) {}
+        }
+    }
+
+    fn watchFile(this: &Explorer, path: string) {
+        this.unwatchFile();
+        match this.watcher.add(path) { Result.Ok(id) { this.fileWatch = id; } Result.Err(_) {} }
+    }
+
+    fn unwatchFile(this: &Explorer) {
+        if this.fileWatch >= 0 { this.watcher.remove(this.fileWatch); }
+        this.fileWatch = -1;
+    }
+
+    // The open file changed on disk: show the new text, unless there are unsaved edits (kept, with a note).
+    fn reloadFile(this: &Explorer) {
+        if this.mode != EDIT { return; }
+        fresh(this.load);
+        match io.readFile(this.file.str(), this.load) {
+            Result.Ok(bytes) {
+                let now = bytes as string;
+                if now == this.saved.str() { return; }  // our own save
+                if this.dirty() { this.note("Changed on disk, unsaved edits kept: ", this.file.str()); return; }
+                let out = this.nextSwap();
+                out.pushStr(now);
+                this.text = out.str();
+                this.saved.clear();
+                this.saved.pushStr(now);
+                this.rehighlight();
+                this.reparse();
+            }
+            Result.Err(_) { this.note("Gone from disk: ", this.file.str()); }
+        }
+    }
+
+    // An empty swap buffer for new editor text (alternating, so the textarea always sees a new string).
+    fn nextSwap(this: &Explorer): &Text {
+        let out = &this.swapA;
+        if this.swapped { out = &this.swapB; }
+        this.swapped = !this.swapped;
+        out.clear();
+        return out;
+    }
+
+    // A copy of `s` in `mem` (kept across refreshes).
+    fn keep(this: &Explorer, s: string): string {
+        let t = Text.new(this.mem);
+        t.pushStr(s);
+        return t.str();
+    }
+
+    // Entries shown inside folder `dir` (dotfiles only with showHidden; -1 unreadable).
+    // ponytail: lists every subfolder on each listing; a worker if huge trees stutter.
+    fn countIn(this: &Explorer, dir: string, scratch: &Arena): int {
+        let at = scratch.checkpoint();
+        let n = -1;
+        match io.listDir(dir, scratch) {
+            Result.Ok(es) {
+                n = 0;
+                for e in es { if this.showHidden || e.name.len == 0 || e.name[0] != 46 { n += 1; } }
+            }
+            Result.Err(_) {}
+        }
+        scratch.rewind(at);
+        return n;
+    }
+
+    fn wasOpen(this: &Explorer, path: string): bool {
+        for i in 0..this.opened.len { if this.opened.items[i] == path { return true; } }
+        return false;
+    }
+
+    // Insert the entries of `dir` at row `at` (folders first, then by name).
+    fn listInto(this: &Explorer, dir: string, at: int, depth: int) {
+        let scratch = Arena.create(16384);
+        match io.listDir(dir, this.tree) {
+            Result.Ok(entries) {
+                sortEntries(entries);
+                let k = at;
+                for e in entries {
+                    if !this.showHidden && (e.hidden || (e.name.len > 0 && e.name[0] == 46)) { continue; }
+                    let p = Text.new(this.tree);
+                    p.pushStr(dir);
+                    if dir.len == 0 || dir[dir.len - 1] != 47 { p.push(47); }
+                    p.pushStr(e.name);
+                    let ps = p.str();
+                    let n = 0;
+                    if e.isDir { n = this.countIn(ps, &scratch); }
+                    this.insertRow(k, Row { path: p, name: ps[ps.len - e.name.len..ps.len], depth: depth, isDir: e.isDir, git: this.gitOf(ps, e.isDir), size: e.size, items: n });
+                    k += 1;
+                }
+            }
+            Result.Err(_) { this.note("Cannot list ", dir); }
+        }
+        scratch.destroy();
+    }
+
+    fn insertRow(this: &Explorer, at: int, r: Row) {
+        this.rows.push(r);
+        let i = this.rows.len - 1;
+        while i > at {
+            this.rows.items[i] = this.rows.items[i - 1];
+            i -= 1;
+        }
+        this.rows.items[at] = r;
+    }
+
+    // Click on row `i`: a folder opens or closes, a file opens in the editor.
+    fn activate(this: &Explorer, i: int) {
+        this.selected = i;
+        let r = &this.rows.items[i];
+        if !r.isDir { this.openFile(r.path.str()); return; }
+        if r.open { this.collapse(i); } else { this.expand(i); }
+    }
+
+    fn expand(this: &Explorer, i: int) {
+        let r = &this.rows.items[i];
+        if r.open { return; }
+        r.open = true;
+        if !this.wasOpen(r.path.str()) { this.opened.push(this.keep(r.path.str())); }
+        this.listInto(r.path.str(), i + 1, r.depth + 1);
+        this.syncWatches();
+    }
+
+    fn collapse(this: &Explorer, i: int) {
+        let r = &this.rows.items[i];
+        r.open = false;
+        for k in 0..this.opened.len {
+            if this.opened.items[k] == r.path.str() { this.opened.remove(k); break; }
+        }
+        let end = i + 1;
+        while end < this.rows.len && this.rows.items[end].depth > r.depth { end += 1; }
+        let n = end - (i + 1);
+        for k in i + 1..this.rows.len - n { this.rows.items[k] = this.rows.items[k + n]; }
+        this.rows.len -= n;
+        if this.selected > i && this.selected < end { this.selected = i; }
+        this.menuRow = -1;
+        this.syncWatches();
+    }
+
+    // The folder new files go in: the selected folder, the selected file's folder, or root.
+    fn targetDir(this: &Explorer): string {
+        if this.selected < 0 { return this.root.str(); }
+        let r = &this.rows.items[this.selected];
+        if r.isDir { return r.path.str(); }
+        let p = r.path.str();
+        return p[0..p.len - r.name.len - 1];
+    }
+
+    fn openFile(this: &Explorer, path: string) {
+        if kinds.of(path) == kinds.IMAGE { this.openImage(path); return; }
+        match io.stat(path) {
+            Result.Ok(e) {
+                if e.size > MAX_EDIT_BYTES { this.note("Too large to edit: ", path); return; }
+            }
+            Result.Err(_) { this.note("Cannot open ", path); return; }
+        }
+        fresh(this.load);
+        match io.readFile(path, this.load) {
+            Result.Ok(bytes) {
+                if !isText(bytes) { this.note("Not a text file: ", path); return; }
+                this.watchFile(path);
+                this.file.clear();
+                this.file.pushStr(path);
+                this.saved.clear();
+                this.saved.pushBytes(bytes);
+                this.text = this.saved.str();
+                this.message.clear();
+                this.mode = EDIT;
+                this.kind = kinds.of(path);
+                this.rehighlight();
+                this.reparse();
+            }
+            Result.Err(_) { this.note("Cannot open ", path); }
+        }
+    }
+
+    fn dirty(this: &Explorer): bool { return this.mode == EDIT && this.text != this.saved.str(); }
+
+    fn save(this: &Explorer) {
+        if this.mode == EDIT && this.write() { this.note("Saved ", this.file.str()); }
+    }
+
+    // The open file is inside `notesDir`: edits autosave.
+    fn isNote(this: &Explorer): bool {
+        let d = this.notesDir.str();
+        let f = this.file.str();
+        return d.len > 0 && f.len > d.len && f[0..d.len] == d && f[d.len] == 47;
+    }
+
+    // Notes: write unsaved edits without a "Saved" note.
+    fn autosave(this: &Explorer) { if this.dirty() { this.write(); } }
+
+    fn write(this: &Explorer): bool {
+        match io.writeFile(this.file.str(), this.text as []u8) {
+            Result.Ok(_) {
+                this.saved.clear();
+                this.saved.pushStr(this.text);
+                return true;
+            }
+            Result.Err(_) { this.note("Could not save ", this.file.str()); return false; }
+        }
+    }
+
+    // The editor text changed (notes autosave after a quiet second).
+    fn edited(this: &Explorer) {
+        this.editedAt = game.ticks();
+        this.hlPending = true;
+    }
+
+    // Back to the tree (unsaved edits are dropped; the UI asks first).
+    fn back(this: &Explorer) {
+        this.unwatchFile();
+        this.mode = TREE;
+        this.showFind = false;
+        this.message.clear();
+    }
+
+    // Matches of `find` in the editor text.
+    fn findCount(this: &Explorer): int {
+        if this.find.len == 0 { return 0; }
+        let n = 0;
+        let at = 0;
+        while at < this.text.len {
+            let k = find(this.text[at..this.text.len], this.find);
+            if k < 0 { break; }
+            n += 1;
+            at += k + this.find.len;
+        }
+        return n;
+    }
+
+    // Replace every match of `find` with `replace` in the editor text.
+    fn replaceAll(this: &Explorer) {
+        if this.find.len == 0 { return; }
+        let out = this.nextSwap();
+        let at = 0;
+        while at < this.text.len {
+            let k = find(this.text[at..this.text.len], this.find);
+            if k < 0 { break; }
+            out.pushStr(this.text[at..at + k]);
+            out.pushStr(this.replace);
+            at += k + this.find.len;
+        }
+        out.pushStr(this.text[at..this.text.len]);
+        this.text = out.str();
+        this.rehighlight();
+    }
+
+    // Start of the first match of `find` at or after `from`, wrapping to the top; -1 if none.
+    fn nextMatch(this: &Explorer, from: int): int {
+        if this.find.len == 0 { return -1; }
+        let f = from;
+        if f > this.text.len { f = this.text.len; }
+        let k = find(this.text[f..this.text.len], this.find);
+        if k >= 0 { return f + k; }
+        return find(this.text, this.find);
+    }
+
+    // Colors for the editor text (after it changed or the theme did).
+    // The caret to the start of 1-based `line` of the open file (the UI moves it next frame).
+    fn gotoLine(this: &Explorer, line: int) {
+        let at = 0;
+        let l = 1;
+        while l < line && at < this.text.len {
+            if this.text[at] == 10 { l += 1; }
+            at += 1;
+        }
+        this.gotoByte = at;
+    }
+
+    fn rehighlight(this: &Explorer) {
+        this.hlPending = false;
+        this.spans = this.hl.spans(this.text, this.file.str());
+    }
+
+    fn note(this: &Explorer, what: string, path: string) {
+        this.message.clear();
+        this.message.pushStr(what);
+        this.message.pushStr(path);
+    }
+}
+
+// An explorer at `root`. `slot` is an arena header the explorer owns (freed by `close`).
+pub fn create(slot: &Arena, root: string, showHidden: bool): Explorer {
+    *slot = Arena.create(262144);
+    let hl = highlight.create(slot);
+    let arenas = slot.alloc::<Arena>(2);
+    arenas[0] = Arena.create(65536);
+    arenas[1] = Arena.create(65536);
+    let e = Explorer {
+        mem: slot, tree: &arenas[0], load: &arenas[1], root: Text.new(slot), rows: List<Row>.new(slot), opened: List<string>.new(slot),
+        file: Text.new(slot), image: Text.new(slot), saved: Text.new(slot), swapA: Text.new(slot), swapB: Text.new(slot), message: Text.new(slot),
+        hl: hl, spans: hl.out.items[0..0], showHidden: showHidden, editRequest: Text.new(slot),
+        viewer: Viewer { tex: Texture {} }, doc: mddoc.create(slot), thumbs: thumbs.create(slot),
+        gitTop: Text.new(slot), gitPaths: List<string>.new(slot), gitKinds: List<int>.new(slot),
+        dragOut: Text.new(slot), notesDir: Text.new(slot), selPath: Text.new(slot), pickKeep: Text.new(slot), props: Text.new(slot), propLines: List<string>.new(slot),
+        watcher: Watcher.create(slot), evs: List<Event>.new(slot), watchPaths: List<string>.new(slot), watchIds: List<int>.new(slot),
+    };
+    e.root.pushStr(root);
+    return e;
+}
+
+// `create`, with the Explorer itself in its arena (`close` frees it all; `slot` can be reused).
+pub fn open(slot: &Arena, root: string, showHidden: bool): &Explorer {
+    let v = create(slot, root, showHidden);
+    let e = &slot.alloc::<Explorer>(1)[0];
+    *e = v;
+    return e;
+}
+
+pub fn close(e: &Explorer) {
+    e.watcher.close();
+    e.tree.destroy();
+    e.load.destroy();
+    e.viewer.free();
+    e.thumbs.destroy();
+    e.doc.mem.destroy();
+    e.mem.destroy();
+}
+
+// Empty `a` (its old contents are gone).
+fn fresh(a: &Arena) {
+    a.destroy();
+    *a = Arena.create(65536);
+}
+
+// `line` is one of the newline-ended lines of `lines`.
+fn hasLine(lines: string, line: string): bool {
+    let k = 0;
+    while k < lines.len {
+        let e = k;
+        while e < lines.len && lines[e] != 10 { e += 1; }
+        if lines[k..e] == line { return true; }
+        k = e + 1;
+    }
+    return false;
+}
+
+// No NUL byte in the first 8 KB.
+fn isText(b: []u8): bool {
+    let n = b.len;
+    if n > 8192 { n = 8192; }
+    for i in 0..n { if b[i] == 0 { return false; } }
+    return true;
+}
+
+// Folders first, then names in byte order. Insertion sort; folders are small.
+fn sortEntries(es: []DirEntry) {
+    for i in 1..es.len {
+        let e = es[i];
+        let j = i;
+        while j > 0 && before(e, es[j - 1]) {
+            es[j] = es[j - 1];
+            j -= 1;
+        }
+        es[j] = e;
+    }
+}
+
+fn before(a: DirEntry, b: DirEntry): bool {
+    if a.isDir != b.isDir { return a.isDir; }
+    let n = a.name.len;
+    if b.name.len < n { n = b.name.len; }
+    for i in 0..n {
+        if a.name[i] != b.name[i] { return a.name[i] < b.name[i]; }
+    }
+    return a.name.len < b.name.len;
+}

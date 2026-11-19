@@ -1,0 +1,148 @@
+module jzero.explorer.syntax.registry;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.Text;
+use jzero.config.config;
+use jzero.explorer.syntax.grammar;
+use jzero.explorer.syntax.grammar.Grammar;
+
+// Every grammar: bundled `assets/syntax/*.syntax`, then extensions'
+// `<config>/extensions/<name>/syntax/*.syntax` (a later one wins for the same file type).
+// Process-wide, like the theme. Rescanned once a second; a changed file reloads them all.
+
+const SCAN_MS = 1000;
+const BUNDLED = "assets/syntax";
+
+struct Registry {
+    mem: &Arena;            // grammars and their source text; rebuilt on reload
+    list: List<Grammar>;
+    scanMem: &Arena;        // listings, rebuilt each scan
+    sig: int = -1;          // of the extension files (count, sizes, mtimes)
+    scannedAt: int = -100000;
+    version: int = 0;
+}
+
+#[singleton] let REG: int = 0;   // &Registry (no pointer singletons: init must be a constant)
+
+fn reg(): &Registry {
+    if REG == 0 {
+        let boot = Arena.create(4096);   // the registry's home for the whole process
+        let r = &boot.alloc::<Registry>(1)[0];
+        let m = &boot.alloc::<Arena>(1)[0];
+        *m = Arena.create(65536);
+        let sm = &boot.alloc::<Arena>(1)[0];
+        *sm = Arena.create(8192);
+        *r = Registry { mem: m, list: List<Grammar>.new(m), scanMem: sm };
+        REG = r as ptr as int;
+        load(r);
+    }
+    return REG as ptr as &Registry;
+}
+
+// The grammar for file `path`: by name, else by extension, else the `ext = *` one, else none.
+pub fn forFile(path: string): Option<&Grammar> {
+    let base = baseName(path);
+    match find(extOf(base), base) { Option.Some(g) { return Option.Some(g); } Option.None {} }
+    return find("*", "");
+}
+
+fn find(ext: string, base: string): Option<&Grammar> {
+    let r = reg();
+    let i = r.list.len;
+    while i > 0 {
+        i -= 1;
+        if r.list.items[i].matches(ext, base) { return Option.Some(&r.list.items[i]); }
+    }
+    return Option.None;
+}
+
+// Changes whenever the grammars do (re-highlight then).
+pub fn version(): int { return reg().version; }
+
+// Reload when an extension's grammar file was added, removed or changed (at most once a second
+// unless `force`).
+pub fn refresh(now: int, force: bool) {
+    let r = reg();
+    if !force && now - r.scannedAt < SCAN_MS { return; }
+    r.scannedAt = now;
+    let s = scan(r, false);
+    if force || s != r.sig { load(r); }
+}
+
+fn load(r: &Registry) {
+    r.mem.destroy();
+    *r.mem = Arena.create(65536);
+    r.list = List<Grammar>.new(r.mem);
+    readDir(r, BUNDLED);
+    r.sig = scan(r, true);
+    r.version += 1;
+}
+
+// Signature of the extension grammar files; with `read` also loads them.
+fn scan(r: &Registry, read: bool): int {
+    r.scanMem.destroy();
+    *r.scanMem = Arena.create(8192);
+    let tmp = r.scanMem;
+    let sig = 0;
+    let root = config.dir();
+    root.pushStr("/extensions");
+    match io.listDir(root.str(), tmp) {
+        Result.Ok(entries) {
+            for e in entries {
+                if !e.isDir || e.name[0] == 46 { continue; }
+                let d = Text.new(tmp);
+                d.pushStr(root.str());
+                d.push(47);
+                d.pushStr(e.name);
+                d.pushStr("/syntax");
+                match io.listDir(d.str(), tmp) {
+                    Result.Ok(files) {
+                        for f in files { if isSyntax(f.name) { sig = sig * 31 + f.mtime + f.size * 7 + 1; } }
+                        if read { readDir(r, d.str()); }
+                    }
+                    Result.Err(_) {}
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+    return sig;
+}
+
+fn readDir(r: &Registry, dir: string) {
+    match io.listDir(dir, r.mem) {
+        Result.Ok(files) {
+            for f in files {
+                if !isSyntax(f.name) { continue; }
+                let p = Text.new(r.mem);
+                p.pushStr(dir);
+                p.push(47);
+                p.pushStr(f.name);
+                match io.readFile(p.str(), r.mem) {
+                    Result.Ok(bytes) { r.list.push(grammar.read(bytes as string, r.mem)); }
+                    Result.Err(_) {}
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+fn isSyntax(name: string): bool { return name.len > 7 && name[name.len - 7..name.len] == ".syntax"; }
+
+fn baseName(p: string): string {
+    let k = p.len;
+    while k > 0 && p[k - 1] != 47 { k -= 1; }
+    return p[k..p.len];
+}
+
+// After the last `.` (not a leading one: `.bashrc` has none).
+fn extOf(base: string): string {
+    let k = base.len;
+    while k > 1 && base[k - 1] != 46 { k -= 1; }
+    if k > 1 { return base[k..base.len]; }
+    return "";
+}

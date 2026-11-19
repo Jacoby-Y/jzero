@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JZero Icons</title>
+<style>
+@font-face { font-family: jzmono; src: url(../assets/mono.ttf); }
+:root { --bg:#1e2122; --card:#2a2e2f; --fg:#eeeeec; --dim:#888a85; --light:#d3d7cf; }
+body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg); font:14px jzmono, monospace; }
+h1 { font-size:18px; margin:0 0 4px; }
+p { color:var(--dim); margin:0 0 20px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:16px; }
+.card { background:var(--card); padding:16px; }
+.card b { display:block; margin-bottom:12px; }
+.row { display:flex; align-items:flex-end; gap:12px; }
+.sizes { display:flex; flex-direction:column; gap:6px; }
+.strip { display:flex; align-items:center; gap:8px; padding:6px; }
+.strip.l { background:var(--light); } .strip.d { background:#000; }
+svg { display:block; }
+</style>
+</head>
+<body>
+<h1>JZ icons, from the ocean backdrop art</h1>
+<p>First 16 columns of ART in ui/ocean/Ocean.j3ui, drawn as geometry (not font) so it stays crisp. Shown at 128, then 48 / 32 / 16.</p>
+<div class="grid" id="grid"></div>
+<script>
+// JZ slice of the ocean backdrop wordmark
+const ART = [
+  '     ██╗███████╗',
+  '     ██║╚══███╔╝',
+  '     ██║  ███╔╝ ',
+  '██   ██║ ███╔╝  ',
+  '╚█████╔╝███████╗',
+  ' ╚════╝ ╚══════╝',
+];
+// box-drawing char -> edges its line reaches from the cell center
+const EDGES = { '╗':'ld', '║':'ud', '╔':'rd', '╝':'lu', '╚':'ru', '═':'lr' };
+
+// each char cell is 1 wide, 2 tall (terminal aspect)
+function icon({ fg, shadow, bg, rows = ART, pad = 10, line = .35 }) {
+  const cols = Math.max(...rows.map(r => [...r].length));
+  const w = cols, h = rows.length * 2, s = (64 - 2 * pad) / Math.max(w, h);
+  const ox = (64 - w * s) / 2, oy = (64 - h * s) / 2;
+  let blocks = '', lines = '';
+  rows.forEach((r, y) => [...r].forEach((c, x) => {
+    const X = x, Y = y * 2, cx = X + .5, cy = Y + 1;
+    if (c === '█') blocks += `<rect x="${X}" y="${Y}" width="1.02" height="2.02"/>`;
+    else if (shadow && EDGES[c]) for (const e of EDGES[c]) {
+      const [x2, y2] = { l:[X, cy], r:[X + 1, cy], u:[cx, Y], d:[cx, Y + 2] }[e];
+      lines += `<line x1="${cx}" y1="${cy}" x2="${x2}" y2="${y2}"/>`;
+    }
+  }));
+  return `<svg viewBox="0 0 64 64"><rect width="64" height="64" fill="${bg}"/>` +
+    `<g transform="translate(${ox} ${oy}) scale(${s})">` +
+    (shadow ? `<g stroke="${shadow}" stroke-width="${line}" stroke-linecap="square">${lines}</g>` : '') +
+    `<g fill="${fg}" shape-rendering="crispEdges">${blocks}</g></g></svg>`;
+}
+
+const BG = '#2e3436', DARK = '#16181d';
+const LIST = [
+  ['White + grey shadow',        icon({ fg:'#eeeeec', shadow:'#888a85', bg:BG })],
+  ['Green + dark green shadow',  icon({ fg:'#8ae234', shadow:'#4e9a06', bg:BG })],
+  ['Blue (ocean) + navy shadow', icon({ fg:'#729fcf', shadow:'#3465a4', bg:BG })],
+  ['Thin shadow',                icon({ fg:'#eeeeec', shadow:'#888a85', bg:BG, line:.2 })],
+  ['Blocks only',                icon({ fg:'#eeeeec', bg:BG, rows:ART.slice(0, 5) })],
+  ['Blocks only, green',         icon({ fg:'#8ae234', bg:BG, rows:ART.slice(0, 5) })],
+  ['Near-black bg',              icon({ fg:'#eeeeec', shadow:'#555753', bg:DARK })],
+  ['Light bg',                   icon({ fg:'#2e3436', shadow:'#888a85', bg:'#eeeeec' })],
+  ['Tight padding',              icon({ fg:'#eeeeec', shadow:'#888a85', bg:BG, pad:4 })],
+];
+
+document.getElementById('grid').innerHTML = LIST.map(([name, svg]) => {
+  const sz = n => svg.replace('<svg', `<svg width="${n}" height="${n}"`);
+  const strip = c => `<div class="strip ${c}">${sz(48)}${sz(32)}${sz(16)}</div>`;
+  return `<div class="card"><b>${name}</b><div class="row">${sz(128)}<div class="sizes">${strip('l')}${strip('d')}</div></div></div>`;
+}).join('');
+</script>
+</body>
+</html>

@@ -1,0 +1,138 @@
+module jzero.state;
+
+// State part: the `jzctl` commands answered on a later frame: `wait`, `run`, `watch`. Each is a
+// `Waiter` that `checkWaiters` tries every frame (output wakes the idle loop; time-based ones
+// ask for a wake-up).
+
+extend State {
+    // `wait <id> (--match <text> | --idle <ms> | --prompt) [--timeout <ms>]`.
+    fn ctlWait(this: &State, req: Request, args: []string, pane: int) {
+        let w = Waiter { req: req, kind: W_MATCH, pane: pane, text: ctl.flag(args, "--match"), since: game.ticks(), until: deadline(args) };
+        w.idleMs = ctl.num(ctl.flag(args, "--idle"), -1);
+        if ctl.has(args, "--prompt") { w.kind = W_PROMPT; }
+        else if w.idleMs >= 0 { w.kind = W_IDLE; }
+        else if w.text.len == 0 { req.reply("err\nusage: jzctl wait <id> (--match <text> | --idle <ms> | --prompt) [--timeout <ms>] (jzctl help wait)\n"); return; }
+        this.waiters.push(w);
+    }
+
+    // `run <id> <command> [--timeout <ms>]`: at the next prompt, type `command` and Enter; reply
+    // `exit <code>` with its output when it ends. Needs shell integration.
+    fn ctlRun(this: &State, req: Request, args: []string, pane: int) {
+        if args.len < 4 || args[3].len == 0 { req.reply("err\nusage: jzctl run <id> <command> [--timeout <ms>] (jzctl help run)\n"); return; }
+        this.waiters.push(Waiter { req: req, kind: W_RUN, pane: pane, text: args[3], since: game.ticks(), until: deadline(args) });
+    }
+
+    // `watch <id> --from <line> [--lines N]` (the client loops on it): the lines past `line` the
+    // program is done with, after the next line number. `--from -1` starts at the end (less N).
+    fn ctlWatch(this: &State, req: Request, args: []string, n: &Node) {
+        let t = n.session();
+        let from = ctl.num(ctl.flag(args, "--from"), -1);
+        if from < 0 { from = t.droppedTotal + maxInt(0, t.doneLines() - ctl.num(ctl.flag(args, "--lines"), 0)); }
+        this.waiters.push(Waiter { req: req, kind: W_WATCH, pane: n.id, text: "", since: game.ticks(), from: from });
+    }
+
+    // Answer every waiter that is done; ask to wake when the next one can time out or go idle.
+    fn checkWaiters(this: &State, now: int) {
+        let wake = 0;
+        let i = this.waiters.len;
+        while i > 0 {
+            i -= 1;
+            let w = &this.waiters.items[i];
+            let answer = this.waitAnswer(w, now);
+            if answer.len == 0 {
+                wake = soonest(wake, w.until);
+                if w.kind == W_IDLE { wake = soonest(wake, maxInt(this.outAtOf(w.pane), w.since) + w.idleMs); }
+                continue;
+            }
+            w.req.reply(answer);  // nothing when the client is gone
+            this.waiters.remove(i);
+        }
+        if wake > 0 { game.wakeAt(wake); }
+    }
+
+    // The reply for `w`, "" while it still waits.
+    fn waitAnswer(this: &State, w: &Waiter, now: int): string {
+        if !w.req.alive() { return "err\n"; }
+        let at = this.findPane(w.pane);
+        if at.island < 0 || !this.islands.get(at.island).panes.get(at.leaf).hasTerm() { return "err\npane closed\n"; }
+        let t = this.islands.get(at.island).panes.get(at.leaf).session();
+        let answer = "";
+        match w.kind {
+            W_MATCH {
+                // ponytail: plain substring of the screen; a regex if agents need one.
+                let screen = Text.scratch();
+                t.tailText(0, screen);
+                if contains(screen.str(), w.text) { answer = "ok\n"; }
+            }
+            W_IDLE { if now - maxInt(t.outAt, w.since) >= w.idleMs { answer = "ok\n"; } }
+            W_PROMPT { if atPrompt(t) { answer = "ok\n"; } }
+            W_RUN { answer = runStep(w, t); }
+            W_WATCH { answer = watchLines(w, t); }
+            _ {}
+        }
+        if answer.len == 0 && w.until > 0 && now >= w.until { return "timeout\n"; }
+        return answer;
+    }
+
+    // Pane `id`'s last output time (0 when it is gone).
+    fn outAtOf(this: &State, id: int): int {
+        let at = this.findPane(id);
+        if at.island < 0 || !this.islands.get(at.island).panes.get(at.leaf).hasTerm() { return 0; }
+        return this.islands.get(at.island).panes.get(at.leaf).session().outAt;
+    }
+}
+
+// The shell waits at its prompt for a command line (shell integration seen).
+fn atPrompt(t: &Session): bool { return t.tap.atPrompt && t.tap.runStart < 0; }
+
+// `run`: type the command at the first prompt, then reply when the shell says it ended.
+fn runStep(w: &Waiter, t: &Session): string {
+    if w.done < 0 {
+        if !atPrompt(t) { return ""; }
+        w.done = t.tap.doneCount;
+        t.pasteText(w.text);
+        t.pressKey(input.KEY_ENTER, 0, i32(0));
+        return "";
+    }
+    if t.tap.doneCount == w.done || t.tap.runStart >= 0 { return ""; }
+    let out = Text.scratch();
+    out.pushStr(`exit {t.tap.lastExit}`);
+    out.push(10);
+    t.lastOutput(out);
+    return out.str();
+}
+
+// `watch`: `ok\n<next line number>\n<lines>` once there are lines past `w.from`.
+fn watchLines(w: &Waiter, t: &Session): string {
+    let end = t.droppedTotal + t.doneLines();
+    let from = w.from;
+    if from > end { from = end; }  // the scrollback was cleared
+    if from < t.droppedTotal { from = t.droppedTotal; }  // fell off the ring before we read it
+    if from == end && !firstCall(w) { return ""; }
+    let out = Text.scratch();
+    out.pushStr("ok\n");
+    out.pushInt(end);
+    out.push(10);
+    t.linesText(from - t.droppedTotal, end - t.droppedTotal, out);
+    return out.str();
+}
+
+// The client's first `watch` request (`--from -1`) answers at once, even with no lines.
+fn firstCall(w: &Waiter): bool {
+    let a = w.req.args();
+    return ctl.flag(a, "--from") == "-1";
+}
+
+// `--timeout <ms>` as a deadline (0: none).
+fn deadline(args: []string): int {
+    let ms = ctl.num(ctl.flag(args, "--timeout"), 0);
+    if ms <= 0 { return 0; }
+    return game.ticks() + ms;
+}
+
+// The earlier of two wake times, 0 meaning none.
+fn soonest(a: int, b: int): int {
+    if b <= 0 { return a; }
+    if a <= 0 || b < a { return b; }
+    return a;
+}

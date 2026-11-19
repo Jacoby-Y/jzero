@@ -1,0 +1,12 @@
+name = TOML
+ext = toml
+file = Cargo.lock
+comment = #
+region = string """ """ escape multiline
+region = string ''' ''' multiline
+string = " " escape
+string = ' '
+region = section [ ] start
+constant = true false inf nan
+word-chars = -.
+key = =

@@ -1,0 +1,19 @@
+# JavaScript and TypeScript
+name = JavaScript
+ext = js mjs cjs jsx ts tsx mts cts
+comment = //
+comment = /* */
+string = " " escape
+string = ' ' escape
+string = ` ` escape multiline
+prefix = annotation @
+keyword = async class const debugger delete extends function in instanceof let new of static super this typeof var void as implements interface type enum namespace declare readonly public private protected abstract keyof satisfies
+control = await break case catch continue default do else export finally for from if import return switch throw try while with yield
+plain = variable
+type = string number boolean any unknown never object symbol bigint
+constant = true false null undefined NaN Infinity
+builtin = console window document Math JSON Promise Array Object String Number require module exports
+after = function function
+after = type class interface type enum
+call = true
+capitalized = type

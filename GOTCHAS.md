@@ -1,0 +1,19 @@
+# J3 gotchas
+- Never store `Arena` by value in a struct; allocate the header from a parent arena (`&parent.alloc::<Arena>(1)[0]`) and keep `&Arena`.
+- `App.create` boots the world before the window exists; font/View work goes in an `app.startup` system.
+- `testkit.simKeys` only reaches the Dom, not `View.input` (it reads `j3.game` keys); typing needs a real run.
+- A visible `<canvas>` does not keep the loop awake in practice (measured); wake it with `idleWake()`.
+- `<icon name={…}>` needs string literals in the expression; map an index with `{#match}` (see `ui/IslandIcon.j3ui`).
+- Custom icons: `icons/<name>.svg`, single-color fills, no strokes. Preview: `tools/icons.html`.
+- Markup collapses runs of spaces; use `{"  text"}` holes to keep them. `display: inline-block` is unsupported.
+- Flex children with long content need `min-width: 0` / `min-height: 0`.
+- Float consts used with f32 need a type: `const X: f32 = 4.0;`.
+- `bind:value` gives a view that changes on the next keystroke; copy into a `Text` (see `Inspector.j3ui` + `Islands.rename`).
+- Free drag on the ocean uses `game.mousePos()` + `mouseDown` in `onFrame` (j3.ui.drag is for drop targets, not free positioning).
+- Methods live inside the struct body; `pub const` works across modules.
+- J3 and j2 strings have no `\x1b`/`\e`: build escapes with `push(27)` (see `csis` in `ext/host.j3`); j2 scripts draw through natives.
+- `JZERO_UI` `xy:`/`rxy:`/`wheel:` are real input (`game.simMouse`/`simButton`/`simWheel`), so they reach panes, programs and extensions. `Dom.simInput` (testkit `clickText`/`clickTag`) reaches the Dom only.
+- `View.input` scrolls the same for any wheel `dy` (sign only).
+- Inline elements in text (`<a>`, `<span>` inside a `<p>`) get no clicks: the hit goes to the block. Only flex items / blocks are click targets (markdown preview links are dead until j3c fixes it).
+- `style:color={stringExpr}` fails in LLVM emit (string → float cast); write `style:color="{stringExpr}"`.
+- In `.j3ui`, `on:draw` inside `{#each .. as &r}` cannot use `r`; pass the index `i` and look the row up.

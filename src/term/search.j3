@@ -1,0 +1,139 @@
+module jzero.term.search;
+
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.term.Cell;
+use j3.term.ansi.{ Parser, feed };
+use j3.term.decodeUtf8;
+use j3.term.grid.Grid;
+use j3.text.Text;
+
+const MAX_HITS = 10000;
+
+// Find in a pane's scrollback and screen. Matches are cell ranges in grid lines (`Grid.line`
+// indices), so they line up with what is drawn. `query` is bound to the search box.
+pub struct Search {
+    open: bool = false;
+    query: string = "";
+    caseSensitive: bool = false;
+    hits: List<int>;       // line, col, len per match, top to bottom
+    cur: int = -1;         // current match (index into hits / 3), -1 none
+    ranQuery: Text;        // what `hits` were found for
+    ranCase: bool = false;
+    cps: List<i32>;        // the query as code points
+
+    fn count(this: &Search): int { return this.hits.len / 3; }
+
+    // `hits` are stale: the query or case changed.
+    fn stale(this: &Search): bool { return this.query != this.ranQuery.str() || this.caseSensitive != this.ranCase; }
+
+    // Find every match of `query` in `g`. The current match stays the nearest to `near` (a grid
+    // line), else the last one (the newest output).
+    fn run(this: &Search, g: &Grid, near: int) {
+        this.ranQuery.clear();
+        this.ranQuery.pushStr(this.query);
+        this.ranCase = this.caseSensitive;
+        this.hits.len = 0;
+        this.cps.len = 0;
+        let at = 0;
+        while at < this.query.len {
+            let n = 0;
+            let cp = decodeUtf8(this.query, at, &n);
+            this.cps.push(fold(cp, this.caseSensitive));
+            at += maxI(n, 1);
+        }
+        this.cur = -1;
+        if this.cps.len == 0 { return; }
+        for l in 0..g.lineCount() {
+            let cells = g.line(l);
+            let c = 0;
+            while c < cells.len {
+                if cells[c].width == 0 { c += 1; continue; }
+                let n = this.matchAt(cells, c);
+                if n > 0 {
+                    if this.hits.len >= MAX_HITS * 3 { return; }
+                    this.hits.push(l);
+                    this.hits.push(c);
+                    this.hits.push(n);
+                    c += n;
+                } else {
+                    c += 1;
+                }
+            }
+        }
+        if this.count() == 0 { return; }
+        this.cur = this.count() - 1;
+        if near < 0 { return; }
+        for i in 0..this.count() {
+            if this.hits.items[i * 3] >= near { this.cur = i; return; }
+        }
+    }
+
+    // Cells the query covers starting at cell `c` (0: no match). Wide characters' spacer cells
+    // are skipped.
+    fn matchAt(this: &Search, cells: []Cell, c: int): int {
+        let k = c;
+        for q in 0..this.cps.len {
+            while k < cells.len && cells[k].width == 0 { k += 1; }
+            if k >= cells.len { return 0; }
+            let cp = cells[k].cp;
+            if cp == 0 { cp = 32; }
+            if fold(cp, this.caseSensitive) != this.cps.items[q] { return 0; }
+            k += 1;
+        }
+        return k - c;
+    }
+
+    // Move to the next (`dir` 1) or previous (-1) match, wrapping.
+    fn step(this: &Search, dir: int) {
+        let n = this.count();
+        if n == 0 { return; }
+        this.cur = (this.cur + dir + n) % n;
+    }
+
+    // The current match's line, -1 for none.
+    fn curLine(this: &Search): int {
+        if this.cur < 0 || this.cur >= this.count() { return -1; }
+        return this.hits.items[this.cur * 3];
+    }
+
+    fn close(this: &Search) {
+        this.open = false;
+        this.hits.len = 0;
+        this.cur = -1;
+        this.ranQuery.clear();
+    }
+}
+
+pub fn create(mem: &Arena): Search {
+    return Search { hits: List<int>.new(mem), ranQuery: Text.new(mem), cps: List<i32>.new(mem) };
+}
+
+fn fold(cp: i32, caseSensitive: bool): i32 {
+    if !caseSensitive && cp >= 65 && cp <= 90 { return cp + 32; }
+    return cp;
+}
+
+fn maxI(a: int, b: int): int { if a > b { return a; } return b; }
+
+// Self-check: case folding, several matches per line, scrollback, wide characters.
+pub fn selfTest(mem: &Arena) {
+    let g = Grid.new(mem, 20, 3, 10);
+    let p = Parser.new(mem);
+    feed(&p, "Foo foo\r\none\r\ntwo\r\nfoo 日本x\r\n", &g);
+    let s = create(mem);
+    s.query = "foo";
+    s.run(&g, -1);
+    check(s.count() == 3 && s.cur == 2 && s.hits.items[3 + 1] == 4, "case-insensitive");
+    s.caseSensitive = true;
+    check(s.stale(), "stale");
+    s.run(&g, 0);
+    check(s.count() == 2 && s.cur == 0, "case-sensitive");
+    s.query = "本x";
+    s.run(&g, -1);
+    check(s.count() == 1 && s.hits.items[1] == 6 && s.hits.items[2] == 3, "wide");
+    s.step(1);
+    check(s.cur == 0, "wrap");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`search selfTest: {what}`); } }

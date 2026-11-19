@@ -1,0 +1,34 @@
+module jzero.explorer.clip;
+
+use j3.memory.{ Arena, List };
+use j3.text.Text;
+
+// The app's file clipboard (Ctrl+C / Ctrl+X in an explorer, Ctrl+V in any explorer, any island).
+// ponytail: in-app only; the system clipboard (text/uri-list) once j3.game can offer files.
+pub struct Clip {
+    mem: &Arena;          // paths; emptied by each `set`
+    paths: List<string>;
+    cut: bool = false;    // a paste moves instead of copies (then the clip empties)
+}
+
+extend Clip {
+    fn set(this: &Clip, paths: []string, cut: bool) {
+        this.mem.destroy();
+        *this.mem = Arena.create(4096);
+        this.paths = List<string>.new(this.mem);
+        for p in paths {
+            let t = Text.new(this.mem);
+            t.pushStr(p);
+            this.paths.push(t.str());
+        }
+        this.cut = cut;
+    }
+
+    fn clear(this: &Clip) { this.paths.len = 0; this.cut = false; }
+}
+
+// A clip owning `slot` (an arena header it replaces).
+pub fn create(slot: &Arena): Clip {
+    *slot = Arena.create(4096);
+    return Clip { mem: slot, paths: List<string>.new(slot) };
+}

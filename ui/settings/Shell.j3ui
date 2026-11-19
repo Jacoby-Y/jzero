@@ -1,0 +1,15 @@
+<script>
+    use jzero.config.draft.Draft;
+    props { dr: &Draft; }
+</script>
+<div class="tab">
+    <settings.Row name="Shell" note="Empty uses your default shell ($SHELL; PowerShell on Windows). Shells opened after Save use these.">
+        <input type="text" placeholder="default shell" bind:value={dr.shell} />
+    </settings.Row>
+    <settings.Row name="Shell integration" note="Prompt marks, cwd, exit codes and the 0 command (bash, zsh, fish).">
+        <input type="checkbox" bind:checked={dr.shellIntegration} />
+    </settings.Row>
+    <settings.Row name="Scrollback lines">
+        <input type="text" bind:value={dr.scrollback} />
+    </settings.Row>
+</div>

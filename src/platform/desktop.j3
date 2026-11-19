@@ -1,0 +1,125 @@
+module jzero.platform.desktop;
+
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.os;
+
+// What the desktop does for us: open a link or file with its default app, show a
+// notification, move files to the trash. Linux: `xdg-open`, `notify-send`, `gio trash`.
+// Windows: `rundll32 url.dll`, and Windows PowerShell for toasts and the recycle bin.
+
+// PowerShell's own app id: toasts need a registered one, and JZero ships as a plain zip.
+const TOAST_APP = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+// Open `target` (a URI or a path) with the desktop's handler, detached.
+pub fn open(target: string, mem: &Arena) {
+    if os.windows() {
+        let what = if os.isAbs(target) { os.native(target) } else { target };
+        let argv: [3]string = ["rundll32.exe", "url.dll,FileProtocolHandler", what];
+        detach(argv[:], mem);
+        return;
+    }
+    let argv: [5]string = ["sh", "-c", "xdg-open \"$1\" >/dev/null 2>&1 &", "sh", target];
+    reap(argv[:], mem);
+}
+
+// A desktop notification, detached. Nothing happens when the desktop has no way to show one.
+pub fn notify(title: string, body: string) {
+    let mem = Arena.create(16384);
+    if os.windows() {
+        let s = Text.new(&mem);
+        s.pushStr("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; ");
+        s.pushStr("$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); ");
+        s.pushStr("$t = $x.GetElementsByTagName('text'); ");
+        s.pushStr("$t.Item(0).AppendChild($x.CreateTextNode(");
+        psQuote(title, &s);
+        s.pushStr(")) | Out-Null; $t.Item(1).AppendChild($x.CreateTextNode(");
+        psQuote(body, &s);
+        s.pushStr(")) | Out-Null; [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(");
+        psQuote(TOAST_APP, &s);
+        s.pushStr(").Show([Windows.UI.Notifications.ToastNotification]::new($x))");
+        let argv: [6]string = ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command"];
+        let all = List<string>.new(&mem);
+        for a in argv { all.push(a); }
+        all.push(s.str());
+        detach(all.items[0..all.len], &mem);
+    } else {
+        let argv: [6]string = ["sh", "-c", "notify-send -a JZero -- \"$1\" \"$2\" >/dev/null 2>&1 &", "sh", title, body];
+        reap(argv[:], &mem);
+    }
+    mem.destroy();
+}
+
+// Move `paths` to the trash. "" when it worked, else what went wrong.
+pub fn trash(paths: []string, mem: &Arena): string {
+    let argv = List<string>.new(mem);
+    if os.windows() {
+        let s = Text.new(mem);
+        s.pushStr("Add-Type -AssemblyName Microsoft.VisualBasic; $fs = [Microsoft.VisualBasic.FileIO.FileSystem]; foreach ($p in ");
+        for k in 0..paths.len {
+            if k > 0 { s.push(44); }
+            psQuote(os.native(paths[k]), &s);
+        }
+        s.pushStr(") { if (Test-Path -LiteralPath $p -PathType Container) { $fs::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin') } else { $fs::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin') } }");
+        argv.push("powershell.exe");
+        argv.push("-NoProfile");
+        argv.push("-NonInteractive");
+        argv.push("-Command");
+        argv.push(s.str());
+    } else {
+        argv.push("gio");
+        argv.push("trash");
+        argv.push("--");
+        for p in paths { argv.push(p); }
+    }
+    match proc.run(argv.items[0..argv.len], "", mem) {
+        Result.Ok(o) { if o.code != 0 { return o.errStr(); } return ""; }
+        Result.Err(_) { return Text.new(mem).add("Not found: ").add(argv.items[0]).str(); }
+    }
+}
+
+// `s` as a PowerShell single-quoted string. Every quote PowerShell reads as `'` (the ASCII
+// one and U+2018..U+201B) is doubled, so text never ends the string.
+pub fn psQuote(s: string, out: &Text) {
+    out.push(39);
+    let i = 0;
+    while i < s.len {
+        if s[i] == 39 { out.push(39); out.push(39); }
+        else if i + 2 < s.len && s[i] == 226 && s[i + 1] == 128 && s[i + 2] >= 152 && s[i + 2] <= 155 {
+            out.pushStr(s[i..i + 3]);
+            out.pushStr(s[i..i + 3]);
+            i += 2;
+        }
+        else { out.push(s[i]); }
+        i += 1;
+    }
+    out.push(39);
+}
+
+// Start `argv` and wait for it: a shell line that puts the real program in the background.
+fn reap(argv: []string, mem: &Arena) {
+    match proc.start(argv, mem) {
+        Result.Ok(c) { c.wait(); }
+        Result.Err(_) {}
+    }
+}
+
+// Start `argv` and let it run.
+// ponytail: never waited for, so its handles stay open until JZero exits (a few per call);
+// reap them on a later call if notifications ever come by the thousand.
+fn detach(argv: []string, mem: &Arena) {
+    match proc.start(argv, mem) {
+        Result.Ok(_) {}
+        Result.Err(_) {}
+    }
+}
+
+// Self-check: PowerShell quoting.
+pub fn selfTest(mem: &Arena) {
+    let t = Text.new(mem);
+    psQuote("it's", &t);
+    if t.str() != "'it''s'" { sys.panic(`desktop selfTest: {t.str()}`); }
+}

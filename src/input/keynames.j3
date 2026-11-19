@@ -1,0 +1,138 @@
+module jzero.input.keynames;
+
+use j3.game.Key;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.sys;
+use j3.text.{ Text, find };
+use jzero.input.mods;
+
+struct Named {
+    name: string;
+    key: Key;
+}
+
+// Key names for config files (`ctrl+shift+o`, `ctrl+alt+left`). Letters and digits are
+// built from their case; the rest are listed here.
+pub struct KeyNames {
+    list: List<Named>;
+
+    fn add(this: &KeyNames, name: string, key: Key) { this.list.push(Named { name: name, key: key }); }
+
+    fn find(this: &KeyNames, name: string): Option<Key> {
+        if name.len == 1 {
+            let c = name[0];
+            if c >= 97 && c <= 122 { return Option.Some((i32(Key.A) + i32(c - 97)) as Key); }
+            if c >= 48 && c <= 57 { return Option.Some((i32(Key.Num0) + i32(c - 48)) as Key); }
+        }
+        for i in 0..this.list.len {
+            if this.list.items[i].name == name { return Option.Some(this.list.items[i].key); }
+        }
+        return Option.None;
+    }
+}
+
+pub fn create(mem: &Arena): KeyNames {
+    let k = KeyNames { list: List<Named>.new(mem) };
+    k.add("left", Key.Left); k.add("right", Key.Right); k.add("up", Key.Up); k.add("down", Key.Down);
+    k.add("enter", Key.Enter); k.add("tab", Key.Tab); k.add("space", Key.Space); k.add("escape", Key.Escape);
+    k.add("backspace", Key.Backspace); k.add("delete", Key.Delete); k.add("insert", Key.Insert);
+    k.add("home", Key.Home); k.add("end", Key.End); k.add("page_up", Key.PageUp); k.add("page_down", Key.PageDown);
+    k.add("equal", Key.Equals); k.add("minus", Key.Minus); k.add("comma", Key.Comma); k.add("period", Key.Period);
+    k.add("slash", Key.Slash); k.add("backslash", Key.Backslash); k.add("semicolon", Key.Semicolon);
+    k.add("apostrophe", Key.Apostrophe); k.add("grave", Key.Grave);
+    k.add("left_bracket", Key.LeftBracket); k.add("right_bracket", Key.RightBracket);
+    k.add("f1", Key.F1); k.add("f2", Key.F2); k.add("f3", Key.F3); k.add("f4", Key.F4);
+    k.add("f5", Key.F5); k.add("f6", Key.F6); k.add("f7", Key.F7); k.add("f8", Key.F8);
+    k.add("f9", Key.F9); k.add("f10", Key.F10); k.add("f11", Key.F11); k.add("f12", Key.F12);
+    return k;
+}
+
+// Parse `ctrl+shift+o` into modifier bits and a key. False when a part is unknown.
+pub fn parseCombo(names: &KeyNames, s: string, outMods: &int, outKey: &Key): bool {
+    let m = 0;
+    let rest = s;
+    while true {
+        let plus = find(rest, "+");
+        let part = rest;
+        if plus >= 0 { part = rest[0..plus]; }
+        let bit = modBit(part);
+        if plus < 0 || bit == 0 {
+            match names.find(part) {
+                Option.Some(k) {
+                    if plus >= 0 { return false; }
+                    *outMods = m;
+                    *outKey = k;
+                    return true;
+                }
+                Option.None { return false; }
+            }
+        }
+        m |= bit;
+        rest = rest[plus + 1..rest.len];
+    }
+    return false;
+}
+
+// `mods` + `key` for people (`Ctrl+Shift+O`, `Ctrl+Alt+Left`, `Ctrl+Page up`) into `out`.
+pub fn describe(names: &KeyNames, m: int, key: Key, out: &Text) { write(names, m, key, out, true); }
+
+// `mods` + `key` in config syntax (`ctrl+shift+page_up`), the form `parseCombo` reads.
+pub fn format(names: &KeyNames, m: int, key: Key, out: &Text) { write(names, m, key, out, false); }
+
+fn write(names: &KeyNames, m: int, key: Key, out: &Text, people: bool) {
+    if (m & mods.CTRL) != 0 { out.pushStr(pick(people, "Ctrl+", "ctrl+")); }
+    if (m & mods.SHIFT) != 0 { out.pushStr(pick(people, "Shift+", "shift+")); }
+    if (m & mods.ALT) != 0 { out.pushStr(pick(people, "Alt+", "alt+")); }
+    if (m & mods.SUPER) != 0 { out.pushStr(pick(people, "Super+", "super+")); }
+    let k = i32(key);
+    let a: i32 = 97;
+    if people { a = 65; }
+    if k >= i32(Key.A) && k <= i32(Key.Z) { out.push(u8(a + (k - i32(Key.A)))); return; }
+    if k >= i32(Key.Num0) && k <= i32(Key.Num9) { out.push(u8(48 + (k - i32(Key.Num0)))); return; }
+    for i in 0..names.list.len {
+        let n = names.list.items[i];
+        if n.key != key { continue; }
+        if !people { out.pushStr(n.name); return; }
+        for j in 0..n.name.len {
+            let c = n.name[j];
+            if j == 0 && c >= 97 && c <= 122 { c -= 32; }
+            if c == 95 { c = 32; }
+            out.push(c);
+        }
+        return;
+    }
+}
+
+fn pick(people: bool, a: string, b: string): string {
+    if people { return a; }
+    return b;
+}
+
+fn modBit(s: string): int {
+    if s == "ctrl" { return mods.CTRL; }
+    if s == "shift" { return mods.SHIFT; }
+    if s == "alt" { return mods.ALT; }
+    if s == "super" { return mods.SUPER; }
+    return 0;
+}
+
+// Self-check: modifiers, letters, named keys, bad input.
+pub fn selfTest(mem: &Arena) {
+    let n = create(mem);
+    let m = 0;
+    let k = Key.A;
+    check(parseCombo(&n, "ctrl+shift+o", &m, &k) && m == (mods.CTRL | mods.SHIFT) && k == Key.O, "ctrl+shift+o");
+    check(parseCombo(&n, "ctrl+alt+left", &m, &k) && m == (mods.CTRL | mods.ALT) && k == Key.Left, "ctrl+alt+left");
+    check(parseCombo(&n, "f5", &m, &k) && m == 0 && k == Key.F5, "f5");
+    check(!parseCombo(&n, "ctrl+nope", &m, &k), "ctrl+nope");
+    check(!parseCombo(&n, "o+ctrl", &m, &k), "o+ctrl");
+    let t = Text.new(mem);
+    describe(&n, mods.CTRL | mods.SHIFT, Key.PageUp, &t);
+    check(t.str() == "Ctrl+Shift+Page up", t.str());
+    t.clear();
+    format(&n, mods.CTRL | mods.SHIFT, Key.PageUp, &t);
+    check(t.str() == "ctrl+shift+page_up", t.str());
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`keynames selfTest: {what}`); } }

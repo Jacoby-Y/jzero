@@ -1,0 +1,66 @@
+module jzero.explorer.explorer;
+
+// Explorer part: `git status` colors for the tree.
+
+extend Explorer {
+    // Read `git status` for `root` (nothing outside a repository or without git).
+    fn readGit(this: &Explorer) {
+        this.gitTop.clear();
+        this.gitPaths.len = 0;
+        this.gitKinds.len = 0;
+        let top: [5]string = ["git", "-C", this.root.str(), "rev-parse", "--show-toplevel"];
+        match proc.run(top[:], "", this.tree) {  // ponytail: blocks the frame for git; a worker if repos get huge
+            Result.Ok(o) {
+                if o.code != 0 { return; }
+                let t = o.outStr();
+                while t.len > 0 && t[t.len - 1] == 10 { t = t[0..t.len - 1]; }
+                this.gitTop.pushStr(t);
+            }
+            Result.Err(_) { return; }
+        }
+        let st: [6]string = ["git", "-C", this.root.str(), "status", "--porcelain=v1", "-z"];
+        match proc.run(st[:], "", this.tree) {
+            Result.Ok(o) { if o.code == 0 { this.parseStatus(o.outStr()); } }
+            Result.Err(_) {}
+        }
+    }
+
+    // `XY path\0` records; a rename's old path follows as its own record and is skipped.
+    fn parseStatus(this: &Explorer, s: string) {
+        let at = 0;
+        while at + 3 < s.len {
+            let end = at;
+            while end < s.len && s[end] != 0 { end += 1; }
+            let x = s[at];
+            let y = s[at + 1];
+            let kind = GIT_MODIFIED;
+            if x == 63 { kind = GIT_UNTRACKED; }
+            else if x == 65 && y != 77 { kind = GIT_ADDED; }
+            let p = Text.new(this.tree);
+            p.pushStr(this.gitTop.str());
+            p.push(47);
+            p.pushStr(s[at + 3..end]);
+            let ps = p.str();
+            while ps.len > 1 && ps[ps.len - 1] == 47 { ps = ps[0..ps.len - 1]; }  // untracked folders end in /
+            this.gitPaths.push(ps);
+            this.gitKinds.push(kind);
+            at = end + 1;
+            if x == 82 || x == 67 {  // renamed / copied: skip the source path
+                while at < s.len && s[at] != 0 { at += 1; }
+                at += 1;
+            }
+        }
+    }
+
+    // GIT_* of `path`: its own status, or for a folder the first change inside it.
+    fn gitOf(this: &Explorer, path: string, isDir: bool): int {
+        for i in 0..this.gitPaths.len {
+            let g = this.gitPaths.items[i];
+            if g == path { return this.gitKinds.items[i]; }
+            if isDir && g.len > path.len && g[0..path.len] == path && g[path.len] == 47 { return this.gitKinds.items[i]; }
+            // inside an untracked folder
+            if path.len > g.len && path[0..g.len] == g && path[g.len] == 47 && this.gitKinds.items[i] == GIT_UNTRACKED { return GIT_UNTRACKED; }
+        }
+        return GIT_NONE;
+    }
+}

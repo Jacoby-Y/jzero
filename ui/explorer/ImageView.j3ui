@@ -1,0 +1,83 @@
+<script>
+    // The explorer's image modal content: fit or zoom (wheel, at the pointer), drag to pan,
+    // Left / Right step through the folder's images.
+    use jzero.explorer.explorer.Explorer;
+    use jzero.input.mods;
+    use jzero.theme.theme;
+    use j3.game.{ Key, Mouse, keyPressedRaw, mouseDown, mousePos, mouseWheel };
+    props { ex: &Explorer; }
+    events { close; }
+
+    const STEP: f32 = 1.25;  // zoom per wheel notch
+
+    let el: int = -1;
+    let box: Vec2 = Vec2 { x: 1.0, y: 1.0 };
+    let dragging: bool = false;
+    let last: Vec2 = Vec2 { x: 0.0, y: 0.0 };
+
+    fn onFrame(dt: f32) {
+        if mods.held() == 0 {
+            if keyPressedRaw(Key.Left) { ex.stepImage(-1); }
+            if keyPressedRaw(Key.Right) { ex.stepImage(1); }
+        }
+        if !dragging { return; }
+        if !mouseDown(Mouse.Left) { dragging = false; return; }
+        let m = mousePos();
+        ex.viewer.pan(m.x - last.x, m.y - last.y);
+        last = m;
+    }
+
+    fn press(button: int) {
+        if button != 0 { return; }
+        dragging = true;
+        last = mousePos();
+    }
+
+    fn zoomWheel() {
+        let w = mouseWheel();
+        if w == 0.0 || el < 0 { return; }
+        let m = mousePos();
+        let at = Vec2 { x: m.x - d.absX(el), y: m.y - d.absY(el) };
+        ex.viewer.zoomAt(box, at, if w > 0.0 { STEP } else { 1.0 / STEP });
+    }
+
+    fn zoomBy(f: f32) { ex.viewer.zoomAt(box, Vec2 { x: box.x * 0.5, y: box.y * 0.5 }, f); }
+
+    fn drawImage(size: Vec2) {
+        box = size;
+        ex.viewer.draw(size, theme.fgAlpha(14), theme.fgAlpha(30));
+    }
+
+    fn fileName(): string {
+        let path = ex.image.str();
+        let k = path.len;
+        while k > 0 && path[k - 1] != 47 { k -= 1; }
+        return path[k..path.len];
+    }
+</script>
+
+<div class="view">
+    <div class="bar">
+        <span class="title" title={ex.image.str()}>{fileName()}</span>
+        <span class="info">{ex.viewer.info(box)}</span>
+        <button class="btn" title="Previous image (Left)" on:click={ex.stepImage(-1)}><icon name="caret-left-fill" /></button>
+        <button class="btn" title="Next image (Right)" on:click={ex.stepImage(1)}><icon name="caret-right-fill" /></button>
+        <button class="btn" title="Zoom out" on:click={zoomBy(1.0 / STEP)}><icon name="zoom-out" /></button>
+        <button class="btn" title="Zoom in" on:click={zoomBy(STEP)}><icon name="zoom-in" /></button>
+        <button class="btn" class:on={ex.viewer.zoom == 0.0} title="Fit" on:click={ex.viewer.fit()}><icon name="arrows-angle-contract" /></button>
+        <button class="btn" class:on={ex.viewer.zoom == 1.0} title="Actual size" on:click={ex.viewer.actual()}><icon name="aspect-ratio" /></button>
+        <button class="btn" title="Close (Esc)" on:click={emit close}><icon name="x-lg" /></button>
+    </div>
+    <canvas class="pic" class:grab={dragging} bind:this={el} on:draw={drawImage(size)} on:mousedown={press(button)} on:wheel|stop={zoomWheel()}></canvas>
+</div>
+
+<style>
+    .view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+    .bar { height: 2.286em; flex-shrink: 0; display: flex; flex-direction: row; align-items: center; padding-left: 0.571em; background: var(--chrome-bg); }
+    .title { flex: 1; min-width: 0; overflow: hidden; white-space: pre; color: var(--c-bright-white); }
+    .info { flex-shrink: 0; padding: 0 0.571em; color: var(--c-bright-black); white-space: pre; }
+    .btn { width: 2.286em; height: 2.286em; display: flex; align-items: center; justify-content: center; }
+    .btn.on { color: var(--c-bright-white); }
+    .pic { flex: 1; min-height: 0; background: var(--term-bg); cursor: grab; }
+    .pic.grab { cursor: grabbing; }
+</style>

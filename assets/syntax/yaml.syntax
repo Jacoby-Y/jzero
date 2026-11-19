@@ -1,0 +1,13 @@
+name = YAML
+ext = yaml yml
+file = .clang-format
+comment = # alone
+string = " " escape
+string = ' '
+prefix = annotation !!
+prefix = variable &
+prefix = variable *
+region = section --- $ start
+constant = true false null yes no on off ~
+word-chars = -.
+key = :

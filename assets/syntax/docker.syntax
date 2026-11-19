@@ -1,0 +1,10 @@
+name = Dockerfile
+ext = dockerfile containerfile
+file = Dockerfile Containerfile
+comment = # start
+string = " " escape
+string = ' '
+region = variable ${ }
+prefix = variable $
+ignore-case = true
+keyword = from run cmd label expose env add copy entrypoint volume user workdir arg onbuild stopsignal healthcheck shell as maintainer

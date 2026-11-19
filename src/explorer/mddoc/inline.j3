@@ -1,0 +1,126 @@
+module jzero.explorer.mddoc;
+
+// Doc part: inline runs of one line (styles nest; inline HTML tags; images).
+
+extend Doc {
+    // Inline runs of `s[from..end]`, appended to `b` (its runs must be the last ones), styled like `st`.
+    fn inline(this: &Doc, s: string, from: int, end: int, b: &Block, st: Run) {
+        let i = from;
+        let plain = from;
+        let cur = st;  // HTML tags change it as the line goes
+        while i < end {
+            let c = s[i];
+            let stop = -1;
+            let what = 0;  // 1 code, 2 bold, 3 italic, 4 image, 5 wiki, 6 link, 7 tag, 8 comment
+            let mid = -1;
+            let t = Tag { end: -1, name: "", closing: false, body: "" };
+            if c == 96 {
+                stop = close(s, i + 1, end, "`");
+                what = 1;
+            } else if c == 42 && at(s, i + 1, end) == 42 {
+                stop = close(s, i + 2, end, "**");
+                what = 2;
+            } else if (c == 42 || (c == 95 && (i == from || !isWord(s[i - 1])))) && i + 1 < end && s[i + 1] != 32 {
+                stop = close(s, i + 1, end, if c == 42 { "*" } else { "_" });
+                what = 3;
+            } else if c == 33 && at(s, i + 1, end) == 91 {
+                mid = close(s, i + 2, end, "](");
+                if mid > 0 { stop = close(s, mid, end, ")"); }
+                what = 4;
+            } else if c == 91 && at(s, i + 1, end) == 91 {
+                stop = close(s, i + 2, end, "]]");
+                what = 5;
+            } else if c == 91 {
+                mid = close(s, i + 1, end, "](");
+                if mid > 0 { stop = close(s, mid, end, ")"); }
+                what = 6;
+            } else if c == 60 {
+                stop = mdhtml.comment(s, i, end);
+                what = 8;
+                if stop < 0 { t = mdhtml.at(s, i, end); stop = t.end; what = 7; }
+            }
+            if stop <= 0 { i += 1; continue; }
+            if i > plain { this.text(cur, s[plain..i]); }
+            if what == 1 {
+                let r = cur;
+                r.code = true;
+                this.text(r, s[i + 1..stop - 1]);
+            } else if what == 2 || what == 3 {
+                let r = cur;
+                if what == 2 { r.bold = true; } else { r.italic = true; }
+                let w = if what == 2 { 2 } else { 1 };
+                this.inline(s, i + w, stop - w, b, r);
+            } else if what == 4 {
+                this.runs.push(this.image(cur, s[i + 2..mid - 2], s[mid..stop - 1], ""));
+            } else if what == 5 {
+                let inner = s[i + 2..stop - 2];
+                let bar = 0;
+                while bar < inner.len && inner[bar] != 124 { bar += 1; }
+                let r = cur;
+                r.link = true;
+                r.wiki = true;
+                r.href = inner[0..bar];
+                this.text(r, if bar < inner.len { inner[bar + 1..inner.len] } else { inner });
+            } else if what == 6 {
+                let r = cur;
+                r.link = true;
+                r.wiki = false;
+                r.href = firstWord(s[mid..stop - 1]);
+                this.inline(s, i + 1, mid - 2, b, r);
+            } else if what == 7 {
+                this.tag(t, &cur, st);
+            }
+            i = stop;
+            plain = i;
+        }
+        if end > plain { this.text(cur, s[plain..end]); }
+        b.to = this.runs.len;
+    }
+
+    fn text(this: &Doc, st: Run, text: string) {
+        let r = st;
+        r.kind = R_TEXT;
+        r.text = text;
+        this.runs.push(r);
+    }
+
+    // An inline HTML tag: styles turn on in `cur` and back to `base` at the closing tag; unknown tags drop out.
+    fn tag(this: &Doc, t: Tag, cur: &Run, base: Run) {
+        let n = t.name;
+        let on = !t.closing;
+        if n == "br" { this.runs.push(Run { kind: R_BREAK, text: "" }); }
+        else if n == "img" { this.runs.push(this.image(*cur, mdhtml.attr(t, "alt"), mdhtml.attr(t, "src"), mdhtml.attr(t, "width"))); }
+        else if n == "b" || n == "strong" { cur.bold = on || base.bold; }
+        else if n == "i" || n == "em" { cur.italic = on || base.italic; }
+        else if n == "code" || n == "kbd" { cur.code = on || base.code; }
+        else if n == "sub" || n == "sup" || n == "small" { cur.small = on || base.small; }
+        else if n == "a" {
+            let href = mdhtml.attr(t, "href");
+            cur.link = (on && href.len > 0) || base.link;
+            cur.wiki = base.wiki;
+            cur.href = if on && href.len > 0 { href } else { base.href };
+        }
+    }
+
+    // `![alt](src "title")` or `<img>`: a local path made absolute; a web image (a badge) shows its alt as code.
+    fn image(this: &Doc, st: Run, alt: string, src: string, width: string): Run {
+        let p = firstWord(src);
+        if p.len > 1 && p[0] == 60 && p[p.len - 1] == 62 { p = p[1..p.len - 1]; }
+        let r = st;
+        r.text = alt;
+        if find2(p, "://") || p.len == 0 { r.kind = R_TEXT; r.code = true; return r; }
+        let t = Text.new(this.mem);
+        if p[0] != 47 { t.pushStr(this.dir); t.push(47); }
+        unescape(p, &t);
+        r.kind = R_IMAGE;
+        r.href = t.str();
+        r.link = false;
+        if width.len > 0 {
+            let w = Text.new(this.mem);
+            w.pushStr(width);
+            if isDigits(width) { w.pushStr("px"); }
+            r.width = w.str();
+        }
+        return r;
+    }
+}

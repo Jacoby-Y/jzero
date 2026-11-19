@@ -1,0 +1,202 @@
+module jzero.term.selection;
+
+use j3.memory.Arena;
+use j3.sys;
+use j3.term.ansi.{ Parser, feed };
+use j3.term.Cell;
+use j3.term.grid.Grid;
+use j3.term.pushUtf8;
+use j3.text.Text;
+
+pub const CHARS = 1;
+pub const WORDS = 2;
+pub const LINES = 3;
+
+const MULTI_CLICK_MS = 400;
+// Characters that end a word for double-click (besides spaces).
+const WORD_STOPS = " \t'\"`()[]{}<>|,;";
+
+// A text selection in grid line coordinates (`Grid.line` indices, so it works in scrollback).
+// `anchor` is where the press was, `head` follows the drag; the selected range is the two
+// ordered and widened to whole words or lines by `unit`.
+pub struct Selection {
+    on: bool = false;
+    dragging: bool = false;
+    unit: int = 1;
+    aL: int = 0;
+    aC: int = 0;
+    hL: int = 0;
+    hC: int = 0;
+    // range from `update`: start (sL, sC) inclusive, end (eL, eC) exclusive
+    sL: int = 0;
+    sC: int = 0;
+    eL: int = 0;
+    eC: int = 0;
+    clicks: int = 0;
+    lastAt: int = -100000;
+    lastL: int = -1;
+    lastC: int = -1;
+
+    // Mouse down at line `l`, column `c` at time `now` (ms). Repeated clicks pick words, then lines.
+    fn press(this: &Selection, g: &Grid, l: int, c: int, now: int) {
+        let again = now - this.lastAt < MULTI_CLICK_MS && l == this.lastL && absI(c - this.lastC) <= 1;
+        if again { this.clicks = this.clicks % 3 + 1; } else { this.clicks = 1; }
+        this.lastAt = now;
+        this.lastL = l;
+        this.lastC = c;
+        this.unit = this.clicks;
+        this.aL = l;
+        this.aC = c;
+        this.hL = l;
+        this.hC = c;
+        this.dragging = true;
+        // A single click only selects once dragged; words and lines select at once.
+        this.on = this.unit != CHARS;
+        this.update(g);
+    }
+
+    fn drag(this: &Selection, g: &Grid, l: int, c: int) {
+        if !this.dragging { return; }
+        if l == this.hL && c == this.hC { return; }
+        this.hL = l;
+        this.hC = c;
+        this.on = true;
+        this.update(g);
+    }
+
+    fn release(this: &Selection) { this.dragging = false; }
+
+    // `n` lines fell off the top of the scrollback: follow the text up; gone once it scrolled away.
+    fn shift(this: &Selection, g: &Grid, n: int) {
+        if n == 0 || !this.on { return; }
+        this.aL -= n;
+        this.hL -= n;
+        this.lastL -= n;
+        if this.aL < 0 && this.hL < 0 { this.clear(); return; }
+        if this.aL < 0 { this.aL = 0; this.aC = 0; }
+        if this.hL < 0 { this.hL = 0; this.hC = 0; }
+        this.update(g);
+    }
+
+    fn clear(this: &Selection) {
+        this.on = false;
+        this.dragging = false;
+    }
+
+    fn update(this: &Selection, g: &Grid) {
+        let l0 = this.aL;
+        let c0 = this.aC;
+        let l1 = this.hL;
+        let c1 = this.hC;
+        if l1 < l0 || (l1 == l0 && c1 < c0) {
+            l0 = this.hL; c0 = this.hC;
+            l1 = this.aL; c1 = this.aC;
+        }
+        if this.unit == WORDS {
+            c0 = wordStart(g.line(l0), c0);
+            c1 = wordEnd(g.line(l1), c1);
+        } else if this.unit == LINES {
+            c0 = 0;
+            c1 = g.line(l1).len;
+        } else {
+            c1 += 1;
+        }
+        this.sL = l0;
+        this.sC = c0;
+        this.eL = l1;
+        this.eC = c1;
+    }
+
+    // Selected columns of line `l` as [lo, hi); hi <= lo when none. `width` caps open ends.
+    fn span(this: &Selection, l: int, width: int): [2]int {
+        let r: [2]int = [0, 0];
+        if !this.on || l < this.sL || l > this.eL { return r; }
+        r[1] = width;
+        if l == this.sL { r[0] = this.sC; }
+        if l == this.eL { r[1] = minI(this.eC, width); }
+        return r;
+    }
+
+    // The selected text, lines joined by `\n`, each line's trailing spaces trimmed.
+    fn text(this: &Selection, g: &Grid, out: &Text) {
+        if !this.on { return; }
+        for l in this.sL..this.eL + 1 {
+            let cells = g.line(l);
+            let r = this.span(l, cells.len);
+            let start = out.len();
+            for c in r[0]..r[1] {
+                let cell = cells[c];
+                if cell.width == 0 { continue; }
+                if cell.cp == 0 { out.push(32); } else { pushUtf8(out, cell.cp); }
+            }
+            while out.len() > start && out.bytes[out.len() - 1] == 32 { out.pop(); }
+            if l < this.eL { out.push(10); }
+        }
+    }
+}
+
+fn isWord(cell: Cell): bool {
+    if cell.cp == 0 { return false; }
+    if cell.cp > 127 { return true; }
+    let stops: string = WORD_STOPS;
+    for i in 0..stops.len { if i32(stops[i]) == cell.cp { return false; } }
+    return true;
+}
+
+fn wordStart(cells: []Cell, c: int): int {
+    if c >= cells.len || !isWord(cells[c]) { return c; }
+    let i = c;
+    while i > 0 && (isWord(cells[i - 1]) || cells[i - 1].width == 0) { i -= 1; }
+    return i;
+}
+
+// Exclusive end of the word at `c` (just `c + 1` on a non-word cell).
+fn wordEnd(cells: []Cell, c: int): int {
+    if c >= cells.len || !isWord(cells[c]) { return c + 1; }
+    let i = c + 1;
+    while i < cells.len && (isWord(cells[i]) || cells[i].width == 0) { i += 1; }
+    return i;
+}
+
+fn absI(v: int): int { if v < 0 { return 0 - v; } return v; }
+fn minI(a: int, b: int): int { if a < b { return a; } return b; }
+
+// Self-check: char drag, double-click word, triple-click line, multi-line text.
+pub fn selfTest(mem: &Arena) {
+    let g = Grid.new(mem, 20, 4, 10);
+    let p = Parser.new(mem);
+    feed(&p, "hello world-x foo\r\nsecond line", &g);
+    let sb = g.scrollbackLen();
+    let s = Selection {};
+    let t = Text.new(mem);
+    s.press(&g, sb, 6, 0);
+    s.drag(&g, sb, 10);
+    s.release();
+    s.text(&g, &t);
+    check(t.str() == "world", t.str());
+    t.clear();
+    s.press(&g, sb, 7, 1000);
+    s.press(&g, sb, 7, 1100);  // double: word
+    s.text(&g, &t);
+    check(t.str() == "world-x", t.str());
+    t.clear();
+    s.press(&g, sb, 7, 1200);  // triple: line
+    s.drag(&g, sb + 1, 2);
+    s.text(&g, &t);
+    check(t.str() == "hello world-x foo\nsecond line", t.str());
+    // A full scrollback ring drops lines: the selection follows its text.
+    let f = Grid.new(mem, 20, 2, 3);
+    feed(&p, "a\r\nb\r\nc\r\nd\r\n", &f);
+    let head = f.sbHead;
+    let l = 1;  // "b"
+    s.press(&f, l, 0, 5000);
+    s.drag(&f, l, 1);
+    s.release();
+    feed(&p, "e\r\n", &f);
+    s.shift(&f, (f.sbHead - head + f.sbCap) % f.sbCap);
+    t.clear();
+    s.text(&f, &t);
+    check(t.str() == "b", t.str());
+}
+
+fn check(ok: bool, got: string) { if !ok { sys.panic(`selection selfTest: got "{got}"`); } }

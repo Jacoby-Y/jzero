@@ -1,0 +1,73 @@
+<script>
+    use jzero.state.{ State, OCEAN };
+    use j3.game;
+    use j3.build;
+    use jzero.layout.split;
+    use jzero.actions;
+    use j3.option.Option;
+    props { state: &State; }
+
+    fn title(): string {
+        if state.active == OCEAN { return "Ocean"; }
+        return state.islands.get(state.active).name.str();
+    }
+
+    // The focused pane's last command failed.
+    fn failed(): bool {
+        match state.current() {
+            Option.Some(isl) {
+                match isl.panes.focusedTerm() {
+                    Option.Some(t) { return t.tap.runStart < 0 && t.tap.lastExit > 0; }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+        return false;
+    }
+
+    fn zoomed(): bool { return state.active != OCEAN && state.islands.get(state.active).panes.zoomed >= 0; }
+    fn broadcasting(): bool { return state.active != OCEAN && state.islands.get(state.active).broadcast; }
+</script>
+
+<header class="bar" window-drag>
+    <span class="title">{title()}</span>
+    {#if state.active != OCEAN}
+        <span class="cwd">{state.focusedCwd()}</span>
+        <span class="status" class:bad={failed()}>{state.paneStatus()}</span>
+    {/if}
+    {#if zoomed()}
+        <button class="badge" title="Zoom pane: click to show every pane" on:click={actions.run(state, actions.ZOOM_PANE)}>ZOOM</button>
+    {/if}
+    {#if broadcasting()}
+        <button class="badge on" title="Typing goes to every pane: click to stop" on:click={actions.run(state, actions.BROADCAST)}>BROADCAST</button>
+    {/if}
+    <div class="spacer"></div>
+    <span class="brand"><b>JZero</b> // v{build.VERSION}</span>
+    {#if state.active != OCEAN}
+        <button class="btn" title="Split right" on:click={state.splitFocused(split.RIGHT)}><icon name="layout-split" /></button>
+        <button class="btn" title="Split down" on:click={state.splitFocused(split.DOWN)}><icon name="terminal-split" /></button>
+    {/if}
+    <button class="btn" title="Command palette" on:click={actions.run(state, actions.PALETTE)}><icon name="command" /></button>
+    <div class="gap"></div>
+    <button class="btn" title="Minimize" on:click={game.minimizeWindow()}><icon name="dash-lg" /></button>
+    <button class="btn" title="Maximize" on:click={game.setMaximized(!game.windowMaximized())}>
+        <icon name={if game.windowMaximized() { "fullscreen-exit" } else { "square" }} />
+    </button>
+    <button class="btn close" title="Close" on:click={state.requestQuit()}><icon name="x-lg" /></button>
+</header>
+
+<style>
+    .bar { height: 36px; display: flex; flex-direction: row; align-items: center; padding-left: 12px; background: var(--chrome-bg); }
+    .title { color: var(--c-bright-white); }
+    .cwd { margin-left: 10px; color: var(--c-bright-black); }
+    .status { margin-left: 12px; color: var(--c-bright-green); }
+    .status.bad { color: var(--c-bright-red); }
+    .badge { margin-left: 10px; height: 22px; padding: 0 8px; font-size: 12px; background: var(--chrome-active); color: var(--c-bright-white); }
+    .badge.on { background: var(--chrome-danger); }
+    .spacer { flex: 1; }
+    .brand { margin-right: 12px; font-size: 12px; color: var(--c-bright-black); }
+    .gap { width: 12px; }
+    .btn { width: 40px; height: 36px; font-size: 14px; display: flex; align-items: center; justify-content: center; }
+    .close:hover { background: var(--chrome-danger); color: var(--c-bright-white); }
+</style>

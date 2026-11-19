@@ -1,0 +1,16 @@
+name = Go
+ext = go
+comment = //
+comment = /* */
+string = " " escape
+string = ` ` multiline
+region = string ' ' char
+keyword = chan const func import interface map package struct type var
+control = break case continue default defer else fallthrough for go goto if range return select switch
+plain = variable
+type = bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string uint uint8 uint16 uint32 uint64 uintptr any
+constant = true false nil iota
+builtin = append cap close copy delete len make new panic print println recover
+after = function func
+after = type type
+call = true

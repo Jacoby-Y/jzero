@@ -1,0 +1,66 @@
+<script>
+    use jzero.state.State;
+    use jzero.config.config;
+    props { state: &State; }
+    fn step(by: int) {
+        let dr = &state.draft;
+        dr.fontSize += by;
+        if dr.fontSize < config.FONT_MIN { dr.fontSize = config.FONT_MIN; }
+        if dr.fontSize > config.FONT_MAX { dr.fontSize = config.FONT_MAX; }
+    }
+</script>
+{#let dr = &state.draft}
+<div class="tab">
+    <settings.Row name="Theme" note="Theme files (Ghostty, base16, iTerm2) go in the themes folder.">
+        <select bind:value={dr.theme}>
+            {#each 0..state.themes.count() as k}
+                <option value={state.themes.name(k)}>{state.themes.title(k)}</option>
+            {/each}
+        </select>
+    </settings.Row>
+    <settings.Row name="Font family" note="A family name or a font file path. Applies on Save.">
+        <input type="text" placeholder="Bundled (JetBrains Mono)" bind:value={dr.fontFamily} />
+    </settings.Row>
+    <settings.Row name="Font size">
+        <button class="step" on:click={step(-1)}><icon name="dash-lg" /></button>
+        <span class="num">{dr.fontSize}</span>
+        <button class="step" on:click={step(1)}><icon name="plus-lg" /></button>
+    </settings.Row>
+    <settings.Row name="Font ligatures">
+        <input type="checkbox" bind:checked={dr.ligatures} />
+    </settings.Row>
+    <settings.Row name="Line height">
+        <input type="range" min="100" max="300" step="5" bind:value={dr.lineHeight} />
+        <span class="num">{int(dr.lineHeight)}%</span>
+    </settings.Row>
+    <settings.Row name="Padding left/right">
+        <input type="range" min="0" max="60" step="1" bind:value={dr.padX} />
+        <span class="num">{int(dr.padX)}px</span>
+    </settings.Row>
+    <settings.Row name="Padding top/bottom">
+        <input type="range" min="0" max="60" step="1" bind:value={dr.padY} />
+        <span class="num">{int(dr.padY)}px</span>
+    </settings.Row>
+    <settings.Row name="Cursor">
+        <select bind:value={dr.cursor}>
+            {#each 0..3 as k}
+                <option value={config.cursorName(k)}>{config.cursorName(k)}</option>
+            {/each}
+        </select>
+    </settings.Row>
+    <settings.Row name="Cursor blink">
+        <input type="checkbox" bind:checked={dr.cursorBlink} />
+    </settings.Row>
+    <settings.Row name="Unfocused splits">
+        <input type="range" min="15" max="100" step="5" bind:value={dr.unfocused} />
+        <span class="num">{int(dr.unfocused)}%</span>
+    </settings.Row>
+    <settings.Row name="Background opacity" note="Going from 100% to below it (or back) takes a restart.">
+        <input type="range" min="10" max="100" step="5" bind:value={dr.bgOpacity} />
+        <span class="num">{int(dr.bgOpacity)}%</span>
+    </settings.Row>
+</div>
+<style>
+    .step { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: var(--chrome-hover); }
+    .num { width: 48px; text-align: center; color: var(--c-bright-white); }
+</style>

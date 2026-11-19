@@ -1,0 +1,263 @@
+module jzero.git.repo;
+
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text;
+use j3.text.Text;
+use jzero.platform.os;
+use jzero.git.job;
+use jzero.git.job.Job;
+
+// The Git UI's view of one folder: what `git` says about it (read on `refresh`, all local and
+// quick, so on the frame thread), plus the actions in `repo/ops.j3`.
+
+// A changed path from `git status`: `xy` is git's two status letters (index, worktree).
+pub struct Change {
+    xy: string;
+    path: string;   // relative to the repository top
+}
+
+pub struct Commit {
+    hash: string;
+    subject: string;
+}
+
+pub struct Ran {
+    code: int;
+    out: string;
+    err: string;
+}
+
+const DIFF_MAX = 3000;  // lines shown of one file's diff
+
+pub struct Repo {
+    mem: &Arena;          // everything read below; replaced on every refresh
+    dir: Text;            // the folder the panel was opened on
+    top: Text;            // its repository's top folder ("" when it is not in one)
+    note: Text;           // the last result or error the panel shows
+    bad: bool = false;    // `note` is an error
+    diffPath: Text;       // the file whose diff shows ("" none)
+    branch: string = "";
+    upstream: string = "";
+    ahead: int = 0;
+    behind: int = 0;
+    hasCommits: bool = false;
+    remote: string = "";  // origin's URL
+    ghReady: bool = false; // `gh` is logged in (checked while there is no remote)
+    changes: List<Change>;
+    branches: List<string>;
+    log: List<Commit>;
+    diff: List<string>;
+    job: &Job;
+
+    fn isRepo(this: &Repo): bool { return this.top.len() > 0; }
+    fn busy(this: &Repo): bool { return this.job.running; }
+
+    // The panel opens on `path`.
+    fn open(this: &Repo, path: string) {
+        this.dir.clear();
+        this.dir.pushStr(path);
+        this.diffPath.clear();
+        this.say("", false);
+        this.refresh();
+    }
+
+    // The folder's last name (the default GitHub repository name).
+    fn dirName(this: &Repo): string {
+        let d = this.dir.str();
+        let at = text.lastIndexOf(d, "/");
+        if at < 0 { return d; }
+        return d[at + 1..d.len];
+    }
+
+    // Read everything again.
+    fn refresh(this: &Repo) {
+        this.mem.destroy();
+        *this.mem = Arena.create(65536);
+        this.changes = List<Change>.new(this.mem);
+        this.branches = List<string>.new(this.mem);
+        this.log = List<Commit>.new(this.mem);
+        this.diff = List<string>.new(this.mem);
+        this.branch = ""; this.upstream = ""; this.remote = "";
+        this.ahead = 0; this.behind = 0;
+        this.hasCommits = false; this.ghReady = false;
+        this.top.clear();
+        let top: [5]string = ["git", "-C", this.dir.str(), "rev-parse", "--show-toplevel"];
+        let r = run(top[:], this.mem);
+        if r.code != 0 { return; }
+        this.top.pushStr(text.trimEnd(r.out));
+        let st: [4]string = ["status", "--porcelain=v2", "--branch", "-z"];
+        this.readStatus(this.git(st[:]).out);
+        let br: [2]string = ["branch", "--format=%(refname:short)"];
+        for b in text.lines(this.git(br[:]).out) { this.branches.push(b); }
+        if this.hasCommits {
+            let lg: [4]string = ["log", "-n", "30", "--format=%h%x09%s"];
+            for l in text.lines(this.git(lg[:]).out) {
+                let tab = text.find(l, "\t");
+                if tab > 0 { this.log.push(Commit { hash: l[0..tab], subject: l[tab + 1..l.len] }); }
+            }
+        }
+        let rm: [3]string = ["remote", "get-url", "origin"];
+        let o = this.git(rm[:]);
+        if o.code == 0 { this.remote = text.trimEnd(o.out); }
+        else {
+            let gh: [3]string = ["gh", "auth", "token"];
+            this.ghReady = run(gh[:], this.mem).code == 0;
+        }
+        if this.diffPath.len() > 0 { this.readDiff(); }
+    }
+
+    // `--porcelain=v2 --branch -z` records: `# branch.*` headers, `1`/`2`/`u` changes (path after
+    // a fixed count of fields; a `2` rename is followed by its old path), `?` untracked.
+    fn readStatus(this: &Repo, s: string) {
+        let at = 0;
+        while at < s.len {
+            let end = at;
+            while end < s.len && s[end] != 0 { end += 1; }
+            let rec = s[at..end];
+            at = end + 1;
+            if rec.len < 2 { continue; }
+            match rec[0] {
+                35 { this.readHeader(rec); }                                   // #
+                49 { this.addChange(rec, 8); }                                 // 1
+                117 { this.addChange(rec, 10); }                               // u
+                63 { this.changes.push(Change { xy: "??", path: rec[2..rec.len] }); }  // ?
+                50 {                                                            // 2
+                    this.addChange(rec, 9);
+                    while at < s.len && s[at] != 0 { at += 1; }
+                    at += 1;
+                }
+                _ {}
+            }
+        }
+    }
+
+    fn readHeader(this: &Repo, rec: string) {
+        let v = afterFields(rec, 2);
+        if text.startsWith(rec, "# branch.oid ") { this.hasCommits = v != "(initial)"; }
+        else if text.startsWith(rec, "# branch.head ") { this.branch = v; }
+        else if text.startsWith(rec, "# branch.upstream ") { this.upstream = v; }
+        else if text.startsWith(rec, "# branch.ab ") {
+            let sp = text.find(v, " ");
+            if sp > 1 {
+                this.ahead = digits(v[1..sp]);
+                this.behind = digits(v[sp + 2..v.len]);
+            }
+        }
+    }
+
+    fn addChange(this: &Repo, rec: string, fields: int) {
+        if rec.len < 4 { return; }
+        this.changes.push(Change { xy: rec[2..4], path: afterFields(rec, fields) });
+    }
+
+    // The diff of `diffPath` against the last commit (untracked: the whole file as added).
+    fn readDiff(this: &Repo) {
+        this.diff.clear();
+        let p = this.diffPath.str();
+        let r = Ran { code: 0, out: "", err: "" };
+        if this.untracked(p) {
+            let a: [6]string = ["diff", "--no-color", "--no-index", "--", "/dev/null", p];
+            r = this.git(a[:]);
+        } else if this.hasCommits {
+            let a: [5]string = ["diff", "--no-color", "HEAD", "--", p];
+            r = this.git(a[:]);
+        } else {
+            let a: [5]string = ["diff", "--no-color", "--cached", "--", p];
+            r = this.git(a[:]);
+        }
+        for l in text.lines(r.out) {
+            if this.diff.len >= DIFF_MAX { break; }
+            this.diff.push(l);
+        }
+    }
+
+    fn untracked(this: &Repo, path: string): bool {
+        for c in this.changes.items[0..this.changes.len] { if c.path == path { return c.xy == "??"; } }
+        return false;
+    }
+
+    // `git -C <top> args...`, output in this refresh's memory.
+    fn git(this: &Repo, args: []string): Ran {
+        let argv = List<string>.new(this.mem);
+        argv.push("git"); argv.push("-C"); argv.push(this.top.str());
+        for a in args { argv.push(a); }
+        return run(argv.items[0..argv.len], this.mem);
+    }
+
+    fn say(this: &Repo, msg: string, bad: bool) {
+        this.note.clear();
+        this.note.pushStr(text.trim(msg));
+        this.bad = bad;
+    }
+}
+
+pub fn create(parent: &Arena): Repo {
+    let mem = &parent.alloc::<Arena>(1)[0];
+    *mem = Arena.create(1024);
+    return Repo {
+        mem: mem, dir: Text.new(parent), top: Text.new(parent), note: Text.new(parent), diffPath: Text.new(parent),
+        changes: List<Change>.new(mem), branches: List<string>.new(mem), log: List<Commit>.new(mem), diff: List<string>.new(mem),
+        job: job.create(parent),
+    };
+}
+
+// Staged in the index (shown checked).
+pub fn staged(c: &Change): bool { return c.xy[0] != 46 && c.xy[0] != 63; }
+
+// A short word for the change.
+pub fn kind(c: &Change): string {
+    let k = c.xy[1];
+    if staged(c) { k = c.xy[0]; }
+    match k {
+        63 { return "new"; }
+        77 { return "mod"; }
+        65 { return "add"; }
+        68 { return "del"; }
+        82 { return "ren"; }
+        85 { return "conf"; }
+        _ { return "chg"; }
+    }
+}
+
+fn run(argv: []string, mem: &Arena): Ran {
+    match proc.run(argv, "", mem) {
+        Result.Ok(o) { return Ran { code: o.code, out: o.outStr(), err: o.errStr() }; }
+        Result.Err(_) { return Ran { code: -1, out: "", err: Text.new(mem).add("Could not run ").add(argv[0]).str() }; }
+    }
+}
+
+// `rec` after its first `n` space-separated fields.
+fn afterFields(rec: string, n: int): string {
+    let at = 0;
+    let seen = 0;
+    while at < rec.len && seen < n {
+        if rec[at] == 32 { seen += 1; }
+        at += 1;
+    }
+    return rec[at..rec.len];
+}
+
+fn digits(s: string): int {
+    let n = 0;
+    for c in s { if c >= 48 && c <= 57 { n = n * 10 + int(c - 48); } }
+    return n;
+}
+
+pub fn selfTest(mem: &Arena) {
+    let r = create(mem);
+    let s = Text.new(mem);  // `|` stands for the 0 byte
+    for c in "# branch.oid abc|# branch.head main|# branch.ab +2 -1|1 .M N... 100644 100644 100644 a b src/x y.j3|? new.txt|2 R. N... 1 1 1 a b R100 to.j3|from.j3|" {
+        if c == 124 { s.push(0); } else { s.push(c); }
+    }
+    r.readStatus(s.str());
+    check(r.hasCommits && r.branch == "main" && r.ahead == 2 && r.behind == 1, "branch header");
+    check(r.changes.len == 3, "change count");
+    check(r.changes.items[0].path == "src/x y.j3" && !staged(&r.changes.items[0]), "modified");
+    check(r.changes.items[1].xy == "??" && kind(&r.changes.items[1]) == "new", "untracked");
+    check(r.changes.items[2].path == "to.j3" && staged(&r.changes.items[2]), "rename");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`git selfTest: {what}`); } }

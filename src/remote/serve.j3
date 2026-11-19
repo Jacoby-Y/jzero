@@ -1,0 +1,274 @@
+module jzero.remote.serve;
+
+// `jzctl serve [--port N] [--bind ADDR]`: a phone page for the running JZero. Serves
+// `assets/remote/index.html` and forwards `POST /ctl` (a JSON array of jzctl args) to the
+// instance socket, like any `jzctl` client. The page holds the token in the URL fragment
+// (`#token`, never sent in a GET) and sends it as `X-Token`. Plain HTTP: LAN or Tailscale only.
+// ponytail: one connection at a time, so only non-blocking commands are allowed (no run/wait/watch);
+// a thread per connection if the page ever needs long-polls.
+
+use j3.data.json;
+use j3.instance;
+use j3.io;
+use j3.memory;
+use j3.memory.{ Arena, List };
+use j3.net.tcp;
+use j3.net.tcp.Conn;
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.os;
+use jzero.features.ctl;
+use qr;
+use qr.Ecc;
+use qr.draw;
+
+const PAGE = @embed("assets/remote/index.html");
+const PORT = 7771;
+const MAX_REQ = 65536;
+const IO_MS = 5000;
+// Commands the page may send: all answer at once.
+const ALLOWED: [8]string = ["ls", "read", "send", "key", "status", "history", "new", "focus"];
+
+// This run is `jzctl serve`.
+pub fn wanted(): bool { return ctl.invoked() && ctl.argCount() > 1 && ctl.arg(1) == "serve"; }
+
+// Listen and answer until killed.
+pub fn serve() {
+    let mem = Arena.create(65536);
+    let argv = List<string>.new(&mem);
+    for i in 0..ctl.argCount() { argv.push(ctl.arg(i)); }
+    let args = argv.items[0..argv.len];
+    let port = ctl.num(ctl.flag(args, "--port"), PORT);
+    let bind = ctl.flag(args, "--bind");
+    if bind.len == 0 { bind = "0.0.0.0"; }
+    let name = sys.env("JZERO_INSTANCE");
+    if name.len == 0 { name = ctl.serveName(&mem); }
+    let token = newToken(&mem);
+    match tcp.listenOn(bind, port) {
+        Result.Ok(l) {
+            let lis = l;
+            sys.ignoreSigpipe(true);
+            banner(bind, lis.port, token, &mem);
+            while true {
+                match lis.accept() {
+                    Result.Ok(c) {
+                        let conn = c;
+                        conn.setTimeout(IO_MS);
+                        let req = Arena.create(MAX_REQ * 2);
+                        handle(&conn, name, token, &req);
+                        conn.close();
+                        req.destroy();
+                        memory.rewindScratch();
+                    }
+                    Result.Err(_) {}
+                }
+            }
+        }
+        Result.Err(_) {
+            ctl.writeFd(2, Text.scratch().add("jzctl serve: cannot listen on ").add(bind).add(`:{port}`).add("\n").str());
+            sys.exit(i32(1));
+        }
+    }
+}
+
+// The URL to open on the phone, as text and a QR code to scan.
+fn banner(bind: string, port: int, token: string, mem: &Arena) {
+    let host = bind;
+    if host == "0.0.0.0" { host = reachableIp(mem); }
+    let url = Text.new(mem);
+    url.add("http://").add(host).add(`:{port}/#`).add(token);
+    let t = Text.new(mem);
+    t.add("JZero remote: scan with your phone (same LAN or tailnet):\n\n");
+    match qr.encode(mem, url.str(), Ecc.Low) {
+        Option.Some(code) { draw.text(&t, &code, true); }  // light modules on the dark terminal
+        Option.None {}
+    }
+    t.add("\n  ").add(url.str()).add("\n\nPlain HTTP: anyone who sees the link can drive your panes. Ctrl+C stops.\n");
+    ctl.writeFd(1, t.str());
+}
+
+// This machine's Tailscale IPv4 (reachable from anywhere on the tailnet), else its first LAN
+// address (`hostname -I`), else a placeholder.
+fn reachableIp(mem: &Arena): string {
+    let ts: [3]string = ["tailscale", "ip", "-4"];
+    let ip = firstWord(ts[:], mem);
+    if ip.len > 0 { return ip; }
+    let lan: [2]string = ["hostname", "-I"];
+    ip = firstWord(lan[:], mem);
+    if ip.len > 0 { return ip; }
+    return "<this machine's IP>";
+}
+
+// The first word `argv` prints when it succeeds ("" otherwise).
+fn firstWord(argv: []string, mem: &Arena): string {
+    match proc.run(argv, "", mem) {
+        Result.Ok(o) {
+            if o.code != 0 { return ""; }
+            let s = o.outStr();
+            let n = 0;
+            while n < s.len && s[n] > 32 { n += 1; }
+            return s[0..n];
+        }
+        Result.Err(_) { return ""; }
+    }
+}
+
+// One HTTP request on `c`.
+fn handle(c: &Conn, name: string, token: string, mem: &Arena) {
+    let r = readRequest(c, mem);
+    if r.method.len == 0 { return; }
+    if r.method == "GET" && (r.path == "/" || r.path == "/index.html") { respond(c, "200 OK", "text/html; charset=utf-8", PAGE); return; }
+    if r.method != "POST" || r.path != "/ctl" { respond(c, "404 Not Found", "text/plain", "not found\n"); return; }
+    if !sameText(r.token, token) { respond(c, "403 Forbidden", "text/plain", "err\nbad token\n"); return; }
+    respond(c, "200 OK", "text/plain; charset=utf-8", forward(r.body, name, mem));
+}
+
+// `body` (`["read","3","--json"]`) to the running JZero; its `ok|err...\n<body>` reply.
+fn forward(body: string, name: string, mem: &Arena): string {
+    let args = List<string>.new(mem);
+    args.push("jzctl");
+    match json.parseStr(body, mem) {
+        Result.Ok(j) {
+            if j.kind != json.Kind.Arr { return "err\nbody must be a JSON array of strings\n"; }
+            for i in 0..j.len() { args.push(j.at(i).asStr()); }
+        }
+        Result.Err(_) { return "err\nbad JSON\n"; }
+    }
+    if args.len < 2 || !allowed(args.items[1]) { return "err\ncommand not allowed remotely\n"; }
+    match instance.request(name, args.items[0..args.len], IO_MS) {
+        Option.Some(reply) { return reply; }
+        Option.None { return "err\nno running JZero answered\n"; }
+    }
+}
+
+fn allowed(cmd: string): bool {
+    for a in ALLOWED { if a == cmd { return true; } }
+    return false;
+}
+
+// What `handle` needs from a request ("" method: unreadable).
+struct Req {
+    method: string = "";
+    path: string = "";
+    token: string = "";
+    body: string = "";
+}
+
+// Read the head and a `Content-Length` body (at most `MAX_REQ` bytes in all).
+fn readRequest(c: &Conn, mem: &Arena): Req {
+    let buf = mem.alloc::<u8>(MAX_REQ);
+    let n = 0;
+    let head = -1;
+    while head < 0 {
+        if n == MAX_REQ { return Req {}; }
+        let got = c.read(buf[n..MAX_REQ]);
+        if got <= 0 { return Req {}; }
+        n += got;
+        head = headEnd(buf[0..n]);
+    }
+    let r = parseHead((buf[0..head] as string));
+    let want = head + 4 + ctl.num(r.body, 0);  // `body` holds Content-Length until here
+    if want > MAX_REQ { return Req {}; }
+    while n < want {
+        let got = c.read(buf[n..want]);
+        if got <= 0 { return Req {}; }
+        n += got;
+    }
+    r.body = (buf[head + 4..want] as string);
+    return r;
+}
+
+// Index of the blank line `\r\n\r\n` ending the head, -1 before it arrived.
+fn headEnd(b: []u8): int {
+    for i in 0..b.len - 3 { if b[i] == 13 && b[i + 1] == 10 && b[i + 2] == 13 && b[i + 3] == 10 { return i; } }
+    return -1;
+}
+
+// Request line and the two headers we read; `body` = the Content-Length text.
+fn parseHead(h: string): Req {
+    let r = Req {};
+    let line = 0;
+    let start = 0;
+    for i in 0..h.len + 1 {
+        if i < h.len && h[i] != 10 { continue; }
+        let l = h[start..i];
+        if l.len > 0 && l[l.len - 1] == 13 { l = l[0..l.len - 1]; }
+        start = i + 1;
+        if line == 0 {
+            let sp = indexOf(l, 32, 0);
+            if sp < 0 { return Req {}; }
+            let sp2 = indexOf(l, 32, sp + 1);
+            if sp2 < 0 { sp2 = l.len; }
+            r.method = l[0..sp];
+            r.path = l[sp + 1..sp2];
+        } else {
+            let v = header(l, "content-length");
+            if v.len > 0 { r.body = v; }
+            let t = header(l, "x-token");
+            if t.len > 0 { r.token = t; }
+        }
+        line += 1;
+    }
+    return r;
+}
+
+// The value of header line `l` when its name is `name` (lowercase), else "".
+fn header(l: string, name: string): string {
+    if l.len <= name.len || l[name.len] != 58 { return ""; }
+    for i in 0..name.len {
+        let ch = l[i];
+        if ch >= 65 && ch <= 90 { ch += 32; }
+        if ch != name[i] { return ""; }
+    }
+    let v = l[name.len + 1..l.len];
+    while v.len > 0 && v[0] == 32 { v = v[1..v.len]; }
+    return v;
+}
+
+fn indexOf(s: string, ch: u8, from: int): int {
+    for i in from..s.len { if s[i] == ch { return i; } }
+    return -1;
+}
+
+// Compare without stopping at the first difference (no timing hint on the token).
+fn sameText(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    let diff = 0;
+    for i in 0..a.len { diff |= int(a[i] ^ b[i]); }
+    return diff == 0;
+}
+
+fn respond(c: &Conn, status: string, kind: string, body: string) {
+    let t = Text.scratch();
+    t.add("HTTP/1.1 ").add(status).add("\r\nContent-Type: ").add(kind).add(`\r\nContent-Length: {body.len}`);
+    t.add("\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n").add(body);
+    c.writeAll(t.str() as []u8);
+}
+
+// 128 random bits as hex, from the OS.
+fn newToken(mem: &Arena): string {
+    let raw = mem.alloc::<u8>(16);
+    if !os.random(raw) { sys.panic("jzctl serve: the OS gave no random bytes"); }
+    let t = Text.new(mem);
+    let hex = "0123456789abcdef";
+    for b in raw { t.push(hex[int(b) >> 4]); t.push(hex[int(b) & 15]); }
+    return t.str();
+}
+
+// Self-check: request parsing and token compare.
+pub fn selfTest(mem: &Arena) {
+    let r = parseHead("POST /ctl HTTP/1.1\r\nHost: x\r\nX-Token: abc\r\ncontent-length: 12");
+    check(r.method == "POST" && r.path == "/ctl" && r.token == "abc" && r.body == "12", "head");
+    check(parseHead("garbage").method == "", "bad head");
+    check(headEnd("a\r\n\r\nb" as []u8) == 1 && headEnd("a\r\n" as []u8) == -1, "head end");
+    check(sameText("abc", "abc") && !sameText("abc", "abd") && !sameText("ab", "abc"), "same");
+    check(allowed("read") && !allowed("run") && !allowed("close"), "allowed");
+    check(forward("{}", "x", mem) == "err\nbody must be a JSON array of strings\n", "object body");
+    check(forward("[\"run\",\"1\",\"ls\"]", "x", mem) == "err\ncommand not allowed remotely\n", "blocked");
+    check(newToken(mem).len == 32, "token");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`serve selfTest: {what}`); } }

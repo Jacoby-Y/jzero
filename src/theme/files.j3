@@ -1,0 +1,276 @@
+module jzero.theme.files;
+
+use j3.io;
+use j3.io.printLn;
+use j3.memory.{ Arena };
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, find };
+use jzero.config.parse;
+use jzero.config.parse.trim;
+use jzero.theme.theme;
+use jzero.theme.theme.{ Themes, BG, FG, SEL, CURSOR, SLOTS, SYN, SYNTAX };
+
+// Theme files dropped into `<config dir>/themes/`: Ghostty (`palette = 0=#…`, `background = …`),
+// base16 YAML (`base00: "…"`) and iTerm2 `.itermcolors`. Each becomes a custom theme named
+// after its file (without the extension). Colors a file leaves out come from Tango.
+
+// base16 slot of each ANSI color 0..15 (base16-shell's mapping).
+const BASE16_ANSI: [16]int = [0, 8, 11, 10, 13, 14, 12, 5, 3, 8, 11, 10, 13, 14, 12, 7];
+
+// Read every file of `dir` into `ts`. Strings live in `mem`.
+pub fn loadDir(dir: string, mem: &Arena, ts: &Themes) {
+    match io.listDir(dir, mem) {
+        Result.Ok(entries) {
+            for e in entries {
+                if e.isDir || e.name.len == 0 || e.name[0] == 46 { continue; }
+                let path = Text.new(mem);
+                path.pushStr(dir);
+                path.push(47);
+                path.pushStr(e.name);
+                match io.readFile(path.str(), mem) {
+                    Result.Ok(bytes) {
+                        let cols: [20]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                        if read(bytes as string, mem, cols[:]) { ts.add(stem(e.name), cols[:]); }
+                        else { printLn(`theme: cannot read {path.str()}`); }
+                    }
+                    Result.Err(_) {}
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+// Colors of theme file `src` (any format) into `out` (SLOTS). False when nothing was found.
+pub fn read(src: string, mem: &Arena, out: []int): bool {
+    theme.bundled(0, out);
+    if find(src, "<plist") >= 0 { return readIterm(src, out); }
+    if find(src, "base00") >= 0 { return readBase16(src, out); }
+    return readGhostty(src, mem, out);
+}
+
+// Ghostty theme file, also the color keys of our config (`apply` below).
+fn readGhostty(src: string, mem: &Arena, out: []int): bool {
+    let found = false;
+    let es = parse.parse(src, mem);
+    for i in 0..es.len {
+        let slot = -1;
+        let v = 0;
+        if colorEntry(es.items[i].key, es.items[i].value, &slot, &v) && slot < SLOTS {
+            out[slot] = v;
+            found = true;
+        }
+    }
+    return found;
+}
+
+// A color key of the config or a Ghostty theme: `palette = N=#rrggbb`, `background`,
+// `foreground`, `cursor-color`, `selection-background`, `syntax-<kind>` (editor, SYN + kind).
+// True with its slot and color.
+pub fn colorEntry(key: string, value: string, slot: &int, color: &int): bool {
+    let s = -1;
+    let v = value;
+    if key == "palette" {
+        let eq = find(value, "=");
+        if eq < 0 { return false; }
+        s = toInt(trim(value[0..eq]));
+        if s < 0 || s > 15 { return false; }
+        v = trim(value[eq + 1..value.len]);
+    } else if key == "background" { s = BG; }
+    else if key == "foreground" { s = FG; }
+    else if key == "cursor-color" { s = CURSOR; }
+    else if key == "selection-background" { s = SEL; }
+    else { for k in 0..SYNTAX { if key == theme.syntaxKey(k) { s = SYN + k; } } }
+    if s < 0 { return false; }
+    let c = hex(v);
+    if c < 0 { return false; }
+    *slot = s;
+    *color = c;
+    return true;
+}
+
+// The config key that sets `slot` (`palette` for 0..15).
+pub fn colorKey(slot: int): string {
+    if slot == BG { return "background"; }
+    if slot == FG { return "foreground"; }
+    if slot == CURSOR { return "cursor-color"; }
+    if slot == SEL { return "selection-background"; }
+    if slot >= SYN { return theme.syntaxKey(slot - SYN); }
+    return "palette";
+}
+
+// `#rrggbb` of 0xRRGGBB.
+pub fn pushHex(out: &Text, c: int) {
+    let digits = "0123456789abcdef";
+    out.push(35);
+    let shift = 20;
+    while shift >= 0 {
+        out.push(digits[(c >> shift) & 15]);
+        shift -= 4;
+    }
+}
+
+// `base0X: "rrggbb"` lines (quotes and `#` optional).
+fn readBase16(src: string, out: []int): bool {
+    let base: [16]int = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1];
+    let start = 0;
+    while start < src.len {
+        let end = start;
+        while end < src.len && src[end] != 10 { end += 1; }
+        let line = trim(src[start..end]);
+        start = end + 1;
+        if line.len < 8 || line[0..4] != "base" || line[4] != 48 { continue; }
+        let n = hexDigit(line[5]);
+        let colon = find(line, ":");
+        if n < 0 || colon < 0 { continue; }
+        let v = trim(line[colon + 1..line.len]);
+        let hash = find(v, "#");
+        if hash >= 0 { v = trim(v[hash + 1..v.len]); }
+        let q = 0;
+        while q < v.len && v[q] == 34 { q += 1; }
+        base[n] = hex(v[q..minI(q + 6, v.len)]);
+    }
+    if base[0] < 0 || base[5] < 0 { return false; }
+    for k in 0..16 { if base[BASE16_ANSI[k]] >= 0 { out[k] = base[BASE16_ANSI[k]]; } }
+    out[BG] = base[0];
+    out[FG] = base[5];
+    out[CURSOR] = base[5];
+    if base[2] >= 0 { out[SEL] = base[2]; }
+    return true;
+}
+
+// iTerm2 plist: `<key>Ansi 3 Color</key><dict>…Red Component</key><real>0.5</real>…</dict>`.
+fn readIterm(src: string, out: []int): bool {
+    let found = false;
+    let at = 0;
+    while true {
+        let k = find(src[at..src.len], "<key>");
+        if k < 0 { break; }
+        let ks = at + k + 5;
+        let ke = find(src[ks..src.len], "</key>");
+        if ke < 0 { break; }
+        let name = src[ks..ks + ke];
+        at = ks + ke + 6;
+        let slot = itermSlot(name);
+        if slot < 0 { continue; }
+        let dictEnd = find(src[at..src.len], "</dict>");
+        if dictEnd < 0 { break; }
+        let d = src[at..at + dictEnd];
+        let r = component(d, "Red Component");
+        let g = component(d, "Green Component");
+        let b = component(d, "Blue Component");
+        if r >= 0 && g >= 0 && b >= 0 {
+            out[slot] = (r << 16) | (g << 8) | b;
+            found = true;
+        }
+        at += dictEnd;
+    }
+    return found;
+}
+
+fn itermSlot(name: string): int {
+    if name == "Background Color" { return BG; }
+    if name == "Foreground Color" { return FG; }
+    if name == "Cursor Color" { return CURSOR; }
+    if name == "Selection Color" { return SEL; }
+    if name.len < 12 || name[0..5] != "Ansi " || name[name.len - 6..name.len] != " Color" { return -1; }
+    let n = toInt(name[5..name.len - 6]);
+    if n < 0 || n > 15 { return -1; }
+    return n;
+}
+
+// 0..255 from `<key>what</key><real>0.5</real>` in `d`, or -1.
+fn component(d: string, what: string): int {
+    let k = find(d, what);
+    if k < 0 { return -1; }
+    let rest = d[k..d.len];
+    let r = find(rest, "<real>");
+    if r < 0 { return -1; }
+    let v = rest[r + 6..rest.len];
+    let e = find(v, "<");
+    if e < 0 { return -1; }
+    let f = toFloat(v[0..e]);
+    if f < 0.0 { return -1; }
+    if f > 1.0 { f = 1.0; }
+    return int(f * 255.0 + 0.5);
+}
+
+// `#rrggbb`, `rrggbb` or `0xrrggbb` as 0xRRGGBB; -1 when not one.
+pub fn hex(s: string): int {
+    let v = trim(s);
+    if v.len > 0 && v[0] == 35 { v = v[1..v.len]; }
+    if v.len > 2 && v[0] == 48 && (v[1] == 120 || v[1] == 88) { v = v[2..v.len]; }
+    if v.len != 6 { return -1; }
+    let n = 0;
+    for i in 0..6 {
+        let d = hexDigit(v[i]);
+        if d < 0 { return -1; }
+        n = n * 16 + d;
+    }
+    return n;
+}
+
+fn hexDigit(c: u8): int {
+    if c >= 48 && c <= 57 { return int(c - 48); }
+    if c >= 97 && c <= 102 { return int(c - 87); }
+    if c >= 65 && c <= 70 { return int(c - 55); }
+    return -1;
+}
+
+fn toInt(s: string): int {
+    if s.len == 0 { return -1; }
+    let v = 0;
+    for i in 0..s.len {
+        if s[i] < 48 || s[i] > 57 { return -1; }
+        v = v * 10 + int(s[i] - 48);
+    }
+    return v;
+}
+
+// A plain decimal with an optional exponent (`0.25`, `1`, `6.2e-02`); -1 when not one.
+fn toFloat(s: string): f64 {
+    let t = trim(s);
+    let v: f64 = 0.0;
+    let i = 0;
+    while i < t.len && t[i] >= 48 && t[i] <= 57 { v = v * 10.0 + f64(t[i] - 48); i += 1; }
+    if i < t.len && t[i] == 46 {
+        i += 1;
+        let scale: f64 = 0.1;
+        while i < t.len && t[i] >= 48 && t[i] <= 57 { v += f64(t[i] - 48) * scale; scale *= 0.1; i += 1; }
+    }
+    if i < t.len && (t[i] == 101 || t[i] == 69) {
+        i += 1;
+        let neg = i < t.len && t[i] == 45;
+        if i < t.len && (t[i] == 45 || t[i] == 43) { i += 1; }
+        let e = 0;
+        while i < t.len && t[i] >= 48 && t[i] <= 57 { e = e * 10 + int(t[i] - 48); i += 1; }
+        for _ in 0..e { if neg { v /= 10.0; } else { v *= 10.0; } }
+    }
+    if i != t.len || t.len == 0 { return -1.0; }
+    return v;
+}
+
+fn stem(name: string): string {
+    let k = name.len;
+    while k > 0 && name[k - 1] != 46 { k -= 1; }
+    if k <= 1 { return name; }
+    return name[0..k - 1];
+}
+
+fn minI(a: int, b: int): int { if a < b { return a; } return b; }
+
+// Self-check: the three formats.
+pub fn selfTest(mem: &Arena) {
+    let c: [20]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    check(read("palette = 1=#ff0000\nbackground = 101010\nforeground = #eeeeee\n", mem, c[:]), "ghostty");
+    check(c[1] == 0xff0000 && c[BG] == 0x101010 && c[FG] == 0xeeeeee && c[2] == 0x4e9a06, "ghostty colors");
+    check(read("scheme: \"x\"\nbase00: \"181818\"\nbase05: \"d8d8d8\"\nbase08: \"#ab4642\"\n", mem, c[:]), "base16");
+    check(c[BG] == 0x181818 && c[FG] == 0xd8d8d8 && c[1] == 0xab4642 && c[9] == 0xab4642, "base16 colors");
+    let pl = "<plist><dict><key>Ansi 2 Color</key><dict><key>Blue Component</key><real>0</real><key>Green Component</key><real>1</real><key>Red Component</key><real>0.5</real></dict><key>Background Color</key><dict><key>Blue Component</key><real>1</real><key>Green Component</key><real>0</real><key>Red Component</key><real>0</real></dict></dict></plist>";
+    check(read(pl, mem, c[:]), "iterm");
+    check(c[2] == 0x80ff00 && c[BG] == 0x0000ff, "iterm colors");
+    check(stem("a.b.yaml") == "a.b" && stem(".x") == ".x" && stem("plain") == "plain", "stem");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`theme files selfTest: {what}`); } }

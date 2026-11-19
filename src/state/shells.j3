@@ -1,0 +1,99 @@
+module jzero.state;
+
+// State part: what running shells report each frame (output, bells, notifications,
+// clipboard writes, finished commands, `0` requests) and broadcast input.
+
+extend State {
+    // Pump every shell of island `i`: output, bells, notifications, clipboard writes, finished
+    // commands, broadcast input. A shell that exited closes its pane.
+    fn pumpIsland(this: &State, i: int) {
+        let isl = this.islands.get(i);
+        let p = &isl.panes;
+        for j in 0..p.nodes.len {
+            if !p.isLeaf(j) { continue; }
+            let n = p.get(j);
+            if n.hasExplorer() { this.explorerRequests(n); }
+            match n.term {
+                Option.Some(t) {
+                    if t.ext { this.ext.step(t); }
+                    let out = t.pump();
+                    if (out || t.rang) && i != this.active { isl.unseen = true; }
+                    if t.typed.len() > 0 { t.badge.clear(); t.wants = false; }  // the user answered the `jzctl badge` / bell
+                    if t.flashing() { this.wantFrame = true; }
+                    this.shellEvents(i, j, t);
+                    t.rang = false;
+                    if isl.broadcast && j == p.focus && t.typed.len() > 0 { this.broadcast(isl, j, t.typed.str()); }
+                    if !t.alive() { this.closePane(i, j); }
+                }
+                Option.None {}
+            }
+        }
+    }
+
+    // What a shell asked for through escape codes since the last frame.
+    fn shellEvents(this: &State, i: int, leaf: int, t: &Session) {
+        let isl = this.islands.get(i);
+        let tap = &t.tap;
+        if tap.clipPending {
+            tap.clipPending = false;
+            if this.cfg.clipboardWrite { game.setClipboard(tap.clip.str()); }
+        }
+        if tap.notePending {
+            tap.notePending = false;
+            t.wants = true;
+            if this.cfg.notifications { notify.send(tap.noteTitle.str(), tap.noteBody.str()); }
+        }
+        if tap.runMode != 0 {
+            this.zeroMode = tap.runMode;
+            tap.runMode = 0;
+            this.zeroIsland = i;
+            this.zeroPane = isl.panes.get(leaf).id;
+            this.zeroArgs.clear();
+            this.zeroArgs.pushStr(tap.runArgs.str());
+            this.zeroCwd.clear();
+            t.cwd(&this.zeroCwd);
+        }
+        if tap.finished {
+            tap.finished = false;
+            let seen = game.windowFocused() && this.active == i && isl.panes.focus == leaf;
+            let limit = this.cfg.notifyAfter * 1000;
+            if this.cfg.notifications && limit > 0 && tap.lastMs >= limit && !seen {
+                let body = Text.scratch();
+                body.pushStr(isl.panes.get(leaf).recentCmds(1));
+                while body.len() > 0 && body.bytes[body.len() - 1] == 10 { body.pop(); }
+                body.pushStr(` exited {tap.lastExit} after {tap.lastMs / 1000}s`);
+                notify.send(`Command finished in {isl.name.str()}`, body.str());
+            }
+        }
+    }
+
+    // Typed bytes to every other shell of `isl`.
+    fn broadcast(this: &State, isl: &Island, from: int, bytes: string) {
+        let p = &isl.panes;
+        for j in 0..p.nodes.len {
+            if j == from || !p.isLeaf(j) { continue; }
+            match p.get(j).term {
+                Option.Some(t) { t.send(bytes); }
+                Option.None {}
+            }
+        }
+    }
+
+    // The focused shell's last command: exit code and time, or how long it has run ("" none).
+    fn paneStatus(this: &State): string {
+        match this.current() {
+            Option.Some(isl) {
+                match isl.panes.focusedTerm() {
+                    Option.Some(t) {
+                        let run = -1;
+                        if t.tap.runStart >= 0 { run = sys.monotonicMs() - t.tap.runStart; }
+                        return status.text(run, t.tap.lastExit, t.tap.lastMs);
+                    }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+        return "";
+    }
+}

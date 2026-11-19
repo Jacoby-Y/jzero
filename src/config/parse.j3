@@ -1,0 +1,42 @@
+module jzero.config.parse;
+
+use j3.memory.{ Arena, List };
+use j3.text.find;
+
+pub struct Entry {
+    key: string;
+    value: string;
+    line: int;   // 1-based, for messages
+}
+
+// `key = value` lines; `#` starts a comment line; blank lines are skipped; a key may repeat.
+// Strings are views into `src`.
+pub fn parse(src: string, mem: &Arena): List<Entry> {
+    let out = List<Entry>.new(mem);
+    let start = 0;
+    let n = 1;
+    while start < src.len {
+        let end = start;
+        while end < src.len && src[end] != 10 { end += 1; }
+        let line = trim(src[start..end]);
+        if line.len > 0 && line[0] != 35 {
+            let eq = find(line, "=");
+            if eq > 0 {
+                out.push(Entry { key: trim(line[0..eq]), value: trim(line[eq + 1..line.len]), line: n });
+            }
+        }
+        start = end + 1;
+        n += 1;
+    }
+    return out;
+}
+
+pub fn trim(s: string): string {
+    let a = 0;
+    let b = s.len;
+    while a < b && isSpace(s[a]) { a += 1; }
+    while b > a && isSpace(s[b - 1]) { b -= 1; }
+    return s[a..b];
+}
+
+fn isSpace(c: u8): bool { return c == 32 || c == 9 || c == 13; }

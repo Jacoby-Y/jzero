@@ -1,0 +1,121 @@
+module jzero.git.repo;
+
+// Repo part: what the Git UI's buttons do. Local commands run at once and refresh; push, pull
+// and publish go to the worker (`job.j3`) and `poll` picks up the result.
+
+const J_PUSH = 0;
+const J_PULL = 1;
+const J_PUBLISH = 2;
+const DONE: [3]string = ["Pushed", "Pulled", "Published to GitHub"];
+
+// Git asks `gh` for GitHub credentials (`git/job.j3` keeps it from prompting).
+const AUTH: [5]string = ["git", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
+
+extend Repo {
+    fn init(this: &Repo) {
+        let a: [6]string = ["git", "-C", this.dir.str(), "init", "-b", "main"];
+        this.report(run(a[:], this.mem), "Initialized");
+    }
+
+    // Stage or unstage change `i`.
+    fn toggle(this: &Repo, i: int) {
+        let c = &this.changes.items[i];
+        if !staged(c) {
+            let a: [4]string = ["add", "-A", "--", c.path];
+            this.report(this.git(a[:]), "");
+        } else if this.hasCommits {
+            let a: [4]string = ["restore", "--staged", "--", c.path];
+            this.report(this.git(a[:]), "");
+        } else {
+            let a: [6]string = ["rm", "-r", "-q", "--cached", "--", c.path];
+            this.report(this.git(a[:]), "");
+        }
+    }
+
+    fn stageAll(this: &Repo) {
+        let a: [2]string = ["add", "-A"];
+        this.report(this.git(a[:]), "");
+    }
+
+    fn commit(this: &Repo, msg: string) {
+        if text.trim(msg).len == 0 { this.say("Write a commit message first", true); return; }
+        let a: [3]string = ["commit", "-m", msg];
+        this.report(this.git(a[:]), "Committed");
+    }
+
+    fn switchTo(this: &Repo, name: string) {
+        if name == this.branch { return; }
+        let a: [2]string = ["switch", name];
+        this.report(this.git(a[:]), "");
+    }
+
+    fn newBranch(this: &Repo, name: string) {
+        let n = text.trim(name);
+        if n.len == 0 { this.say("Name the branch first", true); return; }
+        let a: [3]string = ["switch", "-c", n];
+        this.report(this.git(a[:]), "");
+    }
+
+    // Show `path`'s diff (again: hide it).
+    fn showDiff(this: &Repo, path: string) {
+        let same = this.diffPath.str() == path;
+        this.diffPath.clear();
+        this.diff.clear();
+        if same { return; }
+        this.diffPath.pushStr(path);
+        this.readDiff();
+    }
+
+    fn push(this: &Repo) {
+        let a: [4]string = ["push", "-u", "origin", "HEAD"];
+        this.startAuthed(a[:], J_PUSH);
+    }
+
+    fn pull(this: &Repo) {
+        let a: [2]string = ["pull", "--ff-only"];
+        this.startAuthed(a[:], J_PULL);
+    }
+
+    // A new GitHub repository `name` from this one (origin), pushed.
+    fn publish(this: &Repo, name: string, desc: string, private: bool) {
+        let n = text.trim(name);
+        if n.len == 0 { this.say("Name the repository first", true); return; }
+        if !this.hasCommits { this.say("Commit something first", true); return; }
+        let argv = List<string>.new(this.mem);
+        argv.push("gh"); argv.push("repo"); argv.push("create"); argv.push(n);
+        if private { argv.push("--private"); } else { argv.push("--public"); }
+        argv.push("--source"); argv.push(this.top.str());
+        argv.push("--remote"); argv.push("origin"); argv.push("--push");
+        if text.trim(desc).len > 0 { argv.push("--description"); argv.push(text.trim(desc)); }
+        this.startJob(argv.items[0..argv.len], J_PUBLISH);
+    }
+
+    // Main, each frame: a finished background run shows its result.
+    fn poll(this: &Repo) {
+        if !this.job.finished() { return; }
+        let ok = this.job.code == 0;
+        if ok { this.say(DONE[this.job.what], false); } else { this.say(this.job.out, true); }
+        this.refresh();
+    }
+
+    fn startAuthed(this: &Repo, args: []string, what: int) {
+        let argv = List<string>.new(this.mem);
+        for a in AUTH { argv.push(a); }
+        argv.push("-C"); argv.push(this.top.str());
+        for a in args { argv.push(a); }
+        this.startJob(argv.items[0..argv.len], what);
+    }
+
+    fn startJob(this: &Repo, argv: []string, what: int) {
+        if this.job.start(argv, what) { this.say("Working…", false); }
+    }
+
+    // A local command ran: show its error (or `done`), then read everything again.
+    fn report(this: &Repo, r: Ran, done: string) {
+        if r.code != 0 {
+            let t = Text.new(this.mem).add(r.err).add(r.out);
+            this.say(t.str(), true);
+        } else { this.say(done, false); }
+        this.refresh();
+    }
+}

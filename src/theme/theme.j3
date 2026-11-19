@@ -1,0 +1,188 @@
+module jzero.theme.theme;
+
+use j3.game;
+use j3.game.Color;
+use j3.memory.{ Arena, List };
+
+// Terminal colors. Bundled themes are the tables below; custom ones are files in
+// `~/.config/jzero/themes/` (`import.j3`), listed after them. The chrome colors of a bundled
+// theme are the `.theme-<name>` block in ui/theme.css (CSS cannot read these); a custom theme
+// keeps the default (:root) chrome. Keep the two in step.
+pub const BUNDLED = 4;
+const NAMES: [4]string = ["tango", "catppuccin-mocha", "gruvbox-dark", "tokyonight"];
+const TITLES: [4]string = ["Tango", "Catppuccin Mocha", "Gruvbox Dark", "Tokyo Night"];
+
+// Color slots of a theme, as 0xRRGGBB: 0..15 the ANSI colors, then these.
+pub const SLOTS = 20;
+pub const BG = 16;
+pub const FG = 17;
+pub const SEL = 18;
+pub const CURSOR = 19;
+
+// Editor syntax colors after the theme slots: SYN + kind, in explorer grammar kind order.
+// Every theme starts from VS Code Dark+; `syntax-<kind>` config keys override them.
+pub const SYN = 20;
+pub const SYNTAX = 13;
+pub const ALL = 33;
+const SYNTAX_KEYS: [13]string = [
+    "syntax-comment", "syntax-string", "syntax-number", "syntax-keyword", "syntax-type", "syntax-function",
+    "syntax-constant", "syntax-builtin", "syntax-key", "syntax-section", "syntax-variable", "syntax-annotation",
+    "syntax-control",
+];
+const DARK_PLUS: [13]int = [
+    0x6a9955, 0xce9178, 0xb5cea8, 0x569cd6, 0x4ec9b0, 0xdcdcaa,
+    0x569cd6, 0x4ec9b0, 0x9cdcfe, 0x569cd6, 0x9cdcfe, 0xdcdcaa,
+    0xc586c0,
+];
+
+// 16 ANSI colors per theme, in NAMES order.
+const ANSI: [64]int = [
+    // tango (classic GNOME Terminal)
+    0x2e3436, 0xcc0000, 0x4e9a06, 0xc4a000, 0x3465a4, 0x75507b, 0x06989a, 0xd3d7cf,
+    0x555753, 0xef2929, 0x8ae234, 0xfce94f, 0x729fcf, 0xad7fa8, 0x34e2e2, 0xeeeeec,
+    // catppuccin-mocha
+    0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xbac2de,
+    0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
+    // gruvbox-dark
+    0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
+    0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+    // tokyonight
+    0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6,
+    0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
+];
+// Default background and foreground (the cursor uses the foreground); match --term-bg/--term-fg.
+const BG_OF: [4]int = [0x2e3436, 0x1e1e2e, 0x282828, 0x1a1b26];
+const FG_OF: [4]int = [0xd3d7cf, 0xcdd6f4, 0xebdbb2, 0xc0caf5];
+const SEL_OF: [4]int = [0x729fcf, 0x585b70, 0x665c54, 0x33467c];
+const SEL_ALPHA = 110;
+
+// The colors in use (ALL of them), and a counter bumped whenever they change.
+#[singleton] let PAL: [33]int = [
+    0x2e3436, 0xcc0000, 0x4e9a06, 0xc4a000, 0x3465a4, 0x75507b, 0x06989a, 0xd3d7cf,
+    0x555753, 0xef2929, 0x8ae234, 0xfce94f, 0x729fcf, 0xad7fa8, 0x34e2e2, 0xeeeeec,
+    0x2e3436, 0xd3d7cf, 0x729fcf, 0xd3d7cf,
+    0x6a9955, 0xce9178, 0xb5cea8, 0x569cd6, 0x4ec9b0, 0xdcdcaa,
+    0x569cd6, 0x4ec9b0, 0x9cdcfe, 0x569cd6, 0x9cdcfe, 0xdcdcaa,
+    0xc586c0,
+];
+#[singleton] let VERSION: int = 0;
+#[singleton] let APPLIED: int = 0;  // theme index in PAL (-1: none yet / forced)
+
+// Every theme there is: the bundled ones, then custom files, plus the config's color overrides.
+pub struct Themes {
+    names: List<string>;   // custom theme names (file names)
+    colors: List<int>;     // SLOTS per custom theme
+    over: List<int>;       // config overrides: slot, color, slot, color, ...
+
+    fn count(this: &Themes): int { return BUNDLED + this.names.len; }
+
+    fn name(this: &Themes, i: int): string {
+        if i < BUNDLED { return NAMES[i]; }
+        return this.names.items[i - BUNDLED];
+    }
+
+    fn title(this: &Themes, i: int): string {
+        if i < BUNDLED { return TITLES[i]; }
+        return this.names.items[i - BUNDLED];
+    }
+
+    fn byName(this: &Themes, name: string): int {
+        for i in 0..this.count() { if this.name(i) == name { return i; } }
+        return -1;
+    }
+
+    // A custom theme `name` with `cols` (SLOTS colors); a name already there is replaced.
+    fn add(this: &Themes, name: string, cols: []int) {
+        let at = this.byName(name);
+        if at >= 0 && at < BUNDLED { return; }
+        if at < 0 {
+            this.names.push(name);
+            for _ in 0..SLOTS { this.colors.push(0); }
+            at = this.count() - 1;
+        }
+        for k in 0..SLOTS { this.colors.items[(at - BUNDLED) * SLOTS + k] = cols[k]; }
+    }
+
+    // Slot `slot` of theme `i`.
+    fn color(this: &Themes, i: int, slot: int): int {
+        if i >= BUNDLED { return this.colors.items[(i - BUNDLED) * SLOTS + slot]; }
+        let c: [20]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        bundled(i, c[:]);
+        return c[slot];
+    }
+}
+
+pub fn create(mem: &Arena): Themes {
+    return Themes { names: List<string>.new(mem), colors: List<int>.new(mem), over: List<int>.new(mem) };
+}
+
+// The SLOTS colors of bundled theme `i` into `out` (a starting point for imports).
+pub fn bundled(i: int, out: []int) {
+    for k in 0..16 { out[k] = ANSI[i * 16 + k]; }
+    out[BG] = BG_OF[i];
+    out[FG] = FG_OF[i];
+    out[SEL] = SEL_OF[i];
+    out[CURSOR] = FG_OF[i];
+}
+
+// Show theme `i` of `ts` with the config overrides (nothing happens when it already shows).
+pub fn show(ts: &Themes, i: int) {
+    if i < 0 || i >= ts.count() || i == APPLIED { return; }
+    APPLIED = i;
+    for k in 0..SLOTS { PAL[k] = ts.color(i, k); }
+    for k in 0..SYNTAX { PAL[SYN + k] = DARK_PLUS[k]; }
+    let o = 0;
+    while o + 1 < ts.over.len {
+        if ts.over.items[o] < ALL { PAL[ts.over.items[o]] = ts.over.items[o + 1]; }
+        o += 2;
+    }
+    VERSION += 1;
+}
+
+// The next `show` applies even for the same theme (the theme list or overrides changed).
+pub fn invalidate() { APPLIED = -1; }
+
+// Changes whenever the colors do.
+pub fn version(): int { return VERSION; }
+
+// The chrome class suffix: a bundled theme's name, `custom` (the :root tokens) otherwise.
+pub fn cssName(): string {
+    if APPLIED >= 0 && APPLIED < BUNDLED { return NAMES[APPLIED]; }
+    return "custom";
+}
+
+// ANSI color `n` (0..15) of the current theme.
+pub fn ansi(n: int): int { return PAL[n]; }
+pub fn bg(): int { return PAL[BG]; }
+
+// Editor color of syntax kind `k`, and its config key (`syntax-<kind name>`).
+pub fn syntax(k: int): int { return PAL[SYN + k]; }
+pub fn syntaxKey(k: int): string { return SYNTAX_KEYS[k]; }
+pub fn syntaxName(k: int): string { return SYNTAX_KEYS[k][7..SYNTAX_KEYS[k].len]; }
+pub fn fg(): int { return PAL[FG]; }
+pub fn cursorRgb(): int { return PAL[CURSOR]; }
+
+// Underline of a Ctrl-hovered link: the bright blue of the palette.
+pub fn link(): Color { return withAlpha(ansi(12), 255); }
+
+// Outline cursor of an unfocused pane.
+pub fn cursor(): Color { return withAlpha(PAL[CURSOR], 255); }
+
+pub fn selection(): Color { return withAlpha(PAL[SEL], SEL_ALPHA); }
+
+// Search matches: yellow, the current one brighter.
+pub fn searchHit(current: bool): Color {
+    if current { return withAlpha(ansi(11), 150); }
+    return withAlpha(ansi(3), 90);
+}
+
+// Red: failed-command marks.
+pub fn danger(): Color { return withAlpha(ansi(1), 255); }
+
+// The background at `alpha` (dimming an unfocused pane, the bell flash uses the foreground).
+pub fn bgAlpha(alpha: int): Color { return withAlpha(bg(), alpha); }
+pub fn fgAlpha(alpha: int): Color { return withAlpha(fg(), alpha); }
+
+pub fn withAlpha(rgb: int, a: int): Color {
+    return game.rgba(u8((rgb >> 16) & 255), u8((rgb >> 8) & 255), u8(rgb & 255), u8(a));
+}

@@ -1,0 +1,185 @@
+module jzero.platform.fileops;
+
+use j3.io;
+use j3.io.IoError;
+use j3.memory.Arena;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.os;
+
+// File operations the explorer needs beyond `j3.io`: copy or move a file or a whole folder,
+// delete a folder tree, and the facts of the Properties dialog. Linux runs coreutils (`cp -a`
+// keeps modes and links); Windows has no such programs, so the same is done with `j3.io`.
+// Each returns "" when it worked, else what went wrong (in `mem`).
+
+pub fn copy(src: string, to: string, mem: &Arena): string {
+    if os.windows() { return if copyTree(src, to, mem) { "" } else { failed(mem, "Could not copy ", src) }; }
+    let argv: [5]string = ["cp", "-a", "--", src, to];
+    return run(argv[:], mem);
+}
+
+// Move `src` to `to` (never onto something that exists).
+pub fn move(src: string, to: string, mem: &Arena): string {
+    if !os.windows() {
+        let argv: [5]string = ["mv", "-n", "--", src, to];
+        return run(argv[:], mem);
+    }
+    if io.exists(to) { return failed(mem, "Already exists: ", to); }
+    match io.rename(src, to) {
+        Result.Ok(_) { return ""; }
+        Result.Err(_) {}
+    }
+    // Another drive: copy, then delete the original.
+    if !copyTree(src, to, mem) { return failed(mem, "Could not move ", src); }
+    removeTree(src, mem);
+    return if io.exists(src) { failed(mem, "Copied, but could not delete ", src) } else { "" };
+}
+
+// Delete `path` and everything in it (not to the trash).
+pub fn removeTree(path: string, mem: &Arena) {
+    if !os.windows() {
+        let argv: [3]string = ["rm", "-r", path];
+        proc.run(argv[:], "", mem);
+        return;
+    }
+    match io.listDir(path, mem) {
+        Result.Ok(entries) {
+            for e in entries {
+                let p = join(mem, path, e.name);
+                // A link goes as a link: what it points to is not ours to empty.
+                if e.isDir && !e.isLink { removeTree(p, mem); }
+                else if !isOk(io.remove(p)) { io.removeDir(p); }
+            }
+        }
+        Result.Err(_) {}
+    }
+    if !isOk(io.removeDir(path)) { io.remove(path); }
+}
+
+// The Properties dialog's values for `path`, one per line: type, size in bytes, permissions,
+// owner, group, modified, accessed (a line is empty when this OS does not say). "" on failure,
+// with the reason in `err`.
+pub fn facts(path: string, mem: &Arena, err: &Text): string {
+    if os.windows() {
+        match io.stat(path) {
+            Result.Ok(st) {
+                let t = Text.new(mem);
+                t.pushStr(if st.isDir { "Folder\n" } else { "File\n" });
+                t.pushInt(st.size);
+                t.pushStr("\n\n\n\n");
+                utcTime(&t, st.mtime);
+                t.pushStr("\n\n");
+                return t.str();
+            }
+            Result.Err(_) { err.pushStr("Cannot read it"); return ""; }
+        }
+    }
+    let argv: [5]string = ["stat", "-L", "-c", "%F\n%s\n%A (%a)\n%U\n%G\n%y\n%x", path];
+    match proc.run(argv[:], "", mem) {
+        Result.Ok(o) {
+            if o.code != 0 { err.pushStr(o.errStr()); return ""; }
+            return o.outStr();
+        }
+        Result.Err(_) { err.pushStr("stat not found"); return ""; }
+    }
+}
+
+// Unix seconds as `2026-11-17 09:30:05 UTC`.
+// ponytail: UTC, not local time (j3 has no time zone lookup).
+pub fn utcTime(t: &Text, secs: int) {
+    let days = secs / 86400;
+    let rem = secs - days * 86400;
+    if rem < 0 { rem += 86400; days -= 1; }
+    // Days since 1970 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 });
+    t.pushInt(y);
+    t.push(45); two(t, m);
+    t.push(45); two(t, d);
+    t.push(32); two(t, rem / 3600);
+    t.push(58); two(t, rem / 60 % 60);
+    t.push(58); two(t, rem % 60);
+    t.pushStr(" UTC");
+}
+
+fn two(t: &Text, n: int) {
+    if n < 10 { t.push(48); }
+    t.pushInt(n);
+}
+
+fn copyTree(src: string, to: string, mem: &Arena): bool {
+    match io.stat(src) {
+        Result.Ok(st) { if !st.isDir { return isOkInt(io.copyFile(src, to)); } }
+        Result.Err(_) { return false; }
+    }
+    io.makeDirs(to);
+    match io.listDir(src, mem) {
+        Result.Ok(entries) {
+            for e in entries {
+                if !copyTree(join(mem, src, e.name), join(mem, to, e.name), mem) { return false; }
+            }
+            return true;
+        }
+        Result.Err(_) { return false; }
+    }
+}
+
+fn isOk(r: Result<bool, IoError>): bool {
+    match r { Result.Ok(_) { return true; } Result.Err(_) { return false; } }
+}
+
+fn isOkInt(r: Result<int, IoError>): bool {
+    match r { Result.Ok(_) { return true; } Result.Err(_) { return false; } }
+}
+
+fn run(argv: []string, mem: &Arena): string {
+    match proc.run(argv, "", mem) {
+        Result.Ok(o) { if o.code != 0 { return o.errStr(); } return ""; }
+        Result.Err(_) { return failed(mem, "Not found: ", argv[0]); }
+    }
+}
+
+fn failed(mem: &Arena, what: string, path: string): string { return Text.new(mem).add(what).add(path).str(); }
+
+fn join(mem: &Arena, dir: string, name: string): string {
+    let t = Text.new(mem);
+    t.pushStr(dir);
+    if dir.len == 0 || dir[dir.len - 1] != 47 { t.push(47); }
+    t.pushStr(name);
+    return t.str();
+}
+
+// Self-check: dates; a folder copied, moved and removed in the temp folder.
+pub fn selfTest(mem: &Arena) {
+    let t = Text.new(mem);
+    utcTime(&t, 1794994205);
+    check(t.str() == "2026-11-18 09:30:05 UTC", t.str());
+    t.clear();
+    utcTime(&t, 951782400);
+    check(t.str() == "2000-02-29 00:00:00 UTC", t.str());
+    let dir = Text.new(mem);
+    os.testDir("files", &dir);
+    let a = join(mem, dir.str(), "a");
+    io.makeDirs(join(mem, a, "in"));
+    io.writeFile(join(mem, a, "in/f.txt"), "x" as []u8);
+    let b = join(mem, dir.str(), "b");
+    check(copy(a, b, mem) == "" && io.exists(join(mem, b, "in/f.txt")), "copy");
+    let c = join(mem, dir.str(), "c");
+    check(move(b, c, mem) == "" && io.exists(join(mem, c, "in/f.txt")) && !io.exists(b), "move");
+    let e = Text.new(mem);
+    check(facts(c, mem, &e).len > 0 && e.len() == 0, "facts");
+    removeTree(dir.str(), mem);
+    check(!io.exists(join(mem, c, "in/f.txt")), "remove files");
+    check(!io.exists(dir.str()), "remove");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`fileops selfTest: {what}`); } }

@@ -1,0 +1,100 @@
+module jzero.explorer.highlight;
+
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.sys;
+use j3.text.Text;
+use j3.ui.spans.Span;
+use jzero.explorer.markdown;
+use jzero.explorer.syntax.grammar;
+use jzero.explorer.syntax.lex;
+use jzero.explorer.syntax.registry;
+use jzero.theme.theme;
+
+// The explorer editor's colors: `SPAN_COLOR` spans from the file type's grammar
+// (`explorer/syntax/`, `assets/syntax/*.syntax`), markdown by `markdown.j3`.
+
+pub const MAX_BYTES = 262144;  // bigger files show plain (rebuilt on every edit)
+
+pub struct Highlighter {
+    colors: List<string>;  // by kind, for `themeAt`; slices of `colorBuf`
+    colorBuf: Text;        // `#rrggbb` per kind, refilled in place
+    themeAt: int = -1;
+    grammarsAt: int = -1;  // registry version the spans were made with
+    out: List<Span>;
+
+    // Spans for `text` of a file named `name` (empty when too big).
+    fn spans(this: &Highlighter, text: string, name: string): []Span {
+        this.out.len = 0;
+        this.grammarsAt = registry.version();
+        if text.len > MAX_BYTES { return this.out.items[0..0]; }
+        if this.themeAt != theme.version() { this.loadColors(); }
+        let cs = this.colors.items[0..this.colors.len];
+        if isMarkdown(name) { markdown.spans(text, &this.out, cs); }
+        else { match registry.forFile(name) { Option.Some(g) { lex.spans(g, text, &this.out, cs); } Option.None {} } }
+        return this.out.items[0..this.out.len];
+    }
+
+    // The theme or the grammars changed since the last `spans`.
+    fn stale(this: &Highlighter): bool { return this.themeAt != theme.version() || this.grammarsAt != registry.version(); }
+
+    fn loadColors(this: &Highlighter) {
+        this.themeAt = theme.version();
+        this.colors.len = 0;
+        this.colorBuf.clear();
+        for k in 0..grammar.KINDS {
+            this.colorBuf.push(35);
+            hex6(theme.syntax(k), &this.colorBuf);
+        }
+        let all = this.colorBuf.str();  // sliced after filling: the first fill may move it
+        for k in 0..grammar.KINDS { this.colors.push(all[k * 7..k * 7 + 7]); }
+    }
+}
+
+pub fn create(mem: &Arena): Highlighter {
+    return Highlighter { colors: List<string>.new(mem), colorBuf: Text.new(mem), out: List<Span>.new(mem) };
+}
+
+fn isMarkdown(name: string): bool {
+    let n = name.len;
+    return (n > 3 && name[n - 3..n] == ".md") || (n > 9 && name[n - 9..n] == ".markdown");
+}
+
+fn hex6(rgb: int, t: &Text) {
+    let digits = "0123456789abcdef";
+    let sh = 20;
+    while sh >= 0 {
+        t.push(digits[(rgb >> sh) & 15]);
+        sh -= 4;
+    }
+}
+
+// Self-check: bundled grammars (J3, Python, TOML, JSON, shell) color what they should.
+pub fn selfTest(mem: &Arena) {
+    let h = create(mem);
+    h.loadColors();
+    let letters = "csnktfobyxvar";
+    for k in 0..grammar.KINDS { h.colors.items[k] = letters[k..k + 1]; }  // Dark+ repeats colors; tell kinds apart
+    check(kinds(&h, "let x = \"hi\" // note\nFoo 42", "a.j3") == "let:k x:v \"hi\":s // note:c Foo:t 42:n ", "j3 basics");
+    check(kinds(&h, "fn go(a: int) { return go(1); }", "a.j3") == "fn:k go:f a:v int:t return:r go:f 1:n ", "j3 fn, call, type, control");
+    check(kinds(&h, "# c\n@dec\ndef f(): return None", "x.py") == "# c:c @dec:a def:k f:f return:r None:o ", "python");
+    check(kinds(&h, "[a]\nk = \"v\" # c", "x.toml") == "[a]:x k:y \"v\":s # c:c ", "toml");
+    check(kinds(&h, "{\"k\": true}", "x.json") == "\"k\":y true:o ", "json");
+    check(kinds(&h, "X=1 echo $HOME a#b # c", "x.sh") == "X:y 1:n echo:b $HOME:v # c:c ", "shell");
+    check(kinds(&h, "x", "Makefile") != "?", "file names");
+}
+
+// `text:letter ` per span (letters: c s n k t f o b y x v a r by kind).
+fn kinds(h: &Highlighter, src: string, name: string): string {
+    let t = Text.new(h.out.arena);
+    let sp = h.spans(src, name);
+    for s in sp {
+        t.pushStr(src[s.start..s.start + s.len]);
+        t.push(58);
+        for k in 0..grammar.KINDS { if s.data == h.colors.items[k] { t.pushStr(h.colors.items[k]); break; } }
+        t.push(32);
+    }
+    return t.str();
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`highlight selfTest: {what}`); } }

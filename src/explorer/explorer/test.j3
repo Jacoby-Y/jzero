@@ -1,0 +1,131 @@
+module jzero.explorer.explorer;
+
+// Explorer part: the self-check (`JZERO_SELFTEST=1`).
+
+// Self-check on a temp folder: listing order, expand/collapse, edit and save, replace.
+pub fn selfTest(mem: &Arena) {
+    let dir = Text.new(mem);
+    os.testDir("explorer", &dir);
+    let sub = Text.new(mem);
+    sub.pushStr(dir.str());
+    sub.pushStr("/sub");
+    io.makeDirs(sub.str());
+    let f = Text.new(mem);
+    f.pushStr(dir.str());
+    f.pushStr("/b.txt");
+    io.writeFile(f.str(), "one two one" as []u8);
+    let g = Text.new(mem);
+    g.pushStr(sub.str());
+    g.pushStr("/inner.txt");
+    io.writeFile(g.str(), "x" as []u8);
+    let h = Text.new(mem);
+    h.pushStr(dir.str());
+    h.pushStr("/.hidden");
+    io.writeFile(h.str(), "" as []u8);
+    let slot = &mem.alloc::<Arena>(1)[0];
+    let e = create(slot, dir.str(), false);
+    e.refresh();
+    check(e.rows.len == 2 && e.rows.items[0].name == "sub" && e.rows.items[1].name == "b.txt", "list");
+    e.toggleHidden();
+    check(e.rows.len == 3 && e.rows.items[1].name == ".hidden", "hidden shown");
+    e.toggleHidden();
+    // git status: a repo with an untracked folder and a modified file.
+    let gi: [4]string = ["git", "-C", dir.str(), "init"];
+    proc.run(gi[:], "", mem);
+    if e.gitTop.len() == 0 { e.refresh(); }
+    if e.gitTop.len() > 0 {
+        check(e.gitOf(g.str(), false) == GIT_UNTRACKED && e.rows.items[0].git == GIT_UNTRACKED, "git untracked");
+    }
+    e.selected = 1;
+    e.openInEditor();
+    check(e.editRequest.str() == f.str(), "edit request");
+    e.activate(0);
+    check(e.rows.len == 3 && e.rows.items[1].name == "inner.txt" && e.rows.items[1].depth == 1, "expand");
+    e.refresh();
+    check(e.rows.len == 3, "refresh keeps open folders");
+    e.activate(0);
+    check(e.rows.len == 2, "collapse");
+    e.activate(1);
+    check(e.mode == EDIT && e.text == "one two one", "open");
+    e.find = "one";
+    check(e.findCount() == 2, "find");
+    e.replace = "1";
+    e.find = "1";
+    check(e.nextMatch(0) == -1, "no match");
+    e.find = "one";
+    e.replaceAll();
+    check(e.text == "1 two 1" && e.dirty(), "replace");
+    e.find = "1";
+    check(e.nextMatch(0) == 0 && e.nextMatch(1) == 6 && e.nextMatch(7) == 0, "next match wraps");
+    e.save();
+    check(!e.dirty(), "save");
+    e.text = "auto";
+    e.message.clear();
+    e.autosave();
+    check(!e.dirty() && e.message.len() == 0, "autosave");
+    // markdown: a [[wikilink]] opens the note beside the open file, rendered.
+    let c = Text.new(mem);
+    c.pushStr(dir.str());
+    c.pushStr("/c d.md");
+    io.writeFile(c.str(), "# C\n- [ ] t" as []u8);
+    e.follow("c%20d", true);
+    check(e.file.str() == c.str() && e.kind == kinds.MARKDOWN && e.previewing() && e.doc.blocks.len == 2, "wikilink opens preview");
+    e.toggleTask(e.doc.blocks.items[1].checkAt);
+    check(e.text == "# C\n- [x] t" && !e.dirty() && e.doc.blocks.items[1].check == 1, "task toggles and saves");
+    // watching: a file made outside shows in the tree; the open file follows edits on disk unless dirty.
+    drain(&e);
+    let n0 = e.rows.len;
+    let nf = Text.new(mem);
+    nf.pushStr(dir.str());
+    nf.pushStr("/new.txt");
+    io.writeFile(nf.str(), "" as []u8);
+    settle(&e);
+    check(e.rows.len == n0 + 1, "watch: new file listed");
+    io.writeFile(c.str(), "# D" as []u8);
+    settle(&e);
+    check(e.text == "# D" && !e.dirty(), "watch: open file reloads");
+    e.text = "mine";
+    io.writeFile(c.str(), "# E" as []u8);
+    settle(&e);
+    check(e.text == "mine" && e.message.len() > 0, "watch: unsaved edits kept");
+    // picking, row info, copy/paste with a free name.
+    e.back();
+    e.refresh();
+    let rows = e.rows.len;
+    check(!e.press(1, 0) && e.press(1, 0), "double click");
+    e.press(1, 0);
+    e.press(rows - 1, mods.SHIFT);
+    check(e.pickCount() == rows - 1 && !e.picked(0), "shift range");
+    e.press(2, mods.CTRL);
+    check(e.pickCount() == rows - 2 && !e.picked(2), "ctrl toggles");
+    e.press(0, 0);
+    check(e.rows.items[0].isDir && e.info(0) == "1 item", "folder info");
+    let hs = Text.new(mem);
+    humanSize(&hs, 512);
+    hs.push(124);
+    humanSize(&hs, 4300);
+    hs.push(124);
+    humanSize(&hs, 52428800);
+    check(hs.str() == "512 B|4.2 KB|50 MB", "human size");
+    e.showProps(0);
+    check(e.propLines.len >= 3 && propPart(e.propLines.items[0], 1) == "sub", "properties");
+    close(&e);
+    fileops.removeTree(dir.str(), mem);
+}
+
+// Take in what the watcher has seen. Linux reports a change at once; Windows a moment later,
+// so wait for the first report (3 s at most), then for the rest of it.
+fn settle(e: &Explorer) {
+    let until = sys.monotonicMs() + (if os.windows() { 3000 } else { 0 });
+    while sys.monotonicMs() < until && !e.pollWatch() {}
+    drain(e);
+}
+
+// Take in reports still on their way (Windows: for 300 ms).
+fn drain(e: &Explorer) {
+    e.pollWatch();
+    let until = sys.monotonicMs() + (if os.windows() { 300 } else { 0 });
+    while sys.monotonicMs() < until { e.pollWatch(); }
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`explorer selfTest: {what}`); } }

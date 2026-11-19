@@ -1,0 +1,50 @@
+module jzero.util.resize;
+
+use j3.game;
+use j3.game.Mouse;
+
+// A centered modal's size, dragged from its corner grip: each side moves by the drag, so the
+// box grows both ways and stays centered (the dialog centers itself). Kept inside the window.
+pub struct Resize {
+    w: f32;
+    h: f32;
+    minW: f32;
+    minH: f32;
+    on: bool = false;
+    sx: f32 = 0.0;   // pointer and size at the grab
+    sy: f32 = 0.0;
+    sw: f32 = 0.0;
+    sh: f32 = 0.0;
+}
+
+extend Resize {
+    // The grip was pressed (`on:mousedown`).
+    fn grab(this: &Resize) {
+        let p = game.mousePos();
+        this.on = true;
+        this.sx = p.x;
+        this.sy = p.y;
+        this.sw = this.w;
+        this.sh = this.h;
+    }
+
+    // Each frame: follow the pointer while the button is held.
+    fn step(this: &Resize) {
+        if !this.on { return; }
+        if !game.mouseDown(Mouse.Left) { this.on = false; return; }
+        let p = game.mousePos();
+        let win = game.windowSize();
+        this.w = clamp(this.sw + 2.0 * (p.x - this.sx), this.minW, win.x - 16.0);
+        this.h = clamp(this.sh + 2.0 * (p.y - this.sy), this.minH, win.y - 16.0);
+    }
+}
+
+pub fn create(w: f32, h: f32, minW: f32, minH: f32): Resize {
+    return Resize { w: w, h: h, minW: minW, minH: minH };
+}
+
+fn clamp(v: f32, lo: f32, hi: f32): f32 {
+    if v > hi { v = hi; }
+    if v < lo { v = lo; }
+    return v;
+}

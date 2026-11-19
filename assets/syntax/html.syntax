@@ -1,0 +1,13 @@
+# HTML, XML, SVG, and markup like .j3ui
+name = HTML
+ext = html htm xhtml xml svg xsl plist j3ui vue svelte
+comment = <!-- -->
+region = annotation <? ?> multiline
+region = annotation <!DOCTYPE >
+string = " " multiline
+string = ' ' multiline
+prefix = keyword </
+prefix = keyword <
+prefix = constant &
+word-chars = -:
+key = = anywhere

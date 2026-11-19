@@ -1,0 +1,96 @@
+module jzero.term.session;
+
+// Session part: completing `0 <name>` at a shell prompt. While the typed line is `0 <letters>`,
+// the best JZero commands (`features/zerocmds.j3`) show under the cursor and Tab types the
+// first one.
+
+extend Session {
+    // Where the user's input starts: the cursor at the first key after a new prompt.
+    // ponytail: a prompt redrawn without a new 133;A (Ctrl+L) loses it until the next prompt.
+    fn noteInputStart(this: &Session) {
+        let m = this.lastMark();
+        if !this.tap.atPrompt || m < 0 || m == this.inMark { return; }
+        this.inMark = m;
+        this.inX = this.grid.cursorX();
+        this.inLine = this.grid.scrollbackLen() + this.grid.cursorY();
+    }
+
+    fn lastMark(this: &Session): int {
+        if this.tap.marks.len == 0 { return -1; }
+        return this.tap.marks.items[this.tap.marks.len - 1];
+    }
+
+    // The matches for the line typed so far (`zeroHits`; none unless it is `0 <name>`).
+    fn findZero(this: &Session) {
+        this.zeroHits.len = 0;
+        this.zeroQ.clear();
+        if this.isCommand || !this.tap.atPrompt || this.grid.altScreen() || this.view.off(&this.grid) != 0 { return; }
+        if this.inMark != this.lastMark() || this.grid.scrollbackLen() + this.grid.cursorY() != this.inLine { return; }
+        let cx = this.grid.cursorX();
+        if cx <= this.inX + 2 { return; }
+        let t = Text.scratch();
+        let cells = this.grid.rowCells(this.grid.cursorY());
+        if cx > cells.len { return; }
+        lineText(t, cells[this.inX..cx], false);
+        let s = t.str();
+        if s.len < 3 || s[0] != 48 || s[1] != 32 { return; }
+        let q = s[2..s.len];
+        for i in 0..q.len { if q[i] == 32 { return; } }
+        this.zeroQ.pushStr(q);
+        this.zero.find(q, &this.zeroHits);
+    }
+
+    // Tab while matches show: the rest of the first one, then a space (the typed part is
+    // erased first when it is not a prefix of it).
+    fn completeZero(this: &Session) {
+        if this.zeroHits.len == 0 || this.out.str() != "\t" { return; }
+        let name = this.zero.field(this.zeroHits.items[0], 0);
+        let q = this.zeroQ.str();
+        this.out.clear();
+        if name.len >= q.len && name[0..q.len] == q {
+            this.out.pushStr(name[q.len..name.len]);
+        } else {
+            for _ in 0..q.len { this.out.push(127); }
+            this.out.pushStr(name);
+        }
+        this.out.push(32);
+    }
+
+    // The matches, one per row under the cursor (above it near the bottom): name, then the
+    // description dimmed. The first one (what Tab types) is highlighted.
+    fn drawZero(this: &Session, px: f32, py: f32, w: f32) {
+        let n = this.zeroHits.len;
+        if n == 0 { return; }
+        let cw = f32(this.view.cellW);
+        let ch = f32(this.view.cellH);
+        let nameW = 0;
+        for i in 0..n { nameW = maxI(nameW, this.zero.field(this.zeroHits.items[i], 0).len); }
+        let boxW: f32 = 0.0;
+        for i in 0..n {
+            let k = this.zeroHits.items[i];
+            let rowW = f32(nameW + 3) * cw + game.textSize(this.view.font, this.zero.field(k, 2)).x + 2.0 * cw;
+            boxW = maxF(boxW, rowW);
+        }
+        let x = px + f32(this.inX) * cw;
+        if x + boxW > w { x = maxF(0.0, w - boxW); }
+        let row = this.grid.cursorY() + 1;
+        if row + n > this.grid.rows() { row = this.grid.cursorY() - n; }
+        let y = py + f32(row) * ch;
+        game.setColor(theme.withAlpha(theme.bg(), 255));
+        game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: boxW, y: f32(n) * ch });
+        game.setColor(theme.fgAlpha(24));
+        game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: boxW, y: f32(n) * ch });
+        game.setColor(theme.selection());
+        game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: boxW, y: ch });
+        for i in 0..n {
+            let k = this.zeroHits.items[i];
+            let ry = y + f32(i) * ch;
+            game.setColor(theme.withAlpha(theme.fg(), 255));
+            game.drawText(this.view.font, Vec2 { x: x + cw, y: ry }, this.zero.field(k, 0));
+            game.setColor(theme.fgAlpha(150));
+            game.drawText(this.view.font, Vec2 { x: x + f32(nameW + 3) * cw, y: ry }, this.zero.field(k, 2));
+        }
+    }
+}
+
+fn maxI(a: int, b: int): int { if a > b { return a; } return b; }

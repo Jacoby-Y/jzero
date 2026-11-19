@@ -1,0 +1,13 @@
+# Fallback for files no other grammar claims.
+name = Generic
+ext = *
+comment = //
+comment = /* */
+comment = # alone
+string = " " escape
+string = ' ' escape
+keyword = fn func function def lambda class struct enum trait impl interface type let const var mut pub static package mod module in new self this async await
+control = if else elif for while do loop return break continue match case switch default use import from export try catch finally throw
+constant = true false null nil None True False
+call = true
+capitalized = type

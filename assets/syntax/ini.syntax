@@ -1,0 +1,11 @@
+# INI-style config: .ini, .conf, systemd units, .desktop, .env, git and ssh config
+name = INI
+ext = ini conf cfg cnf properties desktop service socket timer mount target path env editorconfig gitconfig gitmodules npmrc
+file = .env .gitconfig .gitmodules .editorconfig .npmrc config
+comment = # alone
+comment = ; start
+string = " " escape
+region = section [ ] start
+constant = true false yes no on off
+word-chars = -.
+key = =

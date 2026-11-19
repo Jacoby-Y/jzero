@@ -1,0 +1,124 @@
+module jzero.term.session;
+
+// Session part: the pointer (selection, links, Alt+click, dropped files).
+
+extend Session {
+    // Left press, drag and release select text, unless the program wants the mouse (Shift
+    // overrides). `m` is grid-local; `inCanvas` the pointer is over the pane.
+    fn mouseSelect(this: &Session, m: Vec2, w: f32, h: f32, inCanvas: bool) {
+        let inside = inCanvas && m.x < w && m.y < h;
+        let held = mods.held();
+        let programMouse = (this.grid.modes & MODE_MOUSE_ANY) != 0 && (held & mods.SHIFT) == 0;
+        let col = clampI(int(maxF(m.x, 0.0) / f32(this.view.cellW)), 0, this.grid.cols());
+        let y = m.y;
+        if y < 0.0 { y = 0.0; }
+        if y > h - 1.0 { y = h - 1.0; }
+        if inCanvas { this.dropFile(); }
+        if this.hoverLink(m, inside, col) { return; }
+        if game.mousePressed(Mouse.Left) && inside && (held & mods.ALT) != 0 && !programMouse {
+            this.moveCursorTo(this.lineAt(m.y), col);
+            return;
+        }
+        if game.mousePressed(Mouse.Left) && inside && !programMouse {
+            this.sel.press(&this.grid, this.lineAt(m.y), col, game.ticks());
+            // A tap can press and release in one frame; no later frame may come to see the release.
+            if !game.mouseDown(Mouse.Left) { this.sel.release(); }
+            if this.sel.on { this.toPrimary(); }  // a double or triple click selects at once
+        } else if this.sel.dragging {
+            // A new press (in another pane) means this drag's release was missed.
+            if game.mouseDown(Mouse.Left) && !game.mousePressed(Mouse.Left) {
+                this.dragScroll(m.y, h);
+                this.sel.drag(&this.grid, this.lineAt(y), col);
+            }
+            else {
+                this.sel.release();
+                if this.sel.on { this.toPrimary(); }
+            }
+        }
+        if game.mousePressed(Mouse.Middle) && inside && !programMouse { this.pasteText(game.primarySelection()); }
+    }
+
+    // Mouse motion to a program that asked for it (`?1002` drags, `?1003` all motion), once per
+    // cell; the View sends presses, releases and the wheel. Off the grid it reports the edge cell.
+    fn reportMotion(this: &Session, m: Vec2, w: f32, h: f32) {
+        let btn = MB_NONE;
+        if game.mouseDown(Mouse.Left) { btn = MB_LEFT; }
+        else if game.mouseDown(Mouse.Middle) { btn = MB_MIDDLE; }
+        else if game.mouseDown(Mouse.Right) { btn = MB_RIGHT; }
+        // The click that focused this pane never reached the program: no drag until it's released.
+        if this.focusClick { this.focusClick = btn != MB_NONE; }
+        let inside = m.x >= 0.0 && m.y >= 0.0 && m.x < w && m.y < h;
+        if this.focusClick || (this.grid.modes & MODE_MOUSE_ANY) == 0 || (!inside && btn == MB_NONE) { this.motionCell = -1; return; }
+        let x = clampI(int(maxF(m.x, 0.0) / f32(this.view.cellW)), 0, this.grid.cols() - 1);
+        let y = clampI(int(maxF(m.y, 0.0) / f32(this.view.cellH)), 0, this.grid.rows() - 1);
+        let cell = y * this.grid.cols() + x;
+        if cell == this.motionCell { return; }
+        let first = this.motionCell < 0;
+        this.motionCell = cell;
+        if first { return; }  // just entered: the press (if any) is the View's
+        let held = mods.held();
+        let md = 0;
+        if (held & mods.SHIFT) != 0 { md |= MOD_SHIFT; }
+        if (held & mods.ALT) != 0 { md |= MOD_ALT; }
+        if (held & mods.CTRL) != 0 { md |= MOD_CTRL; }
+        let t = Text.scratch();
+        encodeMouse(btn, MA_MOVE, x, y, md, this.grid.modes, t);
+        if t.len() > 0 { this.write(t.bytes[0..t.len()]); }
+    }
+
+    // Dragging a selection above or below the pane scrolls, faster the farther out the pointer is.
+    fn dragScroll(this: &Session, y: f32, h: f32) {
+        let cell = f32(this.view.cellH);
+        let lines = 0;
+        if y < 0.0 { lines = 1 + int((0.0 - y) / cell); }
+        else if y > h { lines = 0 - 1 - int((y - h) / cell); }
+        if lines == 0 || game.ticks() - this.dragScrollAt < DRAG_SCROLL_MS { return; }
+        this.dragScrollAt = game.ticks();
+        this.view.scroll(&this.grid, lines);
+        game.wakeAt(this.dragScrollAt + DRAG_SCROLL_MS);  // keep going while the pointer sits still
+    }
+
+    // Alt+click on the line being edited at a prompt: move the shell's cursor there with arrow keys.
+    fn moveCursorTo(this: &Session, line: int, col: int) {
+        if !this.tap.atPrompt || this.grid.altScreen() || this.view.off(&this.grid) != 0 { return; }
+        if line != this.grid.scrollbackLen() + this.grid.cursorY() { return; }
+        let d = col - this.grid.cursorX();
+        let key: u8 = 67;  // ESC [ C: right
+        if d < 0 { key = 68; d = 0 - d; }
+        for _ in 0..d { this.out.push(27); this.out.push(91); this.out.push(key); }
+        this.write(this.out.bytes[0..this.out.len()]);
+        this.out.clear();
+    }
+
+    // A file dropped on the pane from another app: paste its quoted path.
+    fn dropFile(this: &Session) {
+        let path = game.droppedFile();
+        if path.len == 0 { return; }
+        this.pastePath(path);
+    }
+
+    // `path` shell-quoted (and a space) at the prompt, like typing it.
+    fn pastePath(this: &Session, path: string) {
+        let t = Text.scratch();
+        quote(path, t);
+        t.push(32);
+        this.pasteText(t.str());
+    }
+
+    // Ctrl + hover marks the link under the pointer; Ctrl + click opens it (true: the click
+    // was taken).
+    fn hoverLink(this: &Session, m: Vec2, inside: bool, col: int): bool {
+        this.linkLine = -1;
+        if !inside || (mods.held() & mods.CTRL) == 0 { return false; }
+        let line = this.lineAt(m.y);
+        let uri = Text.scratch();
+        let r = links.at(&this.grid, line, col, uri);
+        if r[1] <= r[0] { return false; }
+        this.linkLine = line;
+        this.linkLo = r[0];
+        this.linkHi = r[1];
+        if !game.mousePressed(Mouse.Left) { return false; }
+        links.open(uri.str(), this.mem);
+        return true;
+    }
+}

@@ -1,0 +1,20 @@
+# J3 (.j3) and J3 scripts (.j3s)
+name = J3
+ext = j3 j3s
+comment = //
+comment = /* */
+string = " " escape
+string = ` ` escape multiline
+region = string ' ' char
+prefix = annotation #[
+prefix = annotation @
+keyword = module use lib as pub fn struct enum const let operator this props shared trait impl
+control = if else while for in match return break continue defer
+plain = variable
+type = void bool int i8 i16 i32 i64 u8 u16 u32 u64 f16 f32 f64 float ptr cstr string vec4f vec4i
+constant = true false null
+builtin = Option Result Some None Ok Err List Arena Text Map
+after = function fn
+after = type struct enum trait
+call = true
+capitalized = type

@@ -1,0 +1,127 @@
+module jzero.features.zerocmds;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.config.config;
+use jzero.features.palette;
+use jzero.platform.shells;
+use jzero.term.shellsetup;
+
+pub const SHOWN = 5;  // matches offered while typing `0 <name>`
+
+// The JZero commands in `<config>/commands.sh`, for completing `0 <name>` at a prompt. Read
+// through `0 --list` (one parser, in the script) when the file changes, checked once a second.
+pub struct ZeroCmds {
+    mem: &Arena;           // own arena, emptied on each reload
+    list: Text;            // `name<TAB>mode<TAB>desc` lines
+    starts: List<int>;     // byte offset of each line in `list`
+    mtime: int = -2;
+    checkedAt: int = -100000;
+
+    // Re-read the list when the file changed (at most once a second).
+    fn refresh(this: &ZeroCmds, nowMs: int) {
+        if nowMs - this.checkedAt < 1000 { return; }
+        this.checkedAt = nowMs;
+        let m = -1;
+        match io.stat(file()) {
+            Result.Ok(e) { m = e.mtime; }
+            Result.Err(_) {}
+        }
+        if m == this.mtime { return; }
+        this.mtime = m;
+        if m == -1 { this.set(""); return; }  // no file, no commands: nothing to run
+        let mem = Arena.create(65536);
+        let argv = List<string>.new(&mem);
+        shellsetup.zero(&mem, &argv);
+        argv.push("--list");
+        let out = "";
+        match proc.run(argv.items[0..argv.len], "", &mem) {
+            Result.Ok(o) { out = o.outStr(); }
+            Result.Err(_) {}
+        }
+        this.set(out);
+        mem.destroy();
+    }
+
+    fn set(this: &ZeroCmds, lines: string) {
+        this.mem.rewind(0);  // drops the old buffers (their blocks get reused)
+        this.list = Text.new(this.mem);
+        this.starts = List<int>.new(this.mem);
+        this.list.pushStr(lines);
+        let s = this.list.str();
+        let start = 0;
+        for i in 0..s.len {
+            if s[i] == 10 { this.starts.push(start); start = i + 1; }
+        }
+    }
+
+    fn count(this: &ZeroCmds): int { return this.starts.len; }
+
+    // Field `f` (0 name, 1 mode, 2 description) of command `k`.
+    fn field(this: &ZeroCmds, k: int, f: int): string {
+        let s = this.list.str();
+        let i = this.starts.items[k];
+        let n = 0;
+        while n < f {
+            while i < s.len && s[i] != 9 && s[i] != 10 { i += 1; }
+            if i >= s.len || s[i] == 10 { return ""; }
+            i += 1;
+            n += 1;
+        }
+        let j = i;
+        while j < s.len && s[j] != 9 && s[j] != 10 { j += 1; }
+        return s[i..j];
+    }
+
+    // The best `SHOWN` commands for `q` into `out` (indices, best first): names starting with
+    // `q` first, then fuzzy matches (`palette.score`); ties keep file order.
+    fn find(this: &ZeroCmds, q: string, out: &List<int>) {
+        let best: [6]int = [0, 0, 0, 0, 0, 0];  // SHOWN + 1
+        let bs: [6]int = [0, 0, 0, 0, 0, 0];
+        let n = 0;
+        for k in 0..this.count() {
+            let name = this.field(k, 0);
+            let sc = palette.score(name, q);
+            if sc < 0 { continue; }
+            if name.len >= q.len && name[0..q.len] == q { sc += 100000; }
+            let at = n;
+            while at > 0 && bs[at - 1] < sc { best[at] = best[at - 1]; bs[at] = bs[at - 1]; at -= 1; }
+            best[at] = k;
+            bs[at] = sc;
+            if n < SHOWN { n += 1; }
+        }
+        out.len = 0;
+        for i in 0..n { out.push(best[i]); }
+    }
+}
+
+pub fn create(parent: &Arena): ZeroCmds {
+    let mem = &parent.alloc::<Arena>(1)[0];
+    *mem = Arena.create(8192);
+    return ZeroCmds { mem: mem, list: Text.new(mem), starts: List<int>.new(mem) };
+}
+
+fn file(): string {
+    let t = config.dir();
+    t.push(47);
+    t.pushStr(shells.commandsName());
+    return t.str();
+}
+
+// Self-check: fields, prefix before fuzzy, at most SHOWN.
+pub fn selfTest(mem: &Arena) {
+    let z = create(mem);
+    z.set("deploy\tsplit\tShip it\nlogs\tbg\t\ndev\tinline\tDev server\nd1\ti\t\nd2\ti\t\nd3\ti\t\nadd\ti\t\n");
+    check(z.count() == 7 && z.field(0, 2) == "Ship it" && z.field(1, 2) == "" && z.field(2, 1) == "inline", "fields");
+    let out = List<int>.new(mem);
+    z.find("de", &out);
+    check(out.len == 2 && out.items[0] == 0 && out.items[1] == 2, "prefix");
+    z.find("d", &out);
+    check(out.len == SHOWN && z.field(out.items[SHOWN - 1], 0) != "add", "top 5");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`zerocmds selfTest: {what}`); } }

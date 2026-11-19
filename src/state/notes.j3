@@ -1,0 +1,96 @@
+module jzero.state;
+
+// State part: notes. The notes view (taskbar button above settings) is an explorer rooted at the
+// notes folder (config `notes-dir`, default `<data>/notes`), shown beside its editor in place of
+// the ocean or island. "Turn into note" (right-click a shell) picks a note and turns the pane
+// into an explorer pane open on it. Notes autosave.
+
+extend State {
+    // The notes folder (frame scratch when it is the default).
+    fn notesDir(this: &State): string {
+        if this.cfg.notesDir.len > 0 { return this.cfg.notesDir; }
+        return paths.notes();
+    }
+
+    // The notes view follows the zoom of the island behind it.
+    fn notesScale(this: &State): f32 {
+        if this.active == OCEAN { return 1.0; }
+        return this.zoomScale(this.islands.get(this.active));
+    }
+
+    fn toggleNotes(this: &State) {
+        if this.notesOpen { this.hideNotes(); return; }
+        this.hideKanban();
+        if this.notes.root.len() == 0 {
+            let dir = this.notesDir();
+            io.makeDirs(dir);
+            this.notes.root.pushStr(dir);
+            this.notes.showHidden = this.cfg.explorerHidden;
+            this.notes.notesDir.pushStr(dir);
+        }
+        this.notes.refresh();
+        this.notesOpen = true;
+    }
+
+    fn hideNotes(this: &State) {
+        this.notes.autosave();
+        this.notesOpen = false;
+    }
+
+    // "Turn into note": list the notes (paths relative to the notes folder) and show the picker.
+    fn openNotePick(this: &State) {
+        if !this.focusedShell() { return; }
+        this.noteMem.destroy();
+        *this.noteMem = Arena.create(65536);
+        this.noteList = List<string>.new(this.noteMem);
+        let dir = Text.new(this.noteMem);
+        dir.pushStr(this.notesDir());
+        io.makeDirs(dir.str());
+        gatherNotes(dir.str(), dir.len() + 1, &this.noteList, this.noteMem);
+        sort.strings(this.noteList.items[0..this.noteList.len]);
+        this.notePickOpen = true;
+    }
+
+    // A note was picked (`rel` from `noteList`): turn the focused shell into it, or ask first.
+    fn pickNote(this: &State, rel: string) {
+        this.notePickOpen = false;
+        if this.active == OCEAN { return; }
+        let leaf = this.islands.get(this.active).panes.focus;
+        if leaf < 0 { return; }
+        this.askNote.clear();
+        this.askNote.pushStr(this.notesDir());
+        this.askNote.push(47);
+        this.askNote.pushStr(rel);
+        let what = this.paneBusy(this.islands.get(this.active).panes.get(leaf));
+        if what.len == 0 { this.notePane(this.active, leaf); return; }
+        this.askAbout(ASK_NOTE, this.active, leaf, what);
+    }
+
+    // Turn leaf `leaf` of island `i` (a shell) into an explorer open on `askNote`. One-way.
+    fn notePane(this: &State, i: int, leaf: int) {
+        let n = this.islands.get(i).panes.get(leaf);
+        if !n.hasTerm() { return; }
+        this.stopShell(n);
+        n.pane = split.EXPLORER;
+        n.ex = this.openExplorer(this.askNote.str());
+    }
+}
+
+// Every `.md` under `dir` (dotfiles skipped), as paths from byte `cut` of the full path.
+fn gatherNotes(dir: string, cut: int, out: &List<string>, mem: &Arena) {
+    match io.listDir(dir, mem) {
+        Result.Ok(entries) {
+            for e in entries {
+                if e.name.len == 0 || e.name[0] == 46 { continue; }
+                let p = Text.new(mem);
+                p.pushStr(dir);
+                p.push(47);
+                p.pushStr(e.name);
+                let ps = p.str();
+                if e.isDir { gatherNotes(ps, cut, out, mem); }
+                else if ps.len > 3 && ps[ps.len - 3..ps.len] == ".md" { out.push(ps[cut..ps.len]); }
+            }
+        }
+        Result.Err(_) {}
+    }
+}

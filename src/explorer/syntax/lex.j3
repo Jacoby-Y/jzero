@@ -1,0 +1,143 @@
+module jzero.explorer.syntax.lex;
+
+use j3.memory.List;
+use j3.option.Option;
+use j3.text.Text;
+use j3.ui.spans.{ Span, SPAN_COLOR };
+use jzero.explorer.syntax.grammar;
+use jzero.explorer.syntax.grammar.{ Grammar, Region };
+
+// `text` colored by grammar `g`: one pass, regions (comments, strings, ...) first, then
+// prefixed words, numbers, words. `colors` by kind (`grammar.KINDS`).
+// ponytail: whole text on every edit (capped by highlight.MAX_BYTES); per-line state if big files lag.
+pub fn spans(g: &Grammar, text: string, out: &List<Span>, colors: []string) {
+    let lower = Text.scratch();
+    let i = 0;
+    let lineStart = true;   // only spaces (or YAML `-`) since the newline
+    let pending = -1;       // kind for the next word (after `fn`, `struct`, ...)
+    while i < text.len {
+        let c = text[i];
+        if c == 10 { lineStart = true; pending = -1; i += 1; continue; }
+        if c == 32 || c == 9 || c == 13 { i += 1; continue; }
+        let end = i + 1;
+        let kind = -1;
+        let r = regionAt(g, text, i, lineStart);
+        if r >= 0 {
+            let rg = &g.regions.items[r];
+            end = regionEnd(rg, text, i);
+            kind = rg.kind;
+            if kind == grammar.STRING && isKey(g, text, end, lineStart) { kind = grammar.KEY; }
+        } else if prefixAt(g, text, i) >= 0 {
+            let p = &g.prefixes.items[prefixAt(g, text, i)];
+            end = wordEnd(g, text, i + p.text.len);
+            if end == i + p.text.len && end < text.len && text[end] != 10 && text[end] != 32 { end += 1; }
+            kind = p.kind;
+        } else if isDigit(c) {
+            end = numberEnd(text, i);
+            kind = grammar.NUMBER;
+        } else if isWordStart(c) {
+            end = wordEnd(g, text, i);
+            kind = wordKind(g, text, i, end, lineStart, pending, lower);
+            pending = -1;
+            let w = word(g, text[i..end], lower);
+            match g.after.get(w) { Option.Some(k) { pending = k; } Option.None {} }
+        } else if c != 45 {
+            pending = -1;
+        }
+        if kind >= 0 { out.push(Span { start: i, len: end - i, kind: SPAN_COLOR, data: colors[kind] }); }
+        if c != 45 { lineStart = false; }
+        i = end;
+    }
+}
+
+fn wordKind(g: &Grammar, text: string, i: int, end: int, lineStart: bool, pending: int, lower: &Text): int {
+    if isKey(g, text, end, lineStart) { return grammar.KEY; }
+    match g.words.get(word(g, text[i..end], lower)) { Option.Some(k) { return k; } Option.None {} }
+    if pending >= 0 { return pending; }
+    if g.call && end < text.len && text[end] == 40 { return grammar.FUNCTION; }
+    if g.capitalized >= 0 && text[i] >= 65 && text[i] <= 90 { return g.capitalized; }
+    return g.plain;
+}
+
+// `w`, lowercased into `lower` when the grammar ignores case.
+fn word(g: &Grammar, w: string, lower: &Text): string {
+    if !g.ignoreCase { return w; }
+    lower.clear();
+    for b in w { if b >= 65 && b <= 90 { lower.push(b + 32); } else { lower.push(b); } }
+    return lower.str();
+}
+
+// A token ending at `end` is a key: the next non-space byte is the grammar's separator.
+fn isKey(g: &Grammar, text: string, end: int, lineStart: bool): bool {
+    if g.keySep == 0 || !(lineStart || g.keyAnywhere) { return false; }
+    let k = end;
+    while k < text.len && (text[k] == 32 || text[k] == 9) { k += 1; }
+    if k >= text.len || text[k] != g.keySep { return false; }
+    return k + 1 >= text.len || text[k + 1] != g.keySep;   // not `==`
+}
+
+fn regionAt(g: &Grammar, text: string, i: int, lineStart: bool): int {
+    for r in 0..g.regions.len {
+        let rg = &g.regions.items[r];
+        if rg.start && !lineStart { continue; }
+        if rg.alone && i > 0 && text[i - 1] != 32 && text[i - 1] != 9 && text[i - 1] != 10 { continue; }
+        if !startsAt(text, i, rg.open) { continue; }
+        if rg.char && regionEnd(rg, text, i) < 0 { continue; }
+        return r;
+    }
+    return -1;
+}
+
+// Past the region's close (the end of the line or text when it stays open). A `char` region
+// that does not close soon gives -1.
+fn regionEnd(rg: &Region, text: string, i: int): int {
+    let k = i + rg.open.len;
+    while k < text.len {
+        let c = text[k];
+        if rg.char && (k - i > 12 || c == 32) { return -1; }
+        if rg.close.len == 0 && c == 10 { return k; }
+        if rg.escape && c == 92 { k += 2; continue; }
+        if rg.close.len > 0 && startsAt(text, k, rg.close) { return k + rg.close.len; }
+        if c == 10 && !rg.multiline { if rg.char { return -1; } return k; }
+        k += 1;
+    }
+    if rg.char { return -1; }
+    return text.len;
+}
+
+fn prefixAt(g: &Grammar, text: string, i: int): int {
+    for p in 0..g.prefixes.len { if startsAt(text, i, g.prefixes.items[p].text) { return p; } }
+    return -1;
+}
+
+fn startsAt(s: string, i: int, p: string): bool {
+    if p.len == 0 || i + p.len > s.len { return false; }
+    return s[i..i + p.len] == p;
+}
+
+fn isDigit(c: u8): bool { return c >= 48 && c <= 57; }
+fn isWordStart(c: u8): bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128; }
+
+fn isWord(g: &Grammar, c: u8): bool {
+    if isWordStart(c) || isDigit(c) { return true; }
+    for b in g.wordChars { if b == c { return true; } }
+    return false;
+}
+
+fn wordEnd(g: &Grammar, s: string, i: int): int {
+    let k = i;
+    while k < s.len && isWord(g, s[k]) { k += 1; }
+    return k;
+}
+
+// Digits, letters (`0x1F`, `10u8`, `1e9`), `_`, and a `.` followed by a digit.
+fn numberEnd(s: string, i: int): int {
+    let k = i;
+    while k < s.len {
+        let c = s[k];
+        if isWordStart(c) || isDigit(c) { k += 1; }
+        else if c == 46 && k + 1 < s.len && isDigit(s[k + 1]) { k += 1; }
+        else { break; }
+    }
+    return k;
+}

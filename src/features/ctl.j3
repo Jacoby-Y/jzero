@@ -1,0 +1,269 @@
+module jzero.features.ctl;
+
+// `jzctl ls/new/send/...` (`NAMES`): drive the running JZero's panes from another
+// process (an agent in one pane opening and typing into another). The client side is here:
+// it forwards its arguments with `j3.instance.request` and prints the reply. The running copy
+// answers in `state/ctl*.j3`. A reply is `ok|err|timeout|exit <code>\n<body>`.
+
+use j3.build;
+use j3.data.save.parseInt;
+use j3.instance;
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.sys;
+use j3.term.input;
+use j3.text.Text;
+use jzero.platform.os;
+
+// Subcommands, by index (`command`).
+pub const LS = 0;
+pub const NEW = 1;
+pub const SEND = 2;
+pub const KEY = 3;
+pub const READ = 4;
+pub const WAIT = 5;
+pub const FOCUS = 6;
+pub const CLOSE = 7;
+pub const RUN = 8;
+pub const WATCH = 9;
+pub const STATUS = 10;
+pub const HISTORY = 11;
+pub const NOTIFY = 12;
+pub const BADGE = 13;
+pub const SEARCH = 14;
+pub const OPEN = 15;
+pub const KANBAN = 16;
+pub const NAMES: [17]string = ["ls", "new", "send", "key", "read", "wait", "focus", "close", "run", "watch", "status", "history", "notify", "badge", "search", "open", "kanban"];
+
+const TIMEOUT_MS = 5000;
+
+// Exit codes.
+const EXIT_ERR = 1;
+const EXIT_NOT_RUNNING = 2;
+const EXIT_TIMEOUT = 3;
+
+// Named keys for `jzctl key` (besides `ctrl+<letter>`).
+const KEY_NAMES: [9]string = ["enter", "tab", "esc", "backspace", "up", "down", "left", "right", "delete"];
+
+// A key for `jzctl key`: `key` is input.KEY_NONE when the name is unknown.
+pub struct Key {
+    key: int = 0;
+    mods: int = 0;
+    cp: i32 = 0;
+}
+
+// Index of subcommand `name`, -1 when it is not one.
+pub fn command(name: string): int {
+    for i in 0..NAMES.len { if NAMES[i] == name { return i; } }
+    return -1;
+}
+
+// This process runs as `jzctl`, not as the app: `jzero --ctl ...` (what `assets/shell/bin/jzctl`
+// and `jzctl.cmd` run), or argv[0] is `jzctl` (a link named so).
+pub fn invoked(): bool {
+    if shift() == 1 { return true; }
+    let a = sys.arg(0);
+    return a == "jzctl" || (a.len > 6 && a[a.len - 6..a.len] == "/jzctl");
+}
+
+// The arguments as `jzctl` sees them: `jzero --ctl ls 3` and `jzctl ls 3` both give [_, ls, 3].
+pub fn argCount(): int { return sys.argCount() - shift(); }
+pub fn arg(i: int): string { return sys.arg(if i == 0 { 0 } else { i + shift() }); }
+fn shift(): int { if sys.argCount() > 1 && sys.arg(1) == "--ctl" { return 1; } return 0; }
+
+// This run is a control command (`jzctl ls`), not the app.
+pub fn isCommand(): bool { return invoked() && argCount() > 1 && command(arg(1)) >= 0; }
+
+// The instance name this copy serves: one copy per window class (`--class work` is its own),
+// `-dev` so a `j3c run` copy runs beside the installed one. `JZERO_CTL=<name>` overrides it
+// (headless control tests).
+pub fn serveName(mem: &Arena): string {
+    let t = Text.new(mem);
+    let test = sys.env("JZERO_CTL");
+    if test.len > 0 { t.pushStr(test); return t.str(); }
+    t.pushStr("jzero");
+    let cls = classArg();
+    if cls.len > 0 { t.pushStr("-"); t.pushStr(cls); }
+    if build.DEV { t.pushStr("-dev"); }
+    return t.str();
+}
+
+// `--class NAME` from the command line ("" when absent).
+pub fn classArg(): string {
+    for i in 1..sys.argCount() - 1 { if sys.arg(i) == "--class" { return sys.arg(i + 1); } }
+    return "";
+}
+
+// The value after flag `name` ("" when absent). Stops at `--`.
+pub fn flag(args: []string, name: string): string {
+    for i in 0..args.len - 1 {
+        if args[i] == "--" { return ""; }
+        if args[i] == name { return args[i + 1]; }
+    }
+    return "";
+}
+
+// Flag `name` is there (before `--`).
+pub fn has(args: []string, name: string): bool {
+    for a in args {
+        if a == "--" { return false; }
+        if a == name { return true; }
+    }
+    return false;
+}
+
+// What follows `--` (empty when there is none).
+pub fn rest(args: []string): []string {
+    for i in 0..args.len { if args[i] == "--" { return args[i + 1..args.len]; } }
+    return args[0..0];
+}
+
+// A number, `fallback` when `s` is not one.
+pub fn num(s: string, fallback: int): int {
+    if s.len == 0 { return fallback; }
+    for c in s { if c < 48 || c > 57 { return fallback; } }
+    return parseInt(s as []u8, 0, fallback);
+}
+
+// `enter`, `tab`, `esc`, ..., or `ctrl+<letter>`.
+pub fn key(name: string): Key {
+    for i in 0..KEY_NAMES.len { if KEY_NAMES[i] == name { return Key { key: keyCode(i) }; } }
+    if name.len == 6 && name[0..5] == "ctrl+" && name[5] >= 97 && name[5] <= 122 {
+        return Key { key: input.KEY_CHAR, mods: input.MOD_CTRL, cp: i32(name[5]) };
+    }
+    return Key { key: input.KEY_NONE };
+}
+
+// The `KEY_*` of `KEY_NAMES[i]`.
+fn keyCode(i: int): int {
+    let codes: [9]int = [input.KEY_ENTER, input.KEY_TAB, input.KEY_ESC, input.KEY_BACKSPACE, input.KEY_UP, input.KEY_DOWN, input.KEY_LEFT, input.KEY_RIGHT, input.KEY_DELETE];
+    return codes[i];
+}
+
+// The exit code a reply means (`exit <code>`: a `run` command's own).
+pub fn exitCode(reply: string): int {
+    let s = status(reply);
+    if s == "ok" { return 0; }
+    if s == "timeout" { return EXIT_TIMEOUT; }
+    if s.len > 5 && s[0..5] == "exit " { return num(s[5..s.len], EXIT_ERR); }
+    return EXIT_ERR;
+}
+
+// The reply's first line.
+fn status(reply: string): string {
+    for i in 0..reply.len { if reply[i] == 10 { return reply[0..i]; } }
+    return reply;
+}
+
+// The reply after its first line.
+pub fn body(reply: string): string {
+    for i in 0..reply.len { if reply[i] == 10 { return reply[i + 1..reply.len]; } }
+    return "";
+}
+
+// Run the control command in this process's arguments and exit. `self` as the pane id is
+// `$JZERO_PANE`; `new` without `--in` splits the asking pane (when it is one).
+pub fn run() {
+    let mem = Arena.create(65536);
+    let pane = sys.env("JZERO_PANE");
+    let raw = List<string>.new(&mem);
+    for i in 0..argCount() { raw.push(arg(i)); }
+    let argv = raw.items[0..raw.len];
+    let cmd = command(argv[1]);
+    let split = (cmd == NEW || cmd == OPEN) && pane.len > 0 && !has(argv, "--in");
+    let args = List<string>.new(&mem);
+    for i in 0..argv.len {
+        let a = argv[i];
+        if i == 2 && a == "self" { a = pane; }
+        if i == 2 && cmd == OPEN { a = absolute(a, &mem); }
+        args.push(a);
+        if i == 2 && split { args.push("--in"); args.push(pane); }
+    }
+    let name = sys.env("JZERO_INSTANCE");
+    if name.len == 0 { name = serveName(&mem); }
+    if cmd == WATCH { watch(name, &args, &mem); }
+    let timeout = TIMEOUT_MS;
+    if cmd == WAIT || cmd == RUN { timeout = 0; }  // the running copy keeps `--timeout`
+    match instance.request(name, args.items[0..args.len], timeout) {
+        Option.Some(reply) {
+            let code = exitCode(reply);
+            let out = body(reply);
+            let fd = 1;
+            if code != 0 { fd = 2; }
+            writeFd(fd, out);
+            sys.exit(i32(code));
+        }
+        Option.None {
+            writeFd(2, "jzctl: no running JZero answered\n");
+            sys.exit(i32(EXIT_NOT_RUNNING));
+        }
+    }
+}
+
+// `watch`: ask for the lines after `--from <n>` again and again (each request waits in the
+// running copy until there are some), printing them, until the pane closes or Ctrl+C.
+fn watch(name: string, args: &List<string>, mem: &Arena) {
+    let base = args.len;
+    let from = Text.new(mem);
+    from.pushStr("-1");
+    while true {
+        args.len = base;
+        args.push("--from");
+        args.push(from.str());
+        match instance.request(name, args.items[0..args.len], 0) {
+            Option.Some(reply) {
+                if exitCode(reply) != 0 { writeFd(2, body(reply)); sys.exit(i32(EXIT_ERR)); }
+                let b = body(reply);
+                let nl = 0;
+                while nl < b.len && b[nl] != 10 { nl += 1; }
+                from.clear();
+                from.pushStr(b[0..nl]);
+                if nl < b.len { writeFd(1, b[nl + 1..b.len]); }
+            }
+            Option.None {
+                writeFd(2, "jzctl: no running JZero answered\n");
+                sys.exit(i32(EXIT_NOT_RUNNING));
+            }
+        }
+    }
+}
+
+// `path` from this process's directory (the running copy has its own), kept in `mem`.
+// `$PWD` first: it keeps the symlinks the user typed; cmd and PowerShell set none.
+fn absolute(path: string, mem: &Arena): string {
+    let pwd = sys.env("PWD");
+    if pwd.len == 0 { pwd = os.slashes(io.cwd(mem)); }
+    if path.len == 0 || os.isAbs(os.slashes(path)) || pwd.len == 0 { return path; }
+    let t = Text.new(mem);
+    t.pushStr(pwd);
+    t.push(47);
+    t.pushStr(path);
+    return t.str();
+}
+
+// `s` to file descriptor `fd` as is (no newline added).
+pub fn writeFd(fd: int, s: string) {
+    if s.len == 0 { return; }
+    let t = Text.scratch();
+    t.pushStr(s);
+    sys.write(fd, &t.bytes[0] as ptr, t.len());
+}
+
+// Self-check: argument helpers, keys, replies.
+pub fn selfTest(mem: &Arena) {
+    let a: [7]string = ["jzctl", "read", "3", "--lines", "20", "--", "--lines"];
+    check(command("read") == READ && command("nope") == -1, "command");
+    check(flag(a[:], "--lines") == "20" && flag(a[:], "--in") == "", "flag");
+    check(has(a[:], "--lines") && !has(a[:], "--enter"), "has");
+    check(rest(a[:]).len == 1 && rest(a[:])[0] == "--lines" && rest(a[0..3]).len == 0, "rest");
+    check(num("42", -1) == 42 && num("4x", -1) == -1 && num("", -1) == -1, "num");
+    check(key("enter").key == input.KEY_ENTER && key("ctrl+c").cp == i32(99) && key("ctrl+C").key == input.KEY_NONE, "key");
+    check(exitCode("ok\nhi") == 0 && body("ok\nhi") == "hi" && exitCode("timeout\n") == EXIT_TIMEOUT && exitCode("err\nx") == EXIT_ERR, "reply");
+    check(body("ok") == "", "reply without body");
+    check(exitCode("exit 7\nout") == 7 && exitCode("exit 0\n") == 0, "run exit code");
+    check(command("open") == OPEN && NAMES.len == KANBAN + 1, "names");
+    check(absolute("/a", mem) == "/a" && os.isAbs(absolute("a", mem)), "absolute");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`ctl selfTest: {what}`); } }

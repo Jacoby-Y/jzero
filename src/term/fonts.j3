@@ -1,0 +1,105 @@
+module jzero.term.fonts;
+
+use j3.game.{ Font, destroyFont, fontFallback, tryLoadFont };
+use j3.io.printLn;
+use j3.memory.{ Arena, List };
+use j3.text.Text;
+use jzero.platform.fontfiles;
+use jzero.platform.os;
+
+const TERM_FONT = "assets/mono.ttf";
+const TERM_ITALIC = "assets/mono-italic.ttf";
+// The terminal font at one size: upright, and italic for SGR 3 (raw 0: none, drawn upright).
+pub struct Face {
+    regular: Font;
+    italic: Font;
+}
+
+// The terminal font files and their sizes, loaded once each (zoom only visits a few).
+pub struct Fonts {
+    path: Text;          // the font file in use
+    italicPath: Text;    // its italic ("" none)
+    family: Text;        // the config value it came from
+    cache: List<Face>;   // by px (regular raw 0: not loaded)
+
+    // Use `family` (config `font-family`: a family name, a font file path, or "" for the
+    // bundled font). Loaded sizes of another file are dropped. True when the file changed.
+    fn setFamily(this: &Fonts, family: string, mem: &Arena): bool {
+        if family == this.family.str() && this.path.len() > 0 { return false; }
+        this.family.clear();
+        this.family.pushStr(family);
+        let path = resolve(family, mem);
+        if path == this.path.str() { return false; }
+        this.path.clear();
+        this.path.pushStr(path);
+        this.italicPath.clear();
+        this.italicPath.pushStr(italicOf(family, path, mem));
+        this.free();
+        return true;
+    }
+
+    // Destroy every loaded size (a new font file, or shutdown).
+    fn free(this: &Fonts) {
+        for i in 0..this.cache.len {
+            let f = this.cache.items[i];
+            if f.regular.raw != 0 as ptr { destroyFont(f.regular); }
+            if f.italic.raw != 0 as ptr { destroyFont(f.italic); }
+        }
+        this.cache.len = 0;
+    }
+
+    // The font at `px` with CJK and color-emoji fallbacks, and its italic. Needs the window.
+    fn get(this: &Fonts, px: int): Face {
+        while this.cache.len <= px { this.cache.push(Face { regular: Font { raw: 0 as ptr }, italic: Font { raw: 0 as ptr } }); }
+        let f = &this.cache.items[px];
+        if f.regular.raw == 0 as ptr {
+            f.regular = load(this.path.str(), px);
+            if this.italicPath.len() > 0 { f.italic = tryLoadFont(this.italicPath.str(), px); }
+        }
+        return *f;
+    }
+}
+
+pub fn create(mem: &Arena): Fonts {
+    return Fonts { path: Text.new(mem), italicPath: Text.new(mem), family: Text.new(mem), cache: List<Face>.new(mem) };
+}
+
+fn load(path: string, px: int): Font {
+    let font = tryLoadFont(path, px);
+    if font.raw == 0 as ptr && path != TERM_FONT {
+        printLn(`font-family: cannot load {path}; using the bundled font`);
+        font = tryLoadFont(TERM_FONT, px);
+    }
+    for i in 0..fontfiles.FALLBACKS {
+        let fb = tryLoadFont(fontfiles.fallback(i), px);
+        if fb.raw != 0 as ptr { fontFallback(font, fb); }
+    }
+    return font;
+}
+
+// The file for `family`: itself when it is a path, else what the OS finds for the family
+// (`platform/fontfiles.j3`), else the bundled font.
+fn resolve(familyIn: string, mem: &Arena): string {
+    if familyIn.len == 0 { return TERM_FONT; }
+    let family = os.slashes(familyIn);
+    if isPath(family) { return Text.new(mem).add(family).str(); }
+    let file = fontfiles.find(family, false, mem);
+    if file.len > 0 { return file; }
+    printLn(`font-family "{family}": not found; using the bundled font`);
+    return TERM_FONT;
+}
+
+// The italic beside the font `resolve` picked: bundled, or the family's italic when that is
+// a different file. "" for a font file path or no italic (italic then draws upright).
+fn italicOf(family: string, path: string, mem: &Arena): string {
+    if path == TERM_FONT { return TERM_ITALIC; }
+    if isPath(os.slashes(family)) { return ""; }
+    let file = fontfiles.find(family, true, mem);
+    if file == path { return ""; }
+    return file;
+}
+
+fn isPath(s: string): bool {
+    for i in 0..s.len { if s[i] == 47 { return true; } }
+    return false;
+}

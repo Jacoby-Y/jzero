@@ -1,0 +1,186 @@
+module jzero.state;
+
+// State part: the `jzctl` commands that print (ls, read, status, history, search). Each takes
+// `--json` for one JSON document instead of tab-separated lines.
+
+const SEARCH_MAX = 50;
+
+extend State {
+    // `ls [--json]`: `id  island  *(focused) or -  program  cwd`, one line per pane of the open islands.
+    fn ctlLs(this: &State, req: Request, args: []string) {
+        let mem = Arena.create(65536);
+        let t = Text.new(&mem);
+        let js = ctl.has(args, "--json");
+        let cwd = Text.new(&mem);
+        t.pushStr("ok\n");
+        if js { t.pushStr("["); }
+        let first = true;
+        for i in 0..this.islands.count() {
+            let isl = this.islands.get(i);
+            if !isl.open { continue; }
+            let p = &isl.panes;
+            for j in 0..p.nodes.len {
+                if !p.isLeaf(j) { continue; }
+                let n = p.get(j);
+                let focused = i == this.active && j == p.focus;
+                let program = "explorer";
+                let wants = false;
+                if n.hasTerm() { program = n.session().program(); wants = n.session().wants || n.session().badge.len() > 0; }
+                cwd.clear();
+                paneCwd(n, &cwd);
+                if js {
+                    if !first { t.pushStr(","); }
+                    t.pushStr("{\"id\":"); t.pushInt(n.id);
+                    t.pushStr(",\"island\":"); json.quote(isl.name.str(), &t);
+                    t.pushStr(",\"focused\":"); t.pushStr(boolStr(focused));
+                    t.pushStr(",\"program\":"); json.quote(program, &t);
+                    t.pushStr(",\"cwd\":"); json.quote(cwd.str(), &t);
+                    t.pushStr(",\"wants\":"); t.pushStr(boolStr(wants));
+                    t.pushStr("}");
+                } else {
+                    let mark = "-";
+                    if focused { mark = "*"; }
+                    t.pushInt(n.id); t.push(9); t.pushStr(isl.name.str()); t.push(9); t.pushStr(mark); t.push(9);
+                    t.pushStr(program); t.push(9); t.pushStr(cwd.str()); t.push(10);
+                }
+                first = false;
+            }
+        }
+        if js { t.pushStr("]\n"); }
+        req.reply(t.str());
+        mem.destroy();
+    }
+
+    // `read <id> [--lines N] [--json]`: the screen's text, or the last N lines with scrollback.
+    fn ctlRead(this: &State, req: Request, args: []string, n: &Node) {
+        let t = n.session();
+        let lines = ctl.num(ctl.flag(args, "--lines"), 0);
+        let rows = t.grid.rows();
+        if lines > 0 { rows = lines; }
+        let mem = Arena.create(2 * rows * (t.grid.cols() * 4 + 1) + 4096);
+        let text = Text.new(&mem);
+        t.tailText(lines, &text);
+        let out = Text.new(&mem);
+        out.pushStr("ok\n");
+        if ctl.has(args, "--json") {
+            out.pushStr("{\"id\":"); out.pushInt(n.id); out.pushStr(",\"text\":");
+            json.quote(text.str(), &out);
+            out.pushStr("}\n");
+        } else {
+            out.pushStr(text.str());
+        }
+        req.reply(out.str());
+        mem.destroy();
+    }
+
+    // `status <id> [--json]`: `running|idle  exit  ms  command`. `ms` is how long the last
+    // command ran, or how long the running one has so far; `exit` is -1 before any ends.
+    fn ctlStatus(this: &State, req: Request, args: []string, n: &Node) {
+        let t = n.session();
+        let state = "idle";
+        let ms = t.tap.lastMs;
+        if t.tap.runStart >= 0 { state = "running"; ms = sys.monotonicMs() - t.tap.runStart; }
+        let cmd = lastLine(t.tap.cmds.str());
+        let out = Text.scratch();
+        out.pushStr("ok\n");
+        if ctl.has(args, "--json") {
+            out.pushStr("{\"id\":"); out.pushInt(n.id);
+            out.pushStr(",\"state\":"); json.quote(state, out);
+            out.pushStr(",\"exit\":"); out.pushInt(t.tap.lastExit);
+            out.pushStr(",\"ms\":"); out.pushInt(ms);
+            out.pushStr(",\"command\":"); json.quote(cmd, out);
+            out.pushStr(",\"program\":"); json.quote(t.program(), out);
+            out.pushStr(",\"integration\":"); out.pushStr(boolStr(t.tap.marks.len > 0));
+            out.pushStr("}");
+            out.push(10);
+        } else {
+            out.pushStr(state); out.push(9); out.pushInt(t.tap.lastExit); out.push(9); out.pushInt(ms); out.push(9);
+            out.pushStr(cmd); out.push(10);
+        }
+        req.reply(out.str());
+    }
+
+    // `history <id> [--lines N] [--json]`: commands run in the pane, oldest first.
+    fn ctlHistory(this: &State, req: Request, args: []string, n: &Node) {
+        let all = n.session().tap.cmds.str();
+        let k = ctl.num(ctl.flag(args, "--lines"), 0);
+        let start = all.len;
+        let seen = 0;
+        if k <= 0 { start = 0; }
+        while start > 0 {
+            if all[start - 1] == 10 && start < all.len { seen += 1; if seen == k { break; } }
+            start -= 1;
+        }
+        let cmds = all[start..all.len];
+        let mem = Arena.create(2 * cmds.len + 4096);
+        let out = Text.new(&mem);
+        out.pushStr("ok\n");
+        if ctl.has(args, "--json") {
+            out.pushStr("[");
+            jsonLines(cmds, &out);
+            out.pushStr("]\n");
+        } else {
+            out.pushStr(cmds);
+        }
+        req.reply(out.str());
+        mem.destroy();
+    }
+
+    // `search <text> [--max N] [--json]`: lines with `text` (any case) in every pane's commands
+    // and scrollback, closed islands too: `id  island  cmd|out  line`, commands first.
+    fn ctlSearch(this: &State, req: Request, args: []string) {
+        if args.len < 3 || args[2].len < 2 { req.reply("err\nusage: jzctl search <text, 2+ chars> [--max N] (jzctl help search)\n"); return; }
+        let mem = Arena.create(4096);
+        let f = everything.on(&mem);
+        this.gatherInto(&f);
+        f.find(args[2], ctl.num(ctl.flag(args, "--max"), SEARCH_MAX));
+        let out = Text.new(f.mem);
+        let js = ctl.has(args, "--json");
+        out.pushStr("ok\n");
+        if js { out.pushStr("["); }
+        for k in 0..f.count() {
+            let d = f.doc(k);
+            let isl = this.islands.get(d.island);
+            let id = isl.panes.get(d.leaf).id;
+            let kind = "out";
+            if d.kind == everything.COMMAND { kind = "cmd"; }
+            if js {
+                if k > 0 { out.pushStr(","); }
+                out.pushStr("{\"id\":"); out.pushInt(id);
+                out.pushStr(",\"island\":"); json.quote(isl.name.str(), &out);
+                out.pushStr(",\"open\":"); out.pushStr(boolStr(isl.open));
+                out.pushStr(",\"kind\":"); json.quote(kind, &out);
+                out.pushStr(",\"line\":"); json.quote(f.line(k), &out);
+                out.pushStr("}");
+            } else {
+                out.pushInt(id); out.push(9); out.pushStr(isl.name.str()); out.push(9); out.pushStr(kind); out.push(9);
+                out.pushStr(f.line(k)); out.push(10);
+            }
+        }
+        if js { out.pushStr("]\n"); }
+        req.reply(out.str());
+        f.mem.destroy();
+    }
+}
+
+// The last line of `s` (`\n` after each), without its newline; "" when empty.
+fn lastLine(s: string): string {
+    let end = s.len;
+    if end > 0 && s[end - 1] == 10 { end -= 1; }
+    let start = end;
+    while start > 0 && s[start - 1] != 10 { start -= 1; }
+    return s[start..end];
+}
+
+// Each `\n`-ended line of `s` as a JSON string, comma-separated, into `out`.
+fn jsonLines(s: string, out: &Text) {
+    let start = 0;
+    for i in 0..s.len {
+        if s[i] != 10 { continue; }
+        if start > 0 { out.pushStr(","); }
+        json.quote(s[start..i], out);
+        start = i + 1;
+    }
+}
+
+fn boolStr(b: bool): string { if b { return "true"; } return "false"; }

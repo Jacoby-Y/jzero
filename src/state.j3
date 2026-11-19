@@ -1,0 +1,567 @@
+module jzero.state;
+
+use j3.game;
+use j3.instance.Request;
+use j3.data.json;
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, contains };
+use j3.term.input;
+use jzero.config.config;
+use jzero.config.config.Config;
+use jzero.config.draft;
+use jzero.config.draft.Draft;
+use jzero.input.keynames;
+use jzero.input.keynames.KeyNames;
+use jzero.features.ctl;
+use jzero.features.notify;
+use jzero.features.zerocmds;
+use jzero.features.zerocmds.ZeroCmds;
+use jzero.features.status;
+use jzero.features.everything;
+use jzero.features.everything.Found;
+use jzero.term.fonts.{ Fonts, Face };
+use jzero.theme.files;
+use jzero.theme.theme.Themes;
+use jzero.explorer.explorer;
+use jzero.explorer.explorer.Explorer;
+use jzero.explorer.clip;
+use jzero.explorer.clip.Clip;
+use jzero.ext.host;
+use jzero.explorer.syntax.registry;
+use jzero.ext.host.Host;
+use jzero.features.palette;
+use jzero.features.palette.Palette;
+use jzero.layout.island;
+use jzero.platform.os;
+use jzero.platform.shells;
+use jzero.layout.island.{ Island, Islands };
+use jzero.layout.split;
+use jzero.layout.split.{ Node };
+use jzero.session.paths;
+use jzero.session.store;
+use jzero.term.fonts;
+use jzero.term.session;
+use jzero.term.session.Session;
+use jzero.term.shellint;
+use jzero.term.shellsetup;
+use jzero.theme.theme;
+use jzero.util.sort;
+use jzero.kanban.boards;
+use jzero.kanban.boards.Boards;
+use jzero.kanban.kanbanctl;
+use jzero.git.repo;
+use jzero.git.repo.Repo;
+
+// `State.active` value meaning the ocean is shown instead of an island.
+pub const OCEAN = -1;
+
+// What the close confirmation asks about (`State.ask`).
+pub const ASK_NONE = 0;
+pub const ASK_PANE = 1;
+pub const ASK_ISLAND = 2;
+pub const ASK_QUIT = 3;
+
+const STOP_PHASES = 3;  // `stopShellPhase`: sync + ask, hang up, save + reap
+pub const ASK_EXPLORER = 4;
+pub const ASK_NOTE = 5;
+
+const SAVE_EVERY_MS = 1000;
+
+// A pane's place: island index and leaf (`findPane`; `island` -1 when it is gone).
+pub struct PaneAt {
+    island: int = -1;
+    leaf: int = -1;
+}
+
+// What a `Waiter` waits for (`state/ctlwait.j3`).
+const W_MATCH = 0;   // `wait --match`: `text` on the screen
+const W_IDLE = 1;    // `wait --idle`: no output for `idleMs`
+const W_PROMPT = 2;  // `wait --prompt`: the shell shows its prompt
+const W_RUN = 3;     // `run`: a prompt, then `text` typed and run, then that command ends
+const W_WATCH = 4;   // `watch`: lines past `from`
+
+// A `jzctl wait/run/watch` answered on a later frame (`state/ctlwait.j3`).
+struct Waiter {
+    req: Request;
+    kind: int;        // W_*
+    pane: int;
+    text: string;     // W_MATCH's text, W_RUN's command (args of `req`, valid until its reply)
+    idleMs: int = 0;
+    since: int;       // ms the wait began
+    until: int = 0;   // ms it times out, 0 never
+    done: int = -1;   // W_RUN: the shell's `doneCount` when the command went in (-1: not yet)
+    from: int = 0;    // W_WATCH: first line wanted (grid line + `droppedTotal`)
+}
+
+// Top-level app state. Pane lifecycle (open/close shells, save their files) is in
+// `state/panes.j3`, `0` commands in `state/zero.j3`, `jzctl` control commands in `state/ctl*.j3`; this file has the frame loop, config and islands.
+pub struct State {
+    mem: &Arena;
+    islands: Islands;
+    fonts: Fonts;          // the terminal font by size, loaded in `start` (needs the window)
+    lineHeight: int = 0;   // config line-height the shells were last given
+    fontSize: int = 0;     // config font-size they were last given
+    themes: Themes;        // bundled + custom themes (custom ones in cfgMem)
+    cfg: Config;
+    cfgMem: &Arena;        // the loaded config file; replaced on every reload
+    cfgReloaded: bool = false; // set by a reload until main re-reads the keybinds
+    hints: List<Text>;     // shortcut text by action id (filled by main from the keymap)
+    binds: List<Text>;     // the same in config syntax (`ctrl+shift+o`), for the settings Keys tab
+    defBinds: List<Text>;  // default combo by action id, config syntax
+    keyNames: KeyNames;
+    draft: Draft;          // the settings screen's edits while it is open
+    nextPaneId: int = 0;
+    saved: Text;           // islands file as last written
+    saveBuf: Text;
+    savedAt: int = 0;      // ms of the last save check
+    active: int = -1;      // OCEAN or an island index
+    selected: int = -1;    // island selected on the ocean, -1 for none
+    keysEaten: bool = false; // a keybind fired this frame: the terminal skips its keys
+    settingsOpen: bool = false;
+    notesOpen: bool = false; // the notes view replaces the ocean / island (`state/notes.j3`)
+    notes: Explorer;
+    clip: Clip;              // explorer file clipboard, shared by every explorer
+    kanbanOpen: bool = false; // the kanban view, likewise (`state/kanban.j3`)
+    kanban: Boards;
+    notePickOpen: bool = false; // "Turn into note" picker
+    noteMem: &Arena;       // noteList, rebuilt on each open
+    noteList: List<string>; // notes, relative to the notes folder
+    recent: List<int>;     // closed islands by last use, for the taskbar's new-island menu
+    askNote: Text;         // full path of the picked note
+    paletteOpen: bool = false;
+    palette: Palette;
+    menuOpen: bool = false;  // right-click menu
+    menuX: f32 = 0.0;
+    menuY: f32 = 0.0;
+    ask: int = 0;          // ASK_*: the close confirmation showing
+    askIsland: int = -1;
+    askLeaf: int = -1;
+    askWhat: Text;         // what runs there
+    useClock: int = 0;     // bumped each time another island shows (Island.used)
+    shown: int = -2;       // `active` as of the last update
+    wantFrame: bool = false; // something animates (visual bell): main keeps frames coming
+    found: Found;          // "search everything" results
+    zeroCmds: ZeroCmds;    // `<config>/commands.sh`, for completing `0 <name>`
+    freeSlots: List<&Arena>;  // arena headers of closed panes, reused by the next open (`state/panes.j3`)
+    zeroMode: int = 0;     // shellint.RUN_*: a `0` request waiting for the end of the frame (`state/zero.j3`)
+    zeroPane: int = -1;    // pane id that asked
+    remotePane: int = -1;  // pane running `jzctl serve` ("Remote access" reopens it)
+    zeroIsland: int = -1;  // its island
+    zeroArgs: Text;        // command name and args, each followed by a 0 byte
+    zeroCwd: Text;         // the asking shell's directory
+    ctlName: Text;         // the instance name `jzero` control commands reach us by (`$JZERO_INSTANCE`)
+    waiters: List<Waiter>; // `jzctl wait`s not answered yet
+    ext: Host;             // extension scripts (`ext/host.j3`)
+    gitOpen: bool = false; // the Git UI modal (`state/git.j3`)
+    git: Repo;
+
+    // Once the window exists: read the config and the islands, start the open ones.
+    fn start(this: &State) {
+        game.holdClose(true);
+        this.reloadConfig();
+        paths.ensureDirs();
+        shellsetup.install(this.mem);
+        this.ext.refresh(true);
+        this.ctlName.pushStr(ctl.serveName(this.mem));
+        this.loadIslands();
+        this.loadCmds();
+        this.active = OCEAN;
+        for i in 0..this.islands.count() {
+            let isl = this.islands.get(i);
+            if !isl.open { continue; }
+            this.startPanes(isl);
+            if this.active == OCEAN { this.active = i; }
+        }
+        // A terminal opens on a shell: with no island open, open the first.
+        if this.active == OCEAN && this.islands.count() > 0 { this.openIsland(0); }
+    }
+
+    // Every frame: pump every shell (a shell that exited closes its pane; an island with no
+    // panes left closes), reload a changed config, save the islands when they changed.
+    fn update(this: &State) {
+        let now = game.ticks();
+        if game.closeRequested() { this.requestQuit(); }
+        if config.changed(&this.cfg, now) { this.reloadConfig(); }
+        this.zeroCmds.refresh(now);
+        this.ext.refresh(false);
+        registry.refresh(now, false);
+        this.noteShown();
+        this.wantFrame = false;
+        let i = 0;
+        while i < this.islands.count() {
+            let isl = this.islands.get(i);
+            if isl.open { this.pumpIsland(i); }
+            if isl.open && isl.panes.empty() {
+                this.closeIsland(i);
+                if isl.temp { this.deleteIsland(i); continue; }
+            }
+            i += 1;
+        }
+        this.git.poll();
+        this.runZero();
+        this.checkWaiters(now);
+        if now - this.savedAt >= SAVE_EVERY_MS {
+            this.savedAt = now;
+            this.saveIslands();
+            this.kanban.save();
+        }
+    }
+
+    // App exit: keep every open pane's scrollback and cwd; islands stay marked open.
+    fn shutdown(this: &State) {
+        game.hideWindow();  // closing feels instant; the rest finishes off screen
+        for phase in 0..STOP_PHASES {
+            for i in 0..this.islands.count() {
+                let isl = this.islands.get(i);
+                if isl.open { this.stopPanesPhase(isl, phase); }
+            }
+        }
+        for i in 0..this.islands.count() {
+            if this.islands.get(i).temp { this.forgetPanes(this.islands.get(i)); }  // `-e` islands are not kept
+        }
+        this.saveIslands();
+        this.notes.autosave();
+        this.kanban.save();
+    }
+
+    // The island on screen changed: stamp it (ocean sorting), clear its badge, retitle the window.
+    fn noteShown(this: &State) {
+        if this.active != OCEAN { this.islands.get(this.active).unseen = false; }
+        if this.active == this.shown { return; }
+        this.shown = this.active;
+        if this.viewOpen() { this.hideViews(); }  // a key switched islands
+        let title = Text.scratch();
+        if this.active != OCEAN {
+            this.useClock += 1;
+            let isl = this.islands.get(this.active);
+            isl.used = this.useClock;
+            title.pushStr(isl.name.str());
+            title.pushStr(" - ");
+        }
+        title.pushStr("JZero");
+        game.setWindowTitle(title.str());
+    }
+
+    fn reloadConfig(this: &State) {
+        this.cfgMem.destroy();
+        *this.cfgMem = Arena.create(65536);
+        config.load(&this.cfg, this.cfgMem);
+        this.themes = theme.create(this.cfgMem);
+        files.loadDir(config.themesDir(), this.cfgMem, &this.themes);
+        this.themes.over = this.cfg.colors;
+        this.cfg.theme = this.themes.byName(this.cfg.themeName);
+        if this.cfg.theme < 0 {
+            io.printLn(`config: unknown theme "{this.cfg.themeName}"`);
+            this.cfg.theme = 0;
+        }
+        this.applyConfig();
+        this.cfgReloaded = true;
+    }
+
+    // Push the config into the running app: theme and fonts now. Scrollback and shell apply
+    // to shells opened later; padding, cursor and the rest are read live.
+    fn applyConfig(this: &State) {
+        theme.invalidate();
+        theme.show(&this.themes, this.cfg.theme);
+        game.setBackgroundAlpha(f32(this.cfg.backgroundOpacity) / 100.0);  // no effect unless see-through
+        let changed = this.fonts.setFamily(this.cfg.fontFamily, this.cfgMem);
+        if changed || this.cfg.fontSize != this.fontSize || this.cfg.lineHeight != this.lineHeight {
+            this.fontSize = this.cfg.fontSize;
+            this.lineHeight = this.cfg.lineHeight;
+            for i in 0..this.islands.count() { this.refreshFonts(this.islands.get(i)); }
+        }
+    }
+
+    // `isl`'s zoom as a factor of the config's font size (explorers scale their UI by it).
+    fn zoomScale(this: &State, isl: &Island): f32 {
+        if isl.fontPx == 0 { return 1.0; }
+        return f32(isl.fontPx) / f32(this.cfg.fontSize);
+    }
+
+    // The terminal font of `isl` (its zoom, else the config's size).
+    fn fontFor(this: &State, isl: &Island): Face {
+        let px = isl.fontPx;
+        if px == 0 { px = this.cfg.fontSize; }
+        return this.fonts.get(px);
+    }
+
+    // Give every shell of `isl` its current font.
+    fn refreshFonts(this: &State, isl: &Island) {
+        let p = &isl.panes;
+        let font = this.fontFor(isl);
+        for j in 0..p.nodes.len {
+            if !p.isLeaf(j) { continue; }
+            match p.get(j).term {
+                Option.Some(t) { t.setFont(font, this.cfg.lineHeight); }
+                Option.None {}
+            }
+        }
+    }
+
+    fn loadIslands(this: &State) {
+        match io.readFile(paths.islands(), this.mem) {
+            Result.Ok(bytes) {
+                let next = store.decode(bytes as string, this.mem, &this.islands);
+                if next >= 0 { this.nextPaneId = next; return; }
+            }
+            Result.Err(_) {}
+        }
+        // First run: one island, open.
+        let i = this.islands.add(this.mem, "home", 0, slotX(0), slotY(0));
+        this.islands.get(i).open = true;
+    }
+
+    // Write the islands file if anything in it changed. Running panes' cwds are read first.
+    fn saveIslands(this: &State) {
+        this.refreshCwds();
+        this.saveBuf.clear();
+        store.encode(&this.islands, this.nextPaneId, &this.saveBuf);
+        if this.saveBuf.str() == this.saved.str() { return; }
+        match io.writeFile(paths.islands(), this.saveBuf.bytes[0..this.saveBuf.len()]) {
+            Result.Ok(_) {
+                this.saved.clear();
+                this.saved.pushStr(this.saveBuf.str());
+            }
+            Result.Err(_) {}
+        }
+    }
+
+    // The island on screen, if any.
+    fn current(this: &State): Option<&Island> {
+        if this.active == OCEAN { return Option.None; }
+        return Option.Some(this.islands.get(this.active));
+    }
+
+    // The focused pane is a shell (the menu's "Turn into explorer" shows).
+    fn focusedShell(this: &State): bool {
+        if this.active == OCEAN { return false; }
+        let p = &this.islands.get(this.active).panes;
+        return p.focus >= 0 && p.get(p.focus).hasTerm();
+    }
+
+    // The focused pane's extension session, if it is one (its `pane.menu` joins the right-click menu).
+    fn focusedExt(this: &State): Option<&Session> {
+        if this.active == OCEAN { return Option.None; }
+        let p = &this.islands.get(this.active).panes;
+        if p.focus < 0 || !p.get(p.focus).hasTerm() { return Option.None; }
+        let s = p.get(p.focus).session();
+        if !s.ext { return Option.None; }
+        return Option.Some(s);
+    }
+
+    fn extMenuLen(this: &State): int {
+        match this.focusedExt() { Option.Some(s) { return this.ext.menuLen(s); } Option.None { return 0; } }
+    }
+
+    fn extMenuLabel(this: &State, i: int): string {
+        match this.focusedExt() { Option.Some(s) { return this.ext.menuLabel(s, i); } Option.None { return ""; } }
+    }
+
+    fn extMenuPick(this: &State, i: int) {
+        this.menuOpen = false;
+        match this.focusedExt() { Option.Some(s) { this.ext.menuPick(s, i); } Option.None {} }
+    }
+
+    // The right-click menu was opened on a folder row of the focused explorer.
+    fn menuFolder(this: &State): bool {
+        match this.focusedExplorer() {
+            Option.Some(e) { return e.menuRow >= 0 && e.rows.items[e.menuRow].isDir; }
+            Option.None { return false; }
+        }
+    }
+
+    // That folder becomes the explorer's root (the Parent folder button backs out).
+    fn focusFolder(this: &State) {
+        this.menuOpen = false;
+        match this.focusedExplorer() {
+            Option.Some(e) { if e.menuRow >= 0 { e.enter(e.menuRow); e.menuRow = -1; } }
+            Option.None {}
+        }
+    }
+
+    // The right-click menu was opened on a row of the focused explorer.
+    fn menuRowAt(this: &State): bool {
+        match this.focusedExplorer() { Option.Some(e) { return e.menuRow >= 0; } Option.None { return false; } }
+    }
+
+    fn rowProps(this: &State) {
+        this.menuOpen = false;
+        match this.focusedExplorer() {
+            Option.Some(e) { e.showProps(e.menuRow); e.menuRow = -1; }
+            Option.None {}
+        }
+    }
+
+    fn focusedExplorer(this: &State): Option<&Explorer> {
+        if this.active == OCEAN { return Option.None; }
+        let p = &this.islands.get(this.active).panes;
+        if p.focus < 0 || !p.get(p.focus).hasExplorer() { return Option.None; }
+        return Option.Some(p.get(p.focus).explorer());
+    }
+
+    // The focused pane's directory, `~` for $HOME ("" on the ocean). Refreshed once a second.
+    fn focusedCwd(this: &State): string {
+        if this.active == OCEAN { return ""; }
+        let p = &this.islands.get(this.active).panes;
+        if p.focus < 0 { return ""; }
+        return paths.tilde(p.get(p.focus).cwd.str());
+    }
+
+    // Shortcut text of action `id` ("" when unbound).
+    fn hint(this: &State, id: int): string {
+        if id < 0 || id >= this.hints.len { return ""; }
+        return this.hints.items[id].str();
+    }
+
+    // A dialog, menu or palette covers the panes: they take no keys or mouse.
+    fn overlayOpen(this: &State): bool { return this.settingsOpen || this.gitOpen || this.notePickOpen || this.menuOpen || this.paletteOpen || this.ask != ASK_NONE; }
+
+    fn openMenu(this: &State, x: f32, y: f32) {
+        this.menuOpen = true;
+        this.menuX = x;
+        this.menuY = y;
+    }
+
+    fn openIsland(this: &State, i: int) {
+        let isl = this.islands.get(i);
+        if !isl.open {
+            this.startPanes(isl);
+            isl.open = true;
+        }
+        this.active = i;
+    }
+
+    // Stop its shells, keep its layout, scrollback and cwds for the next open.
+    fn closeIsland(this: &State, i: int) {
+        let isl = this.islands.get(i);
+        this.stopPanes(isl);
+        isl.open = false;
+        if this.active == i { this.active = OCEAN; this.cycleIsland(1); }
+    }
+
+    // Show the next (`dir` 1) or previous (-1) open island after the active one, wrapping;
+    // from the ocean, the first or last. Stays put when none is open.
+    fn cycleIsland(this: &State, dir: int) {
+        let n = this.islands.count();
+        let at = this.active;
+        if at == OCEAN && dir < 0 { at = n; }
+        for _ in 0..n {
+            at = (at + dir + n) % n;
+            if this.islands.get(at).open { this.active = at; return; }
+        }
+    }
+
+    fn newIsland(this: &State): int {
+        let n = this.islands.count();
+        let name = Text.scratch();
+        name.pushStr("island ");
+        name.pushInt(n + 1);
+        let slot = 0;
+        while this.islands.near(slotX(slot), slotY(slot)) { slot += 1; }
+        return this.islands.add(this.mem, name.str(), 0, slotX(slot), slotY(slot));
+    }
+
+    // The active island's font size by `delta` px (0: back to the config's size). Saved with it.
+    fn zoom(this: &State, delta: int) {
+        if this.active == OCEAN { return; }
+        let isl = this.islands.get(this.active);
+        let now = isl.fontPx;
+        if now == 0 { now = this.cfg.fontSize; }
+        let px = now + delta;
+        if delta == 0 { px = 0; }
+        else if px < config.FONT_MIN || px > config.FONT_MAX { return; }
+        if px == this.cfg.fontSize { px = 0; }
+        if px == isl.fontPx { return; }
+        isl.fontPx = px;
+        this.refreshFonts(isl);
+    }
+
+    // Ocean grid spot `k` (for sorting islands).
+    fn slotXOf(this: &State, k: int): f32 { return slotX(k); }
+    fn slotYOf(this: &State, k: int): f32 { return slotY(k); }
+
+    fn deleteIsland(this: &State, i: int) {
+        let isl = this.islands.get(i);
+        this.stopPanes(isl);
+        this.forgetPanes(isl);
+        this.islands.remove(i);
+        this.active = shiftAfterRemove(this.active, i);
+        this.selected = shiftAfterRemove(this.selected, i);
+    }
+
+    // Taskbar drag: island `from` takes index `to`; indices held in State follow.
+    fn moveIsland(this: &State, from: int, to: int) {
+        if from == to { return; }
+        this.islands.move(from, to);
+        this.active = shiftAfterMove(this.active, from, to);
+        this.selected = shiftAfterMove(this.selected, from, to);
+        this.askIsland = shiftAfterMove(this.askIsland, from, to);
+        this.shown = shiftAfterMove(this.shown, from, to);
+    }
+}
+
+// Ocean grid: one cell per icon tile; islands snap to it.
+pub const OCEAN_GRID: f32 = 56.0;
+pub fn oceanSnap(v: f32): f32 {
+    if v < 0.0 { return 0.0; }
+    return f32(int(v / OCEAN_GRID + 0.5)) * OCEAN_GRID;
+}
+
+// Ocean spots for new islands: every other grid cell, row by row.
+const SLOT_COLS = 6;
+fn slotX(slot: int): f32 { return OCEAN_GRID + f32(slot % SLOT_COLS) * 2.0 * OCEAN_GRID; }
+fn slotY(slot: int): f32 { return OCEAN_GRID + f32(slot / SLOT_COLS) * 2.0 * OCEAN_GRID; }
+
+// An index into the island list after island `removed` is gone (-1 if it was that one).
+fn shiftAfterRemove(idx: int, removed: int): int {
+    if idx == removed { return -1; }
+    if idx > removed { return idx - 1; }
+    return idx;
+}
+
+// Where index `idx` lands after the item at `from` moves to `to`.
+fn shiftAfterMove(idx: int, from: int, to: int): int {
+    if idx == from { return to; }
+    if from < to && idx > from && idx <= to { return idx - 1; }
+    if to < from && idx >= to && idx < from { return idx + 1; }
+    return idx;
+}
+
+pub fn selfTest(mem: &Arena) {
+    let a = island.create(mem);
+    a.add(mem, "a", 0, 0.0, 0.0); a.add(mem, "b", 0, 0.0, 0.0); a.add(mem, "c", 0, 0.0, 0.0);
+    a.move(0, 2);
+    check(a.get(0).name.str() == "b" && a.get(2).name.str() == "a", "move down");
+    a.move(2, 0);
+    check(a.get(0).name.str() == "a" && a.get(1).name.str() == "b", "move up");
+    check(shiftAfterMove(0, 0, 2) == 2 && shiftAfterMove(2, 0, 2) == 1 && shiftAfterMove(1, 2, 0) == 2, "shift");
+    check(shiftAfterMove(-1, 0, 2) == -1 && shiftAfterMove(3, 0, 2) == 3, "shift outside");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`state selfTest: {what}`); } }
+
+// `parent` holds only State's own arena header: the UI shares the app arena, so State keeps its
+// allocations apart (and measurable through `State.mem`).
+pub fn create(parent: &Arena): State {
+    let mem = &parent.alloc::<Arena>(1)[0];
+    *mem = Arena.create(4194304);
+    let cfgMem = &mem.alloc::<Arena>(1)[0];
+    *cfgMem = Arena.create(65536);
+    let noteMem = &mem.alloc::<Arena>(1)[0];
+    *noteMem = Arena.create(1024);
+    let draftMem = &mem.alloc::<Arena>(1)[0];
+    *draftMem = Arena.create(1024);
+    return State {
+        mem: mem, islands: island.create(mem), fonts: fonts.create(mem), themes: theme.create(cfgMem), hints: List<Text>.new(mem),
+        cfg: config.create(mem), cfgMem: cfgMem, palette: palette.create(mem), saved: Text.new(mem), saveBuf: Text.new(mem),
+        askWhat: Text.new(mem), found: everything.create(mem), zeroArgs: Text.new(mem), zeroCwd: Text.new(mem), zeroCmds: zerocmds.create(mem), freeSlots: List<&Arena>.new(mem),
+        ctlName: Text.new(mem), recent: List<int>.new(mem), waiters: List<Waiter>.new(mem), ext: host.create(mem), notes: explorer.create(&mem.alloc::<Arena>(1)[0], "", false), clip: clip.create(&mem.alloc::<Arena>(1)[0]),
+        kanban: boards.create(mem), noteMem: noteMem, noteList: List<string>.new(noteMem), askNote: Text.new(mem),
+        binds: List<Text>.new(mem), defBinds: List<Text>.new(mem), keyNames: keynames.create(mem), draft: draft.create(draftMem),
+        git: repo.create(mem),
+    };
+}

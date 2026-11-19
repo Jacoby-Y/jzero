@@ -1,0 +1,190 @@
+module jzero.explorer.image;
+
+use j3.game;
+use j3.game.{ Color, Texture };
+use j3.gfx.paint;
+use j3.io;
+use j3.math.Vec2;
+use j3.memory;
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.os;
+use jzero.explorer.kinds;
+use jzero.util.sort;
+
+const MIN_ZOOM: f32 = 0.02;
+const MAX_ZOOM: f32 = 32.0;
+const CHECK: f32 = 12.0;  // checkerboard tile, px
+
+// The explorer's image view: one texture, fit or zoomed, panned.
+pub struct Viewer {
+    tex: Texture;
+    bytes: int = 0;
+    zoom: f32 = 0.0;  // screen px per image px; 0 = fit
+    panX: f32 = 0.0;  // image center from the box center, px
+    panY: f32 = 0.0;
+
+    fn load(this: &Viewer, path: string): bool {
+        this.free();
+        this.tex = game.tryLoadTexture(path);
+        this.bytes = 0;
+        match io.stat(path) { Result.Ok(e) { this.bytes = e.size; } Result.Err(_) {} }
+        this.fit();
+        return this.tex.w > 0;
+    }
+
+    fn free(this: &Viewer) {
+        if this.tex.w > 0 { game.destroyTexture(this.tex); }
+        this.tex = Texture {};
+    }
+
+    fn fit(this: &Viewer) { this.zoom = 0.0; this.panX = 0.0; this.panY = 0.0; }
+    fn actual(this: &Viewer) { this.zoom = 1.0; this.panX = 0.0; this.panY = 0.0; }
+
+    // Fit shrinks a big image to the box; a small one stays 1:1.
+    fn scale(this: &Viewer, box: Vec2): f32 {
+        if this.zoom > 0.0 || this.tex.w == 0 { return this.zoom; }
+        let s = box.x / f32(this.tex.w);
+        let sy = box.y / f32(this.tex.h);
+        if sy < s { s = sy; }
+        if s > 1.0 { s = 1.0; }
+        return s;
+    }
+
+    // Zoom by `factor`, keeping the image point under `at` (box-local) in place.
+    fn zoomAt(this: &Viewer, box: Vec2, at: Vec2, factor: f32) {
+        if this.tex.w == 0 { return; }
+        let s0 = this.scale(box);
+        let s1 = s0 * factor;
+        if s1 < MIN_ZOOM { s1 = MIN_ZOOM; }
+        if s1 > MAX_ZOOM { s1 = MAX_ZOOM; }
+        let cx = box.x * 0.5 + this.panX;
+        let cy = box.y * 0.5 + this.panY;
+        let ux = (at.x - cx) / s0;
+        let uy = (at.y - cy) / s0;
+        this.zoom = s1;
+        this.panX = at.x - ux * s1 - box.x * 0.5;
+        this.panY = at.y - uy * s1 - box.y * 0.5;
+    }
+
+    fn pan(this: &Viewer, dx: f32, dy: f32) { this.panX += dx; this.panY += dy; }
+
+    // Checkerboard (`a`/`b`) under the picture, then the picture, in a `box` at the origin.
+    fn draw(this: &Viewer, box: Vec2, a: Color, b: Color) {
+        if this.tex.w == 0 { return; }
+        let s = this.scale(box);
+        let w = f32(this.tex.w) * s;
+        let h = f32(this.tex.h) * s;
+        let x = box.x * 0.5 + this.panX - w * 0.5;
+        let y = box.y * 0.5 + this.panY - h * 0.5;
+        checker(x, y, w, h, box, a, b);
+        paint.image(this.tex, Vec2 { x: x, y: y }, Vec2 { x: w, y: h });
+    }
+
+    // "1920 × 1080 · 2.3 MB · 100%"
+    fn info(this: &Viewer, box: Vec2): string {
+        let t = Text.scratch();
+        if this.tex.w == 0 { return ""; }
+        t.pushInt(int(this.tex.w));
+        t.pushStr(" × ");
+        t.pushInt(int(this.tex.h));
+        t.pushStr(" · ");
+        pushSize(t, this.bytes);
+        t.pushStr(" · ");
+        t.pushInt(int(this.scale(box) * 100.0 + 0.5));
+        t.pushStr("%");
+        return t.str();
+    }
+}
+
+// Tiles of the visible part of the picture only.
+fn checker(x: f32, y: f32, w: f32, h: f32, box: Vec2, a: Color, b: Color) {
+    let x0 = x; let y0 = y; let x1 = x + w; let y1 = y + h;
+    if x0 < 0.0 { x0 = 0.0; } if y0 < 0.0 { y0 = 0.0; }
+    if x1 > box.x { x1 = box.x; } if y1 > box.y { y1 = box.y; }
+    if x1 <= x0 || y1 <= y0 { return; }
+    paint.rect(Vec2 { x: x0, y: y0 }, Vec2 { x: x1 - x0, y: y1 - y0 }, a);
+    // Integer tile indices: stepping by float widths could round to a 0 step and spin forever.
+    let r0 = int((y0 - y) / CHECK); let r1 = int((y1 - y) / CHECK);
+    let c0 = int((x0 - x) / CHECK); let c1 = int((x1 - x) / CHECK);
+    for row in r0..r1 + 1 {
+        let ty = clampF(y + f32(row) * CHECK, y0, y1);
+        let th = clampF(y + f32(row + 1) * CHECK, y0, y1) - ty;
+        if th <= 0.0 { continue; }
+        for col in c0..c1 + 1 {
+            if (row + col) % 2 == 0 { continue; }
+            let tx = clampF(x + f32(col) * CHECK, x0, x1);
+            let tw = clampF(x + f32(col + 1) * CHECK, x0, x1) - tx;
+            if tw > 0.0 { paint.rect(Vec2 { x: tx, y: ty }, Vec2 { x: tw, y: th }, b); }
+        }
+    }
+}
+
+fn clampF(v: f32, lo: f32, hi: f32): f32 { return if v < lo { lo } else if v > hi { hi } else { v }; }
+
+pub fn pushSize(t: &Text, bytes: int) {
+    if bytes < 1024 { t.pushInt(bytes); t.pushStr(" B"); return; }
+    let units: [3]string = [" KB", " MB", " GB"];
+    let v = f32(bytes) / 1024.0;
+    let u = 0;
+    while v >= 1024.0 && u < 2 { v = v / 1024.0; u += 1; }
+    let tenths = int(v * 10.0 + 0.5);
+    t.pushInt(tenths / 10);
+    t.push(46);
+    t.pushInt(tenths % 10);
+    t.pushStr(units[u]);
+}
+
+// The image `step` places after `path` among the images of its folder (by name, wrapping), into `out`.
+// False when the folder has no other image.
+pub fn sibling(path: string, step: int, out: &Text): bool {
+    let k = path.len;
+    while k > 0 && path[k - 1] != 47 { k -= 1; }
+    if k == 0 { return false; }
+    let dir = os.parent(path);
+    let name = path[k..path.len];
+    let mem = memory.scratch(65536);
+    let mark = mem.checkpoint();
+    let found = false;
+    match io.listDir(dir, mem) {
+        Result.Ok(entries) {
+            let all = mem.alloc::<string>(entries.len);
+            let n = 0;
+            for e in entries { if !e.isDir && kinds.isImage(e.name) { all[n] = e.name; n += 1; } }
+            let imgs = all[0..n];
+            sort.strings(imgs);
+            let at = -1;
+            for i in 0..n { if imgs[i] == name { at = i; break; } }
+            if n > 1 || (n == 1 && at < 0) {
+                let j = ((at + step) % n + n) % n;
+                if at < 0 { j = 0; }
+                out.clear();
+                out.pushStr(dir);
+                if dir[dir.len - 1] != 47 { out.push(47); }
+                out.pushStr(imgs[j]);
+                found = true;
+            }
+        }
+        Result.Err(_) {}
+    }
+    mem.rewind(mark);
+    return found;
+}
+
+pub fn selfTest(mem: &Arena) {
+    let t = Text.new(mem);
+    pushSize(&t, 512);
+    pushSize(&t, 2411724);
+    check(t.str() == "512 B2.3 MB", "size");
+    let v = Viewer { tex: Texture { w: 400, h: 200 } };
+    let box = Vec2 { x: 200.0, y: 200.0 };
+    check(v.scale(box) == 0.5, "fit");
+    v.zoomAt(box, Vec2 { x: 100.0, y: 100.0 }, 2.0);
+    check(v.zoom == 1.0 && v.panX == 0.0, "zoom at center");
+    v.zoomAt(box, Vec2 { x: 0.0, y: 100.0 }, 2.0);
+    check(v.zoom == 2.0 && v.panX == 100.0, "zoom keeps the point");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`image selfTest: {what}`); } }

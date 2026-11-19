@@ -1,0 +1,31 @@
+<script>
+    // The island icon set. Keep COUNT and NAMES in src/layout/icons.j3 in sync.
+    props { icon: int; }
+</script>
+
+{#match icon}
+{:case 1}<icon name="code-slash" />
+{:case 2}<icon name="hdd-stack" />
+{:case 3}<icon name="journal-text" />
+{:case 4}<icon name="globe" />
+{:case 5}<icon name="database" />
+{:case 6}<icon name="cpu" />
+{:case 7}<icon name="git" />
+{:case 8}<icon name="bug" />
+{:case 9}<icon name="rocket-takeoff" />
+{:case 10}<icon name="music-note-beamed" />
+{:case 11}<icon name="house" />
+{:case 12}<icon name="server" />
+{:case 13}<icon name="cloud" />
+{:case 14}<icon name="box-seam" />
+{:case 15}<icon name="controller" />
+{:case 16}<icon name="book" />
+{:case 17}<icon name="pencil" />
+{:case 18}<icon name="gear" />
+{:case 19}<icon name="shield-lock" />
+{:case 20}<icon name="graph-up" />
+{:case 21}<icon name="chat-dots" />
+{:case 22}<icon name="camera" />
+{:case 23}<icon name="lightning" />
+{:else}<icon name="terminal" />
+{/match}

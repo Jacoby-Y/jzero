@@ -1,0 +1,333 @@
+module jzero.term.shellint;
+
+use j3.memory.{ Arena, List };
+use j3.sys;
+use j3.term.ansi.{ Params, Parser, feed };
+use j3.term.grid.Grid;
+use jzero.platform.os;
+use jzero.term.linemap.LineMap;
+use j3.text.{ Text, find };
+
+const MAX_CMDS = 50;
+const MAX_MARKS = 1000;
+const MAX_CLIP = 1048576;  // OSC 52 payloads past this are dropped
+pub const RUN_SPLIT = 1;
+pub const RUN_ISLAND = 2;
+
+// Sits between the parser and the Grid: passes everything through and reads the OSCs the
+// Grid ignores:
+//   7;file://host/path   working directory
+//   133;A                a prompt starts (its grid line is kept, for jumping between prompts)
+//   133;C / 133;D;<code> the command's output starts / it ended with that exit code
+//   633;E;<command>      the command line about to run (VS Code's code; our snippets send it)
+//   9;<body>, 777;notify;<title>;<body>   desktop notifications (`notePending`)
+//   52;<sel>;<base64>    set the clipboard (`clipPending`; the owner decides whether to)
+//   7770;<token>;<mode>;<base64 arg>...   the `0` command asks for a pane running a JZero
+//                        command (`runPending`); ignored unless <token> is this shell's own
+pub struct Tap {
+    grid: &Grid;
+    cwd: Text;             // from OSC 7 ("" until the shell sends one)
+    marks: List<int>;      // grid lines of prompt starts, oldest first
+    failed: List<int>;     // prompt lines whose command exited non-zero
+    cmds: Text;            // commands run, newest last, one per line, at most MAX_CMDS
+    cmdCount: int = 0;
+    changed: bool = false; // cmds changed since the owner last looked
+    atPrompt: bool = false; // between 133;A and 133;C: the shell is reading a command line
+    runStart: int = -1;    // ms at 133;C of the running command (-1: none runs)
+    runPrompt: int = -1;   // its prompt line
+    lastExit: int = -1;    // exit code of the last command (-1: none yet)
+    lastMs: int = 0;       // how long it ran
+    finished: bool = false; // a command just ended (the owner clears it)
+    doneCount: int = 0;    // commands ended so far (`jzctl run` waits for it to grow)
+    outLo: int = -1;       // grid lines of the last command's output: [outLo, outHi)
+    outHi: int = -1;
+    noteTitle: Text;
+    noteBody: Text;
+    notePending: bool = false;
+    clip: Text;
+    clipPending: bool = false;
+    token: Text;           // this shell's $JZERO_TOKEN ("" accepts no `0` requests)
+    runMode: int = 0;      // RUN_*: a `0` request since the owner last looked (0: none)
+    runArgs: Text;         // its arguments (command name first), each followed by a 0 byte
+
+    fn print(this: &Tap, cp: i32) { this.grid.print(cp); }
+    fn exec(this: &Tap, c0: u8) { this.grid.exec(c0); }
+    fn csi(this: &Tap, p: &Params, final: u8) { this.grid.csi(p, final); }
+    fn esc(this: &Tap, inter: int, final: u8) { this.grid.esc(inter, final); }
+    fn apc(this: &Tap, bytes: string) { this.grid.apc(bytes); }
+
+    fn osc(this: &Tap, bytes: string) {
+        if startsWith(bytes, "7;") { this.setCwd(bytes[2..bytes.len]); return; }
+        if bytes == "133;A" || startsWith(bytes, "133;A;") { this.mark(); return; }
+        if bytes == "133;C" || startsWith(bytes, "133;C;") { this.cmdStart(); return; }
+        if bytes == "133;D" || startsWith(bytes, "133;D;") { this.cmdEnd(bytes); return; }
+        if startsWith(bytes, "633;E;") { this.addCmd(bytes[6..bytes.len]); return; }
+        if startsWith(bytes, "9;") && !startsWith(bytes, "9;4;") { this.note("", bytes[2..bytes.len]); return; }
+        if startsWith(bytes, "777;notify;") { this.note777(bytes[11..bytes.len]); return; }
+        if startsWith(bytes, "52;") { this.setClip(bytes[3..bytes.len]); return; }
+        if startsWith(bytes, "7770;") { this.runRequest(bytes[5..bytes.len]); return; }
+        this.grid.osc(bytes);
+    }
+
+    fn line(this: &Tap): int { return this.grid.scrollbackLen() + this.grid.cursorY(); }
+
+    fn cmdStart(this: &Tap) {
+        this.atPrompt = false;
+        this.runStart = sys.monotonicMs();
+        this.runPrompt = -1;
+        if this.marks.len > 0 { this.runPrompt = this.marks.items[this.marks.len - 1]; }
+        this.outLo = this.line();
+        this.outHi = this.outLo;
+    }
+
+    // `133;D;<code>`. A D with no C before it (a prompt after an empty line) is ignored.
+    fn cmdEnd(this: &Tap, bytes: string) {
+        if this.runStart < 0 { return; }
+        let code = 0;
+        if bytes.len > 6 {
+            let rest = bytes[6..bytes.len];
+            let semi = find(rest, ";");
+            if semi >= 0 { rest = rest[0..semi]; }
+            code = toInt(rest);
+        }
+        this.lastExit = code;
+        this.lastMs = sys.monotonicMs() - this.runStart;
+        this.runStart = -1;
+        this.finished = true;
+        this.doneCount += 1;
+        this.outHi = this.line();
+        if this.grid.cursorX() > 0 { this.outHi += 1; }
+        if code != 0 && this.runPrompt >= 0 {
+            if this.failed.len >= MAX_MARKS { this.failed.remove(0); }
+            this.failed.push(this.runPrompt);
+        }
+    }
+
+    // Prompt line `l` had a failed command.
+    fn didFail(this: &Tap, l: int): bool {
+        for i in 0..this.failed.len { if this.failed.items[i] == l { return true; } }
+        return false;
+    }
+
+    fn note(this: &Tap, title: string, body: string) {
+        this.noteTitle.clear();
+        this.noteTitle.pushStr(title);
+        this.noteBody.clear();
+        this.noteBody.pushStr(body);
+        this.notePending = true;
+    }
+
+    // `title;body` (a body with no title is fine too).
+    fn note777(this: &Tap, rest: string) {
+        let semi = find(rest, ";");
+        if semi < 0 { this.note("", rest); return; }
+        this.note(rest[0..semi], rest[semi + 1..rest.len]);
+    }
+
+    // `<selections>;<base64>`; a query (`?`) is not answered: programs never read the clipboard.
+    fn setClip(this: &Tap, rest: string) {
+        let semi = find(rest, ";");
+        if semi < 0 { return; }
+        let data = rest[semi + 1..rest.len];
+        if data == "?" || data.len > MAX_CLIP { return; }
+        this.clip.clear();
+        if !base64(data, &this.clip) { return; }
+        this.clipPending = true;
+    }
+
+    // `<token>;<split|island>;<base64 arg>...` from `0`.
+    fn runRequest(this: &Tap, req: string) {
+        let rest = req;
+        let semi = find(rest, ";");
+        if semi < 0 || this.token.len() == 0 || rest[0..semi] != this.token.str() { return; }
+        rest = rest[semi + 1..rest.len];
+        semi = find(rest, ";");
+        if semi < 0 { return; }
+        let mode = 0;
+        if rest[0..semi] == "split" { mode = RUN_SPLIT; }
+        if rest[0..semi] == "island" { mode = RUN_ISLAND; }
+        if mode == 0 { return; }
+        this.runArgs.clear();
+        while semi >= 0 {
+            rest = rest[semi + 1..rest.len];
+            semi = find(rest, ";");
+            let arg = rest;
+            if semi >= 0 { arg = rest[0..semi]; }
+            if !base64(arg, &this.runArgs) { return; }
+            this.runArgs.push(0);
+        }
+        this.runMode = mode;
+    }
+
+    fn mark(this: &Tap) {
+        this.atPrompt = true;
+        let line = this.line();
+        if this.marks.len > 0 && this.marks.items[this.marks.len - 1] == line { return; }
+        if this.marks.len >= MAX_MARKS { this.marks.remove(0); }
+        this.marks.push(line);
+    }
+
+    // `file://host/path` with %XX escapes; the host is dropped.
+    fn setCwd(this: &Tap, uri: string) {
+        if !startsWith(uri, "file://") { return; }
+        let rest = uri[7..uri.len];
+        let slash = find(rest, "/");
+        if slash < 0 { return; }
+        let raw = Text.scratch();
+        percentDecode(rest[slash..rest.len], raw);
+        this.cwd.clear();
+        this.cwd.pushStr(os.fromShell(raw.str()));  // Windows: `/C:/x`, `/c/x` -> `C:/x`
+    }
+
+    fn addCmd(this: &Tap, cmd: string) {
+        if cmd.len == 0 { return; }
+        if this.cmdCount >= MAX_CMDS {
+            let nl = find(this.cmds.str(), "\n");
+            this.cmds.remove(0, nl + 1);
+            this.cmdCount -= 1;
+        }
+        let t = &this.cmds;
+        for i in 0..cmd.len { if cmd[i] != 10 && cmd[i] != 13 { t.push(cmd[i]); } }
+        t.push(10);
+        this.cmdCount += 1;
+        this.changed = true;
+    }
+
+    // Start from a saved command list (`\n` after each).
+    fn loadCmds(this: &Tap, text: string) {
+        let start = 0;
+        for i in 0..text.len {
+            if text[i] == 10 { this.addCmd(text[start..i]); start = i + 1; }
+        }
+        this.changed = false;
+    }
+
+    // Every grid line kept here through a resize: `saving` before it, then not, after it.
+    fn remap(this: &Tap, m: &LineMap, saving: bool) {
+        for i in 0..this.marks.len { remapOne(m, &this.marks.items[i], saving); }
+        for i in 0..this.failed.len { remapOne(m, &this.failed.items[i], saving); }
+        remapOne(m, &this.runPrompt, saving);
+        remapOne(m, &this.outLo, saving);
+        remapOne(m, &this.outHi, saving);
+    }
+
+    // Grid line of the nearest prompt before (`dir` -1) or after (1) `line`, or -1.
+    fn prompt(this: &Tap, line: int, dir: int): int {
+        let best = -1;
+        for i in 0..this.marks.len {
+            let m = this.marks.items[i];
+            if dir < 0 && m < line { best = m; }
+            if dir > 0 && m > line { return m; }
+        }
+        return best;
+    }
+}
+
+pub fn create(mem: &Arena, grid: &Grid): Tap {
+    return Tap {
+        grid: grid, cwd: Text.new(mem), marks: List<int>.new(mem), failed: List<int>.new(mem), cmds: Text.new(mem),
+        noteTitle: Text.new(mem), noteBody: Text.new(mem), clip: Text.new(mem), token: Text.new(mem), runArgs: Text.new(mem),
+    };
+}
+
+fn remapOne(m: &LineMap, v: &int, saving: bool) { if saving { m.save(v); } else { m.restore(v); } }
+
+fn toInt(s: string): int {
+    let v = 0;
+    let neg = s.len > 0 && s[0] == 45;
+    for i in 0..s.len { if s[i] >= 48 && s[i] <= 57 { v = v * 10 + int(s[i] - 48); } }
+    if neg { return 0 - v; }
+    return v;
+}
+
+// Standard base64 (padding optional, whitespace skipped) appended to `out`. False on a bad byte.
+pub fn base64(s: string, out: &Text): bool {
+    let acc = 0;
+    let bits = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        let v = -1;
+        if c >= 65 && c <= 90 { v = int(c - 65); }
+        else if c >= 97 && c <= 122 { v = int(c - 71); }
+        else if c >= 48 && c <= 57 { v = int(c) + 4; }
+        else if c == 43 { v = 62; }
+        else if c == 47 { v = 63; }
+        else if c == 61 { break; }
+        else if c == 10 || c == 13 || c == 32 { continue; }
+        else { return false; }
+        acc = ((acc << 6) | v) & 0xffffff;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8((acc >> bits) & 255));
+        }
+    }
+    return true;
+}
+
+fn percentDecode(s: string, out: &Text) {
+    let i = 0;
+    while i < s.len {
+        if s[i] == 37 && i + 2 < s.len && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0 {
+            out.push(u8(hex(s[i + 1]) * 16 + hex(s[i + 2])));
+            i += 3;
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+}
+
+fn hex(c: u8): int {
+    if c >= 48 && c <= 57 { return int(c - 48); }
+    if c >= 97 && c <= 102 { return int(c - 87); }
+    if c >= 65 && c <= 70 { return int(c - 55); }
+    return -1;
+}
+
+fn startsWith(s: string, p: string): bool { return s.len >= p.len && s[0..p.len] == p; }
+
+// Self-check: cwd, prompt marks and commands come through; the rest reaches the grid.
+pub fn selfTest(mem: &Arena) {
+    let g = Grid.new(mem, 40, 5, 100);
+    let p = Parser.new(mem);
+    let t = create(mem, &g);
+    // `^` is ESC and `~` is BEL here (J3 strings have no \x escapes).
+    let src = Text.new(mem);
+    let raw = "^]0;title~^]7;file://box/home/a%20b~^]133;A~$ ^]633;E;ls -la~ls\r\nout\r\n^]133;A~$ ";
+    for i in 0..raw.len {
+        if raw[i] == 94 { src.push(27); } else if raw[i] == 126 { src.push(7); } else { src.push(raw[i]); }
+    }
+    feed(&p, src.str(), &t);
+    check(t.cwd.str() == "/home/a b", t.cwd.str());
+    check(t.atPrompt, "at prompt");
+    check(t.marks.len == 2 && t.marks.items[0] == 0 && t.marks.items[1] == 2, "marks");
+    check(t.cmds.str() == "ls -la\n", t.cmds.str());
+    check(t.prompt(2, -1) == 0 && t.prompt(0, 1) == 2 && t.prompt(2, 1) == -1, "prompt");
+    // A command that fails, a notification, a clipboard write.
+    src.clear();
+    let raw2 = "false\r\n^]133;C~^]133;D;1~^]133;A~$ ^]777;notify;T;hi there~^]52;c;aGk=~";
+    for i in 0..raw2.len {
+        if raw2[i] == 94 { src.push(27); } else if raw2[i] == 126 { src.push(7); } else { src.push(raw2[i]); }
+    }
+    feed(&p, src.str(), &t);
+    check(t.finished && t.lastExit == 1 && t.didFail(2) && !t.didFail(0), "exit");
+    check(t.outLo == 3 && t.outHi == 3, "output lines");
+    check(t.notePending && t.noteTitle.str() == "T" && t.noteBody.str() == "hi there", "notify");
+    check(t.clipPending && t.clip.str() == "hi", t.clip.str());
+    // `0` requests: only with this shell's token.
+    src.clear();
+    let raw3 = "^]7770;bad;split;aGk=~^]7770;tok;split;aGk=;~";
+    for i in 0..raw3.len {
+        if raw3[i] == 94 { src.push(27); } else if raw3[i] == 126 { src.push(7); } else { src.push(raw3[i]); }
+    }
+    feed(&p, src.str(), &t);
+    check(t.runMode == 0, "untrusted run");
+    t.token.pushStr("tok");
+    feed(&p, src.str(), &t);
+    check(t.runMode == RUN_SPLIT && t.runArgs.len() == 4 && t.runArgs.bytes[0] == 104 && t.runArgs.bytes[1] == 105 && t.runArgs.bytes[2] == 0, "run");
+    let b = Text.new(mem);
+    check(base64("aGVsbG8gd29ybGQ=", &b) && b.str() == "hello world", "base64");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`shellint selfTest: {what}`); } }

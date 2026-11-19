@@ -1,0 +1,200 @@
+module jzero.state;
+
+// State part: islands made from outside the app: command-line launches (`jzero -e htop`)
+// and templates (`<config>/templates/<name>`, a saved layout with a startup command per pane).
+
+extend State {
+    // Act on launch arguments (this run's, or a later `jzero` handing them over):
+    //   -e CMD ARGS...          a new island running CMD (it goes away when CMD exits)
+    //   --working-directory D   start there
+    //   --title T               the new island's name
+    //   --new-island            a new island with a shell
+    //   --class NAME            (main: window class, one copy per class)
+    // True when they asked for something (plain `jzero` asks for nothing).
+    fn launch(this: &State, args: []string): bool {
+        let cmd = args[0..0];  // everything here is used before `launch` returns, so no copies
+        let dir = "";
+        let title = "";
+        let fresh = false;
+        let i = 1;
+        while i < args.len {
+            let a = args[i];
+            if a == "-e" || a == "--command" {
+                cmd = args[i + 1..args.len];
+                break;
+            }
+            let v = "";
+            if i + 1 < args.len { v = args[i + 1]; }
+            if a == "--working-directory" || a == "--cwd" { dir = v; i += 1; }
+            else if a == "--title" { title = v; i += 1; }
+            else if a == "--class" { i += 1; }  // read by main before the window opens
+            else if a == "--new-island" { fresh = true; }
+            else if a != "--toggle" { io.printLn(`jzero: unknown argument "{a}"`); }
+            i += 1;
+        }
+        if cmd.len == 0 && dir.len == 0 && title.len == 0 && !fresh { return false; }
+        if title.len == 0 && cmd.len > 0 { title = os.baseName(cmd[0]); }
+        this.commandIsland(title, dir, cmd);
+        return true;
+    }
+
+    // A new island named `title` ("" keeps the default) running `cmd` in `dir` (a shell when
+    // `cmd` is empty), shown. One with a command is temporary: it goes away when it exits.
+    // Returns its pane id.
+    fn commandIsland(this: &State, title: string, dir: string, cmd: []string): int {
+        let n = this.newIsland();
+        let isl = this.islands.get(n);
+        isl.temp = cmd.len > 0;
+        if title.len > 0 { this.islands.rename(n, title); }
+        let id = this.newPaneId();
+        isl.panes.start(this.openCommand(isl, id, dir, cmd), id);
+        isl.open = true;
+        this.active = n;
+        return id;
+    }
+
+    // An island running `jzctl serve` (the phone page, `remote/serve.j3`): it prints the link and
+    // QR; closing the island stops it. Already running: show it.
+    fn openRemote(this: &State) {
+        let at = this.findPane(this.remotePane);
+        if at.island >= 0 { this.openIsland(at.island); return; }
+        let tmp = Arena.create(4096);
+        let cmd = List<string>.new(&tmp);
+        shells.serve(&tmp, &cmd);
+        this.remotePane = this.commandIsland("Remote", "", cmd.items[0..cmd.len]);
+        tmp.destroy();
+    }
+
+    // Save island `i`'s layout, cwds and each shell's last command as template `<its name>`.
+    fn saveTemplate(this: &State, i: int) {
+        this.refreshCwds();
+        let isl = this.islands.get(i);
+        let t = Text.new(this.mem);
+        t.pushStr(store.TEMPLATE_HEADER);
+        t.push(10);
+        store.encodeIsland(isl, &t, true);
+        io.makeDirs(templatesDir());
+        let path = Text.scratch();
+        path.pushStr(templatesDir());
+        path.push(47);
+        fileName(isl.name.str(), path);
+        io.writeFile(path.str(), t.bytes[0..t.len()]);
+    }
+
+    // Template names (file names) into `out`, in `mem`.
+    fn templates(this: &State, mem: &Arena, out: &List<string>) {
+        match io.listDir(templatesDir(), mem) {
+            Result.Ok(entries) {
+                for e in entries { if !e.isDir && e.name.len > 0 && e.name[0] != 46 { out.push(e.name); } }
+            }
+            Result.Err(_) {}
+        }
+    }
+
+    // A new island from template `name`: its panes start in their folders and run their commands.
+    fn openTemplate(this: &State, name: string) {
+        let path = Text.scratch();
+        path.pushStr(templatesDir());
+        path.push(47);
+        path.pushStr(name);
+        let src = "";
+        match io.readFile(path.str(), this.mem) {
+            Result.Ok(bytes) { src = bytes as string; }
+            Result.Err(_) { return; }
+        }
+        let before = this.islands.count();
+        if store.decode(src, this.mem, &this.islands) < 0 || this.islands.count() == before { return; }
+        let n = before;
+        let slot = 0;
+        while this.islands.near(slotX(slot), slotY(slot)) { slot += 1; }
+        let isl = this.islands.get(n);
+        isl.x = slotX(slot);
+        isl.y = slotY(slot);
+        isl.open = false;
+        let p = &isl.panes;
+        for j in 0..p.nodes.len { if p.isLeaf(j) { p.get(j).id = this.newPaneId(); } }
+        this.openIsland(n);
+        for j in 0..p.nodes.len {
+            if !p.isLeaf(j) { continue; }
+            let run = p.get(j).recentCmds(1);
+            while run.len > 0 && run[run.len - 1] == 10 { run = run[0..run.len - 1]; }
+            if run.len == 0 { continue; }
+            match p.get(j).term {
+                Option.Some(t) {
+                    t.send(run);
+                    t.send("\r");
+                }
+                Option.None {}
+            }
+        }
+    }
+
+    // Gather every pane's scrollback and commands for "search everything".
+    fn gatherAll(this: &State) { this.gatherInto(&this.found); }
+
+    // Every pane's commands and scrollback, open islands and closed ones, into `f`.
+    fn gatherInto(this: &State, f: &Found) {
+        f.reset();
+        for i in 0..this.islands.count() {
+            let p = &this.islands.get(i).panes;
+            for j in 0..p.nodes.len {
+                if !p.isLeaf(j) { continue; }
+                let n = p.get(j);
+                match n.term {
+                    Option.Some(t) {
+                        f.add(i, j, everything.COMMAND, t.tap.cmds.str());
+                        let all = Text.new(f.mem);
+                        t.allText(&all);
+                        f.add(i, j, everything.OUTPUT, all.str());
+                    }
+                    Option.None {
+                        f.add(i, j, everything.COMMAND, n.cmds.str());
+                        match io.readFile(paths.scroll(n.id), f.mem) {
+                            Result.Ok(bytes) { f.add(i, j, everything.OUTPUT, bytes as string); }
+                            Result.Err(_) {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Show a "search everything" hit: its island, its pane, and the match in the pane's search.
+    fn openFound(this: &State, k: int, query: string) {
+        let d = this.found.doc(k);
+        this.openIsland(d.island);
+        let p = &this.islands.get(d.island).panes;
+        if !p.isLeaf(d.leaf) { return; }
+        p.focus = d.leaf;
+        match p.get(d.leaf).term {
+            Option.Some(t) {
+                let q = Text.new(t.mem);
+                q.pushStr(query);
+                t.find.query = q.str();
+                t.openSearch();
+            }
+            Option.None {}
+        }
+    }
+}
+
+fn templatesDir(): string {
+    let t = config.dir();
+    t.pushStr("/templates");
+    return t.str();
+}
+
+// `name` as a file name (`/` and leading dots replaced).
+fn fileName(name: string, out: &Text) {
+    if name.len == 0 { out.pushStr("island"); return; }
+    for i in 0..name.len {
+        let c = name[i];
+        if os.badNameChar(c) || (i == 0 && c == 46) { out.push(45); } else { out.push(c); }
+    }
+}
+
+fn keep(mem: &Arena, s: string): string {
+    let t = Text.new(mem);
+    t.pushStr(s);
+    return t.str();
+}

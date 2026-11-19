@@ -1,0 +1,67 @@
+module jzero.term.reader;
+
+use j3.game.idleWake;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.term.pty.Pty;
+use j3.thread;
+use j3.thread.{ Queue, Thread };
+
+const POLL_MS = 100;  // how often a quiet reader checks `stop`
+
+// Wakes the sleeping frame loop when a pty has output. The worker only waits on the pty (`waitReadable`, the same call on every OS); the main
+// thread does the read. After a wake the worker waits for `consumed`,
+// so a readable fd does not spin it. Must not move once started (keep it in an arena).
+pub struct Reader {
+    pty: &Pty;
+    stop: int = 0;     // atomic: main asks the worker to quit
+    pending: int = 0;  // atomic: worker woke main, waiting for `consumed`
+    joined: bool = false;
+    ack: Queue<int>;
+    thread: Thread;
+
+    fn start(this: &Reader) {
+        thread.spawn(&this.thread, "pty-reader", run, this as ptr);
+    }
+
+    // Main, after draining the pty: let the worker poll again.
+    fn consumed(this: &Reader) {
+        if @atomicLoad(&this.pending) == 1 {
+            @atomicStore(&this.pending, 0);
+            this.ack.tryPush(1);
+        }
+    }
+
+    // Main: ask the worker to end (it notices within POLL_MS). Stop many, then join them, so
+    // the waits overlap. Safe to call again.
+    fn requestStop(this: &Reader) {
+        if @atomicLoad(&this.stop) == 1 { return; }
+        @atomicStore(&this.stop, 1);
+        this.ack.close();
+    }
+
+    // Main: end the worker and wait for it (up to POLL_MS). Call before closing the fd. Safe to call again.
+    fn stopAndJoin(this: &Reader) {
+        this.requestStop();
+        if this.joined { return; }
+        thread.join(&this.thread);
+        this.joined = true;
+    }
+}
+
+pub fn create(mem: &Arena, pty: &Pty): Reader {
+    return Reader { pty: pty, ack: Queue<int>.create(mem, 2), thread: Thread { f: run } };
+}
+
+fn run(arg: ptr) {
+    let r = arg as &Reader;
+    while @atomicLoad(&r.stop) == 0 {
+        if !r.pty.waitReadable(POLL_MS) { continue; }
+        @atomicStore(&r.pending, 1);
+        idleWake();
+        match r.ack.pop() {
+            Option.Some(_) {}
+            Option.None { return; }
+        }
+    }
+}

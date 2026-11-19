@@ -1,0 +1,296 @@
+<script>
+    use jzero.explorer.explorer;
+    use jzero.explorer.explorer.Explorer;
+    use jzero.explorer.ops;
+    use jzero.explorer.clip.Clip;
+    use jzero.explorer.kinds;
+    use jzero.input.mods;
+    use j3.game.{ Key, Mouse, keyPressedRaw, mousePressed, ticks, windowSize };
+    use j3.io;
+    use j3.text.{ Text, find };
+    use jzero.platform.os;
+    use jzero.session.paths;
+    use jzero.util.resize;
+    use jzero.util.resize.Resize;
+    props { ex: &Explorer; clip: &Clip; focused: bool; side: bool = false; scale: f32 = 1.0; }  // scale: the island's zoom  // side: notes (tree beside the editor, autosave, new files are .md)
+    events { focus; menu(x: f32, y: f32); }
+
+    let op = 0;             // ops.NONE / NEW_FILE / NEW_FOLDER / RENAME
+    let name = "";
+    let confirmDelete = false;
+    let confirmBack = false;
+    let editor = -1;        // the textarea
+    let propSize: Resize = resize.create(420.0, 330.0, 260.0, 160.0);  // Properties dialog
+    let mediaSize: Resize = resize.create(960.0, 680.0, 440.0, 260.0);  // image modal
+
+    fn onFrame(dt: f32) {
+        propSize.step();
+        mediaSize.step();
+        if focused && keyPressedRaw(Key.S) && mods.held() == mods.CTRL { ex.save(); }
+        ex.stepDragOut();
+        ex.pollWatch();
+        if ex.isNote() && ex.dirty() && ticks() - ex.editedAt > 1000 { ex.autosave(); }
+        if ex.mode == explorer.EDIT && (ex.hlPending || ex.hl.stale()) { ex.rehighlight(); }
+        if ex.previewing() && ex.doc.hl.stale() { ex.reparse(); }
+        if ex.gotoByte >= 0 && editor >= 0 { d.setSelection(editor, ex.gotoByte, ex.gotoByte); ex.gotoByte = -1; }
+        if focused { fileKeys(); }
+    }
+
+    // Del, Ctrl+C / X / V on the picked rows, while no text box has the keys; the mouse Back button.
+    fn fileKeys() {
+        if focused && mousePressed(Mouse.Back) && !side {
+            if ex.viewing() { ex.closeImage(); } else if ex.mode == explorer.TREE { ex.up(); } else { back(); }
+        }
+        if op != ops.NONE || confirmDelete || ex.props.len() > 0 || ex.viewing() { return; }
+        if ex.mode != explorer.TREE && d.focused() >= 0 { return; }
+        let m = mods.held();
+        if keyPressedRaw(Key.Delete) && m == 0 && ex.selected >= 0 { confirmDelete = true; }
+        if m != mods.CTRL { return; }
+        if keyPressedRaw(Key.C) { ops.copy(ex, clip, false); }
+        if keyPressedRaw(Key.X) { ops.copy(ex, clip, true); }
+        if keyPressedRaw(Key.V) { ops.paste(ex, clip); }
+    }
+
+    // "name" or "3 items" for the delete confirm.
+    fn pickedName(): string {
+        let n = ex.pickCount();
+        if n <= 1 && ex.selected >= 0 { return ex.rows.items[ex.selected].name; }
+        let t = Text.scratch();
+        t.pushInt(n);
+        t.pushStr(" items");
+        return t.str();
+    }
+
+    // Select the next match after the caret (wrapping) and scroll to it.
+    fn findNext() {
+        let at = ex.nextMatch(d.caret(editor));
+        if at >= 0 { d.setSelection(editor, at, at + ex.find.len); }
+    }
+
+    fn startOp(kind: int) {
+        op = kind;
+        name = "";
+        if kind == ops.RENAME && ex.selected >= 0 { name = ex.rows.items[ex.selected].name; }
+    }
+
+    fn finishOp() {
+        if op == ops.RENAME { ex.autosave(); ops.rename(ex, name); dropGone(); }
+        else if op == ops.NEW_FOLDER || !side { ops.create(ex, name, op == ops.NEW_FOLDER); }
+        else { newNote(); }
+        op = ops.NONE;
+    }
+
+    // A note without an extension gets `.md`; it opens right away.
+    fn newNote() {
+        let n = Text.scratch();
+        n.pushStr(name);
+        if find(name, ".") < 0 { n.pushStr(".md"); }
+        ex.autosave();
+        let made = ops.create(ex, n.str(), false);
+        if made.len > 0 { ex.openFile(made); }
+    }
+
+    // Notes: the open note was renamed or deleted, close it (autosave would write it back).
+    fn dropGone() {
+        if side && ex.mode != explorer.TREE && !io.exists(ex.file.str()) { ex.back(); }
+    }
+
+    // A row click picks it; a double click opens it.
+    fn press(i: int) {
+        if ex.press(i, mods.held()) { open(i); }
+    }
+
+    // Open row `i`; in notes the open note is saved first (the tree stays beside it).
+    fn open(i: int) {
+        if side { ex.autosave(); }
+        ex.activate(i);
+    }
+
+    fn back() {
+        if ex.dirty() { confirmBack = true; } else { ex.back(); }
+    }
+
+    // The modal's size, kept inside a smaller window.
+    fn fitW(w: f32): f32 { let m = windowSize().x - 16.0; return if w > m { m } else { w }; }
+    fn fitH(h: f32): f32 { let m = windowSize().y - 16.0; return if h > m { m } else { h }; }
+
+    fn fileName(): string {
+        let path = ex.file.str();
+        let k = path.len;
+        while k > 0 && path[k - 1] != 47 { k -= 1; }
+        return path[k..path.len];
+    }
+</script>
+
+<div class="explorer" class:focused={focused} class:side={side} style:font-size="{14.0 * scale}px" on:mousedown={emit focus}
+    on:contextmenu={ex.menuRow = -1; emit focus; emit menu(mouse.x, mouse.y);}>
+    <div class="focusbar"></div>
+    <div class="body">
+    {#if side || ex.mode == explorer.TREE}
+        <div class="files">
+        <div class="bar">
+            {#if side}
+                <span class="title" title={ex.root.str()}>Notes</span>
+            {:else}
+                <button class="btn" title="Parent folder" disabled={os.isRoot(ex.root.str())} on:click={ex.up()}><icon name="arrow-90deg-up" /></button>
+                <span class="title" title={ex.root.str()}>{paths.tilde(ex.root.str())}</span>
+            {/if}
+            <button class="btn" title="New file" on:click={startOp(ops.NEW_FILE)}><icon name="file-earmark-plus" /></button>
+            <button class="btn" title="New folder" on:click={startOp(ops.NEW_FOLDER)}><icon name="folder-plus" /></button>
+            <button class="btn" title="Rename" disabled={ex.selected < 0} on:click={startOp(ops.RENAME)}><icon name="pencil" /></button>
+            <button class="btn" title="Delete" disabled={ex.selected < 0} on:click={confirmDelete = true}><icon name="trash" /></button>
+{#if !side}
+                            <button class="btn" title="Open in $EDITOR" disabled={ex.selected < 0 || ex.rows.items[ex.selected].isDir} on:click={ex.openInEditor()}><icon name="terminal" /></button>
+            {/if}
+            {#if !side}
+                <button class="btn" class:on={ex.grid} title={if ex.grid { "List view" } else { "Grid view" }} on:click={ex.toggleGrid()}><icon name={if ex.grid { "list-ul" } else { "grid-3x3-gap" }} /></button>
+            {/if}
+            <button class="btn" class:on={ex.showHidden} title="Show hidden files" on:click={ex.toggleHidden()}><icon name={if ex.showHidden { "eye" } else { "eye-slash" }} /></button>
+            <button class="btn" title="Refresh" on:click={ex.refresh()}><icon name="arrow-clockwise" /></button>
+        </div>
+        {#if op != ops.NONE}
+            <div class="namebar">
+                <input type="text" class="field" bind:value={name} on:submit={finishOp()} />
+                <button class="small" on:click={finishOp()}>OK</button>
+                <button class="small" on:click={op = ops.NONE}>Cancel</button>
+            </div>
+        {/if}
+        {#if ex.grid && !side}
+            <explorer.Grid ex={ex} on:pick={open(event.i)} on:menu={ex.menuRow = event.i} />
+        {:else}
+        <div class="tree">
+            {#each ex.rows.items[0..ex.rows.len] as &r, i}
+                {#if r.isDir}
+                    <div class="row git-{r.git}" class:sel={ex.picked(i)} style:padding-left={(8.0 + f32(r.depth) * 14.0) * scale}
+                        draggable drag-data={r.path.str()} on:dragstart={ex.setDragOut(data)} on:dragend={ex.dragOut.clear()} on:click={press(i)} on:contextmenu={ex.menuRow = i}
+                        on:drop={ops.move(ex, data, r.path.str())}>
+                        <icon name={if r.open { "chevron-down" } else { "chevron-right" }} />
+                        <icon name="folder" />
+                        <span class="nm">{r.name}</span>
+                        <span class="info">{ex.info(i)}</span>
+                    </div>
+                {:else}
+                    <div class="row git-{r.git}" class:sel={ex.picked(i)} style:padding-left={(22.0 + f32(r.depth) * 14.0) * scale}
+                        draggable drag-data={r.path.str()} on:dragstart={ex.setDragOut(data)} on:dragend={ex.dragOut.clear()} on:click={press(i)} on:contextmenu={ex.menuRow = i}>
+                        <icon name={if kinds.isImage(r.name) { "file-earmark-image" } else if kinds.of(r.name) == kinds.MARKDOWN { "markdown" } else { "file-earmark" }} />
+                        <span class="nm">{r.name}</span>
+                        <span class="info">{ex.info(i)}</span>
+                    </div>
+                {/if}
+            {/each}
+        </div>
+        {/if}
+        </div>
+    {/if}
+    {#if ex.mode == explorer.EDIT}
+        <div class="edit">
+        <div class="bar">
+            {#if !side}
+                <button class="btn" title="Back to files" on:click={back()}><icon name="chevron-left" /></button>
+            {/if}
+            <span class="title">{fileName()}{if ex.dirty() { " *" } else { "" }}</span>
+            {#if ex.kind == kinds.MARKDOWN}
+                <button class="btn" class:on={ex.preview} title={if ex.preview { "Show source" } else { "Show preview" }} on:click={ex.togglePreview()}><icon name={if ex.preview { "code-slash" } else { "eye" }} /></button>
+            {/if}
+            {#if !ex.previewing()}
+                <button class="btn" title="Find and replace" on:click={ex.showFind = !ex.showFind}><icon name="search" /></button>
+            {/if}
+            <button class="btn" title="Save (Ctrl+S)" disabled={!ex.dirty()} on:click={ex.save()}><icon name="floppy" /></button>
+        </div>
+        {#if ex.showFind}
+            <div class="namebar">
+                <input type="text" class="field" placeholder="Find" bind:value={ex.find} on:submit={findNext()} />
+                <input type="text" class="field" placeholder="Replace" bind:value={ex.replace} />
+                <span class="count">{ex.findCount()}</span>
+                <button class="small" on:click={findNext()}>Next</button>
+                <button class="small" on:click={ex.replaceAll()}>Replace all</button>
+            </div>
+        {/if}
+        {#if ex.previewing()}
+            <explorer.MdView ex={ex} />
+        {:else}
+            <textarea class="editor" rich bind:this={editor} bind:value={ex.text} bind:spans={ex.spans} on:input={ex.edited()} />
+        {/if}
+        </div>
+    {/if}
+    </div>
+    {#if ex.message.len() > 0}
+        <div class="msg">{ex.message.str()}</div>
+    {/if}
+    {#if confirmDelete}
+        <dialog modal class="confirm" on:close={confirmDelete = false}>
+            <p>Move {pickedName()} to the trash?</p>
+            <div class="acts">
+                <button class="small" on:click={confirmDelete = false}>Cancel</button>
+                <button class="small danger" default on:click={ex.autosave(); ops.trash(ex); dropGone(); confirmDelete = false}>Move to trash</button>
+            </div>
+        </dialog>
+    {/if}
+    {#if ex.props.len() > 0}
+        <dialog modal class="confirm props" style:width="{propSize.w}px" style:height="{propSize.h}px" on:close={ex.closeProps()}>
+            {#each ex.propLines.items[0..ex.propLines.len] as l}
+                <div class="prop"><span class="pk">{explorer.propPart(l, 0)}</span><span class="pv" title={explorer.propPart(l, 1)}>{explorer.propPart(l, 1)}</span></div>
+            {/each}
+            <div class="acts">
+                <button class="small" default on:click={ex.closeProps()}>Close</button>
+            </div>
+            <div class="grip" on:mousedown|stop={propSize.grab()}></div>
+        </dialog>
+    {/if}
+    {#if ex.viewing()}
+        <dialog modal class="media" style:width="{fitW(mediaSize.w)}px" style:height="{fitH(mediaSize.h)}px" on:close={ex.closeImage()}>
+            <explorer.ImageView ex={ex} on:close={ex.closeImage()} />
+            <div class="grip" on:mousedown|stop={mediaSize.grab()}></div>
+        </dialog>
+    {/if}
+    {#if confirmBack}
+        <dialog modal class="confirm" on:close={confirmBack = false}>
+            <p>Discard unsaved changes to {fileName()}?</p>
+            <div class="acts">
+                <button class="small" on:click={confirmBack = false}>Keep editing</button>
+                <button class="small danger" default on:click={ex.back(); confirmBack = false}>Discard</button>
+            </div>
+        </dialog>
+    {/if}
+</div>
+
+<style>
+    .explorer { position: absolute; display: flex; flex-direction: column; background: var(--term-bg); color: var(--term-fg); overflow: hidden; }
+    .focusbar { height: 2px; flex-shrink: 0; background: var(--term-bg); }
+    .explorer.focused .focusbar { background: var(--chrome-active); }
+    .body { flex: 1; min-height: 0; display: flex; flex-direction: row; }
+    .files, .edit { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    .side .files { flex: 0; flex-shrink: 0; width: 18.571em; background: var(--chrome-bg); }
+    .side .title { padding-left: 0.571em; }
+    .bar { height: 2.286em; flex-shrink: 0; display: flex; flex-direction: row; align-items: center; padding-left: 2px; background: var(--chrome-bg); }
+    .title { flex: 1; min-width: 0; overflow: hidden; white-space: pre; color: var(--c-bright-white); }
+    .btn { width: 2.286em; height: 2.286em; display: flex; align-items: center; justify-content: center; }
+    .btn:disabled { opacity: 0.4; cursor: default; }
+    .namebar { flex-shrink: 0; display: flex; flex-direction: row; align-items: center; gap: 0.429em; padding: 0.429em 0.714em; background: var(--chrome-bg); }
+    .field { flex: 1; min-width: 0; height: 1.857em; padding: 0 0.429em; background: var(--chrome-hover); color: var(--c-bright-white); border: none; }
+    .small { height: 1.857em; padding: 0 0.714em; background: var(--chrome-hover); }
+    .count { color: var(--c-bright-black); width: 2.286em; text-align: center; }
+    .tree { flex: 1; min-height: 0; overflow-y: auto; padding: 0.286em 0; }
+    .row { height: 1.714em; display: flex; flex-direction: row; align-items: center; gap: 0.429em; padding-right: 0.571em; cursor: pointer; user-select: none; }
+    .row:hover { background: var(--chrome-hover); }
+    .row.sel { background: var(--chrome-active); color: var(--c-bright-white); }
+    .row:drop-target { background: var(--chrome-active); }
+    .git-1 { color: var(--c-bright-yellow); }
+    .git-2 { color: var(--c-bright-green); }
+    .git-3 { color: var(--c-bright-cyan); }
+    .btn.on { color: var(--c-bright-white); }
+    .nm { flex: 1; min-width: 0; white-space: pre; overflow: hidden; }
+    .info { flex-shrink: 0; color: var(--c-bright-black); white-space: pre; }
+    .row.sel .info { color: var(--chrome-fg); }
+    .props { position: relative; gap: 6px; overflow: hidden; }
+    .media { position: relative; padding: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--chrome-bg); }
+    .grip { position: absolute; right: 0; bottom: 0; width: 12px; height: 12px; cursor: move; background: var(--chrome-hover); }
+    .prop { display: flex; flex-direction: row; gap: 12px; }
+    .pk { width: 96px; flex-shrink: 0; color: var(--c-bright-black); }
+    .pv { flex: 1; min-width: 0; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+    .editor { flex: 1; min-height: 0; padding: 0.429em 0.714em; font-family: "Mono"; font-size: 0.929em; background: var(--term-bg); color: var(--term-fg); border: none; }
+    .msg { flex-shrink: 0; padding: 0.286em 0.714em; color: var(--c-bright-black); background: var(--chrome-bg); white-space: pre; overflow: hidden; }
+    .confirm { width: 320px; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--chrome-bg); color: var(--chrome-fg); }
+    .acts { display: flex; flex-direction: row; justify-content: flex-end; gap: 0.571em; }
+    .danger { background: var(--chrome-danger); color: var(--c-bright-white); }
+</style>

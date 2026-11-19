@@ -1,0 +1,189 @@
+module jzero.platform.shells;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.os;
+
+// Which shells this OS has, which one a new pane runs, and how the few shell-shaped jobs are
+// started (`$EDITOR`, the `0` command, the `jzctl serve` pane).
+
+// Shell families shell integration knows (`term/shellsetup.j3`), by program name.
+pub const OTHER = 0;
+pub const BASH = 1;
+pub const ZSH = 2;
+pub const FISH = 3;
+pub const POWERSHELL = 4;  // pwsh and Windows PowerShell
+pub const CMD = 5;
+
+// A shell found on this machine, for the palette's "Shell: ..." entries.
+pub struct Found {
+    title: string;
+    argv: []string;     // what to run; `argv[0]` is the shell when `integrated`
+    integrated: bool;   // a local shell: gets shell integration. Else a plain program (WSL).
+}
+
+// The family of `shell` (a path or a name; `.exe` and case do not matter).
+pub fn kind(shell: string): int {
+    let name = Text.scratch();
+    for c in os.baseName(shell) { name.push(if c >= 65 && c <= 90 { c + 32 } else { c }); }
+    let n = name.str();
+    if n.len > 4 && n[n.len - 4..n.len] == ".exe" { n = n[0..n.len - 4]; }
+    if n == "bash" { return BASH; }
+    if n == "zsh" { return ZSH; }
+    if n == "fish" { return FISH; }
+    if n == "pwsh" || n == "powershell" { return POWERSHELL; }
+    if n == "cmd" { return CMD; }
+    return OTHER;
+}
+
+// The shell a pane runs when the config names none. Linux: `$SHELL`, else /bin/bash.
+// Windows (VS Code's order): PowerShell 7, Windows PowerShell, `%COMSPEC%`.
+pub fn fallback(mem: &Arena): string {
+    if !os.windows() {
+        let sh = sys.env("SHELL");
+        return if sh.len > 0 { sh } else { "/bin/bash" };
+    }
+    if proc.findProgram("pwsh.exe", mem).len > 0 { return "pwsh.exe"; }
+    if proc.findProgram("powershell.exe", mem).len > 0 { return "powershell.exe"; }
+    let cmd = sys.env("COMSPEC");
+    return if cmd.len > 0 { cmd } else { "cmd.exe" };
+}
+
+// Every shell found here, the default first. Strings live in `mem`.
+pub fn detect(mem: &Arena, out: &List<Found>) {
+    if os.windows() { detectWindows(mem, out); return; }
+    add(mem, out, os.baseName(fallback(mem)), fallback(mem));
+    match io.readFile("/etc/shells", mem) {
+        Result.Ok(bytes) {
+            let src = bytes as string;
+            let start = 0;
+            for i in 0..src.len + 1 {
+                if i < src.len && src[i] != 10 { continue; }
+                let line = src[start..i];
+                start = i + 1;
+                if line.len == 0 || line[0] != 47 || !io.exists(line) { continue; }
+                add(mem, out, os.baseName(line), line);
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+fn detectWindows(mem: &Arena, out: &List<Found>) {
+    if proc.findProgram("pwsh.exe", mem).len > 0 { add(mem, out, "PowerShell", "pwsh.exe"); }
+    if proc.findProgram("powershell.exe", mem).len > 0 { add(mem, out, "Windows PowerShell", "powershell.exe"); }
+    add(mem, out, "Command Prompt", "cmd.exe");
+    let git = Text.new(mem);
+    git.add(os.slashes(sys.env("ProgramFiles"))).add("/Git/bin/bash.exe");
+    if io.exists(git.str()) { add(mem, out, "Git Bash", git.str()); }
+    // WSL distros: `wsl.exe -l -q` prints one per line, in UTF-16.
+    let list: [3]string = ["wsl.exe", "-l", "-q"];
+    match proc.run(list[:], "", mem) {
+        Result.Ok(o) {
+            if o.code != 0 { return; }
+            let names = Text.new(mem);
+            for b in o.out { if b != 0 && b != 13 { names.push(b); } }  // ponytail: ASCII names only
+            let src = names.str();
+            let start = 0;
+            for i in 0..src.len + 1 {
+                if i < src.len && src[i] != 10 { continue; }
+                let name = src[start..i];
+                start = i + 1;
+                if name.len == 0 { continue; }
+                let argv = mem.alloc::<string>(3);
+                argv[0] = "wsl.exe";
+                argv[1] = "-d";
+                argv[2] = name;
+                out.push(Found { title: Text.new(mem).add("WSL ").add(name).str(), argv: argv, integrated: false });
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+// Add shell `program` as `title`, once per title.
+fn add(mem: &Arena, out: &List<Found>, title: string, program: string) {
+    for i in 0..out.len { if out.items[i].title == title { return; } }
+    let argv = mem.alloc::<string>(1);
+    argv[0] = Text.new(mem).add(program).str();
+    out.push(Found { title: Text.new(mem).add(title).str(), argv: argv, integrated: true });
+}
+
+// Argv that edits `file` in the user's editor, into `out` (strings in `mem`). `$EDITOR` may
+// carry flags (`code -w`). Linux lets a shell split it (default vi); Windows splits on
+// spaces (default Notepad).
+pub fn editor(file: string, mem: &Arena, out: &List<string>) {
+    if !os.windows() {
+        out.push("sh");
+        out.push("-c");
+        out.push("exec ${EDITOR:-vi} \"$1\"");
+        out.push("sh");
+        out.push(file);
+        return;
+    }
+    let ed = sys.env("EDITOR");
+    if ed.len == 0 { ed = "notepad.exe"; }
+    let start = 0;
+    for i in 0..ed.len + 1 {
+        if i < ed.len && ed[i] != 32 { continue; }
+        if i > start { out.push(ed[start..i]); }
+        start = i + 1;
+    }
+    out.push(Text.new(mem).add(os.native(file)).str());
+}
+
+// Argv that runs the `0` command installed in folder `bin` (`assets/shell/bin`), into `out`.
+// Linux runs the bash script; Windows runs `zero.ps1` with Windows PowerShell.
+pub fn zero(bin: string, mem: &Arena, out: &List<string>) {
+    let t = Text.new(mem);
+    t.pushStr(bin);
+    if !os.windows() {
+        t.pushStr("/0");
+        out.push(t.str());
+        return;
+    }
+    t.pushStr("/zero.ps1");
+    out.push("powershell.exe");
+    out.push("-NoProfile");
+    out.push("-ExecutionPolicy");
+    out.push("Bypass");
+    out.push("-File");
+    out.push(Text.new(mem).add(os.native(t.str())).str());
+}
+
+// The file the `0` command reads its functions from: bash on Linux, PowerShell on Windows.
+pub fn commandsName(): string { return if os.windows() { "commands.ps1" } else { "commands.sh" }; }
+
+// Argv for the pane that runs `jzctl serve`, into `out`. Linux holds the pane open when it
+// fails (port taken), so the error stays readable.
+pub fn serve(mem: &Arena, out: &List<string>) {
+    let exe = Text.new(mem).add(os.native(os.exe())).str();
+    if os.windows() {
+        out.push(exe);
+        out.push("--ctl");
+        out.push("serve");
+        return;
+    }
+    out.push("bash");
+    out.push("-c");
+    out.push("\"$0\" --ctl serve || read -rp 'Enter closes '");
+    out.push(exe);
+}
+
+// Self-check: shell families; this machine has a default shell and lists it first.
+pub fn selfTest(mem: &Arena) {
+    check(kind("/usr/bin/bash") == BASH && kind("zsh") == ZSH && kind("/bin/fish") == FISH && kind("/bin/sh") == OTHER, "kind");
+    check(kind("C:/Program Files/PowerShell/7/pwsh.exe") == POWERSHELL && kind("PowerShell.EXE") == POWERSHELL && kind("cmd.exe") == CMD, "kind exe");
+    let found = List<Found>.new(mem);
+    detect(mem, &found);
+    check(fallback(mem).len > 0 && found.len > 0 && found.items[0].integrated, "detect");
+    let argv = List<string>.new(mem);
+    editor("/tmp/a b.txt", mem, &argv);
+    check(argv.len >= 2, "editor");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`shells selfTest: {what}`); } }

@@ -1,0 +1,12 @@
+<script>
+    use jzero.config.draft.Draft;
+    props { dr: &Draft; }
+</script>
+<div class="tab">
+    <settings.Row name="Show hidden files" note="For explorers opened after Save.">
+        <input type="checkbox" bind:checked={dr.explorerHidden} />
+    </settings.Row>
+    <settings.Row name="Notes folder" note="Empty uses notes/ in the data folder.">
+        <input type="text" placeholder="Default" bind:value={dr.notesDir} />
+    </settings.Row>
+</div>

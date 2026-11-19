@@ -1,0 +1,52 @@
+<script>
+    use jzero.layout.split.Node;
+    props { node: &Node; leaf: int; focused: bool; keys: bool; pointer: bool; broadcast: bool; alpha: f32 = 1.0; }
+    events { focus; menu(x: f32, y: f32); swap(from: int); }
+    use j3.game.mousePos;
+
+    let el = -1;  // the canvas
+
+    fn drawPane(size: Vec2) {
+        let m = mousePos();
+        let ox = d.absX(el);
+        let oy = d.absY(el);
+        node.drawTerm(size.x, size.y, focused, keys, Vec2 { x: m.x - ox, y: m.y - oy }, pointer, Vec2 { x: ox, y: oy });
+    }
+
+    // Another pane's bar dropped here swaps the two; an explorer row pastes its path.
+    fn dropped(data: string, from: int) {
+        if data == "pane" { emit swap(from); return; }
+        if data.len > 0 && node.hasTerm() { node.session().pastePath(data); }
+    }
+
+    // The plain (unfocused) bar is terminal background, so it fades with `background-opacity`.
+    fn barAlpha(): f32 { if focused || broadcast { return 1.0; } return alpha; }
+
+    fn searching(): bool { return node.hasTerm() && node.session().find.open; }
+
+    // `jzctl badge` text ("" none).
+    fn badge(): string { if node.hasTerm() { return node.session().badge.str(); } return ""; }
+</script>
+
+<div class="pane" class:clear={alpha < 1.0} class:focused={focused} class:bcast={broadcast} on:drop={dropped(data, dragId)}
+    on:mousedown={emit focus} on:contextmenu={emit focus; emit menu(mouse.x, mouse.y);}>
+    <div class="focusbar" style:opacity={barAlpha()} draggable drag-data="pane" drag-id={leaf} title="Drag onto another pane to swap, or onto an island to move"></div>
+    <canvas class="term" bind:this={el} on:draw={drawPane(size)}></canvas>
+    {#if badge().len > 0}
+        <div class="badge">{badge()}</div>
+    {/if}
+    {#if searching()}
+        <island.SearchBar s={node.session()} />
+    {/if}
+</div>
+
+<style>
+    .pane { position: absolute; display: flex; flex-direction: column; background: var(--term-bg); overflow: hidden; }
+    .pane.clear { background: transparent; }  /* the canvas draws the background */
+    .focusbar { height: 4px; flex-shrink: 0; background: var(--term-bg); cursor: move; }
+    .pane.focused .focusbar { background: var(--chrome-active); }
+    .pane.bcast .focusbar { background: var(--chrome-danger); }
+    .pane:drop-target .focusbar { background: var(--c-bright-yellow); }
+    .badge { position: absolute; top: 4px; right: 0; padding: 2px 8px; background: var(--c-yellow); color: var(--term-bg); }
+    .term { flex: 1; min-width: 0; min-height: 0; }
+</style>

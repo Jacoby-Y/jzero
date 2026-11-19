@@ -1,0 +1,45 @@
+<script>
+    use jzero.state.State;
+    use jzero.actions;
+    props { state: &State; }
+
+    fn pick(id: int) {
+        state.menuOpen = false;
+        actions.run(state, id);
+    }
+</script>
+
+<div class="menu" popover left={state.menuX} top={state.menuY} on:close={state.menuOpen = false}>
+    {#each 0..state.extMenuLen() as i}
+        <button class="entry" menuitem on:click={state.extMenuPick(i)}><span class="lbl">{state.extMenuLabel(i)}</span></button>
+    {/each}
+    {#if state.menuFolder()}
+        <button class="entry" menuitem on:click={state.focusFolder()}><span class="lbl">Focus folder</span></button>
+    {/if}
+    {#if state.menuRowAt()}
+        <button class="entry" menuitem on:click={state.rowProps()}><span class="lbl">Properties</span></button>
+    {/if}
+    {#if state.extMenuLen() > 0 || state.menuRowAt()}
+        <div class="sep"></div>
+    {/if}
+    {#each 0..actions.MENU_LEN as k}
+        {#let id = actions.menuItem(k)}
+        {#if id == 0}
+            <div class="sep"></div>
+        {:else if (id == actions.EXPLORER || id == actions.NOTE) && !state.focusedShell()}
+        {:else}
+            <button class="entry" menuitem on:click={pick(id)}>
+                <span class="lbl">{actions.title(id)}</span><span class="key">{state.hint(id)}</span>
+            </button>
+        {/if}
+    {/each}
+</div>
+
+<style>
+    .menu { width: 260px; padding: 4px 0; display: flex; flex-direction: column; background: var(--chrome-bg); }
+    .entry { height: 28px; padding: 0 12px; text-align: left; justify-content: flex-start; display: flex; align-items: center; }
+    .entry:focus { background: var(--chrome-hover); }
+    .lbl { flex: 1; }
+    .key { margin-left: 12px; color: var(--c-bright-black); }
+    .sep { height: 1px; margin: 4px 0; background: var(--chrome-hover); }
+</style>

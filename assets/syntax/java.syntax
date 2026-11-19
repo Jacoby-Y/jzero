@@ -1,0 +1,17 @@
+# Java, Kotlin, C#, Dart (close enough)
+name = Java
+ext = java kt kts cs dart scala
+comment = //
+comment = /* */
+region = string """ """ multiline
+string = " " escape
+region = string ' ' char
+prefix = annotation @
+keyword = abstract class enum extends final implements import instanceof interface native new package private protected public static super synchronized this throws transient volatile var val fun object is in out override open data sealed companion namespace using async await readonly ref get set record
+control = assert break case catch continue default do else finally for if return switch throw try while when yield
+plain = variable
+type = boolean byte char short int long float double void String Int Long Double Boolean Unit Any
+constant = true false null
+after = type class interface enum record object struct
+call = true
+capitalized = type

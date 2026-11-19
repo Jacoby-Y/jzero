@@ -1,0 +1,155 @@
+module jzero.explorer.explorer;
+
+// Explorer part: picking rows (click, Ctrl+click toggles, Shift+click a range), double click opens,
+// row info text (size / item count), Properties.
+
+const DOUBLE_CLICK = 400;  // ms between presses on one row that open it
+
+extend Explorer {
+    // A press on row `i` with modifier bits `m` (jzero.input.mods). True on a double click (open it).
+    fn press(this: &Explorer, i: int, m: int): bool {
+        let now = game.ticks();
+        let dbl = m == 0 && i == this.lastPress && now - this.lastPressAt < DOUBLE_CLICK;
+        this.lastPress = i;
+        if dbl { this.lastPress = -1; }
+        this.lastPressAt = now;
+        if (m & mods.SHIFT) != 0 && this.anchor >= 0 && this.anchor < this.rows.len {
+            let a = this.anchor;
+            let b = i;
+            if b < a { a = i; b = this.anchor; }
+            for k in 0..this.rows.len { this.rows.items[k].sel = k >= a && k <= b; }
+        } else if (m & mods.CTRL) != 0 {
+            this.rows.items[i].sel = !this.rows.items[i].sel;
+            this.anchor = i;
+        } else {
+            this.clearPicks();
+            this.rows.items[i].sel = true;
+            this.anchor = i;
+        }
+        this.selected = i;
+        return dbl;
+    }
+
+    fn clearPicks(this: &Explorer) {
+        for k in 0..this.rows.len { this.rows.items[k].sel = false; }
+    }
+
+    // Row `i` is picked (highlighted).
+    fn picked(this: &Explorer, i: int): bool {
+        return this.rows.items[i].sel || (i == this.selected && this.pickCount() == 0);
+    }
+
+    fn pickCount(this: &Explorer): int {
+        let n = 0;
+        for k in 0..this.rows.len { if this.rows.items[k].sel { n += 1; } }
+        return n;
+    }
+
+    // Paths of the picked rows (the selected row when none is), in `mem`.
+    // A picked folder's picked children are left out (the folder carries them).
+    fn pickedPaths(this: &Explorer, mem: &Arena): List<string> {
+        let out = List<string>.new(mem);
+        for k in 0..this.rows.len {
+            if !this.picked(k) { continue; }
+            let p = this.rows.items[k].path.str();
+            let inside = false;
+            for j in 0..out.len { if underDir(p, out.items[j]) { inside = true; } }
+            if !inside { out.push(p); }
+        }
+        return out;
+    }
+
+    // "4.2 KB" for a file, "12 items" for a folder.
+    fn info(this: &Explorer, i: int): string {
+        let r = &this.rows.items[i];
+        let t = Text.scratch();
+        if r.isDir {
+            if r.items < 0 { return ""; }
+            t.pushInt(r.items);
+            if r.items == 1 { t.pushStr(" item"); } else { t.pushStr(" items"); }
+        } else {
+            humanSize(t, r.size);
+        }
+        return t.str();
+    }
+
+    // Properties of row `i` into `props` (label/value lines), from `stat`.
+    fn showProps(this: &Explorer, i: int) {
+        this.loadProps(i);
+        this.propLines.len = 0;
+        let s = this.props.str();
+        let k = 0;
+        while k < s.len {
+            let e = k;
+            while e < s.len && s[e] != 10 { e += 1; }
+            this.propLines.push(s[k..e]);
+            k = e + 1;
+        }
+    }
+
+    fn closeProps(this: &Explorer) { this.props.clear(); this.propLines.len = 0; }
+
+    fn loadProps(this: &Explorer, i: int) {
+        this.props.clear();
+        fresh(this.load);
+        if i < 0 || i >= this.rows.len { return; }
+        let r = &this.rows.items[i];
+        let p = r.path.str();
+        propLine(&this.props, "Name", r.name);
+        propLine(&this.props, "Location", p[0..p.len - r.name.len]);
+        let err = Text.scratch();
+        let f = fileops.facts(p, this.load, err);
+        if f.len == 0 { propLine(&this.props, "Error", err.str()); return; }
+        let labels: [7]string = ["Type", "Size", "Permissions", "Owner", "Group", "Modified", "Accessed"];
+        let k = 0;
+        for l in labels {
+            let e = k;
+            while e < f.len && f[e] != 10 { e += 1; }
+            let v = f[k..e];
+            k = e + 1;
+            if v.len == 0 { continue; }  // this OS does not say
+            if l == "Size" {
+                let t = Text.scratch();
+                if r.isDir { t.pushStr(this.info(i)); } else { humanSize(t, r.size); t.pushStr(" ("); t.pushStr(v); t.pushStr(" bytes)"); }
+                v = t.str();
+            }
+            let dot = find(v, ".");
+            if (l == "Modified" || l == "Accessed") && dot > 0 { v = v[0..dot]; }
+            propLine(&this.props, l, v);
+            if k > f.len { break; }
+        }
+    }
+}
+
+// Part `which` (0 label, 1 value) of a Properties line.
+pub fn propPart(line: string, which: int): string {
+    let t = find(line, "\t");
+    if t < 0 { return line; }
+    if which == 0 { return line[0..t]; }
+    return line[t + 1..line.len];
+}
+
+// `path` is inside folder `dir`.
+fn underDir(path: string, dir: string): bool {
+    return path.len > dir.len && path[0..dir.len] == dir && path[dir.len] == 47;
+}
+
+fn propLine(t: &Text, label: string, value: string) {
+    t.pushStr(label);
+    t.push(9);
+    t.pushStr(value);
+    t.push(10);
+}
+
+// Bytes as "512 B", "4.2 KB", "13 MB" (1024 steps).
+pub fn humanSize(t: &Text, n: int) {
+    if n < 1024 { t.pushInt(n); t.pushStr(" B"); return; }
+    let units: [5]string = ["KB", "MB", "GB", "TB", "PB"];
+    let tenths = (n * 10 + 512) / 1024;
+    let u = 0;
+    while tenths >= 10240 && u < 4 { tenths = (tenths + 512) / 1024; u += 1; }
+    if tenths < 100 { t.pushInt(tenths / 10); t.push(46); t.pushInt(tenths % 10); }
+    else { t.pushInt((tenths + 5) / 10); }
+    t.push(32);
+    t.pushStr(units[u]);
+}

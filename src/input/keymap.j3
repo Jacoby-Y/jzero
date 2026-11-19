@@ -1,0 +1,110 @@
+module jzero.input.keymap;
+
+use j3.game.{ Key, keyPressedRaw };
+use j3.io.printLn;
+use j3.text.{ Text, find };
+use jzero.input.keynames;
+use jzero.input.keynames.KeyNames;
+use jzero.input.mods;
+use jzero.input.mods.{ CTRL, SHIFT, ALT };
+use j3.memory.{ Arena, List };
+use jzero.actions;
+
+pub struct Binding {
+    mods: int;
+    key: Key;
+    action: int;
+}
+
+// Key combos to action ids. Checked every frame before the terminal reads keys.
+pub struct Keymap {
+    list: List<Binding>;
+
+    fn bind(this: &Keymap, mods: int, key: Key, action: int) {
+        for i in 0..this.list.len {
+            let b = &this.list.items[i];
+            if b.mods == mods && b.key == key { b.action = action; return; }
+        }
+        this.list.push(Binding { mods: mods, key: key, action: action });
+    }
+
+    fn clear(this: &Keymap) { this.list.len = 0; }
+
+    // Ghostty-style defaults.
+    fn reset(this: &Keymap) {
+        this.clear();
+        this.bind(CTRL | SHIFT, Key.C, actions.COPY);
+        this.bind(CTRL | SHIFT, Key.V, actions.PASTE);
+        this.bind(CTRL | SHIFT, Key.T, actions.NEW_ISLAND);
+        this.bind(CTRL, Key.Comma, actions.SETTINGS);
+        this.bind(CTRL | SHIFT, Key.P, actions.PALETTE);
+        this.bind(CTRL | SHIFT, Key.B, actions.EXPLORER);
+        this.bind(CTRL | SHIFT, Key.PageUp, actions.PROMPT_PREV);
+        this.bind(CTRL | SHIFT, Key.PageDown, actions.PROMPT_NEXT);
+        this.bind(CTRL | SHIFT, Key.O, actions.SPLIT_RIGHT);
+        this.bind(CTRL | SHIFT, Key.E, actions.SPLIT_DOWN);
+        this.bind(CTRL | SHIFT, Key.W, actions.CLOSE_PANE);
+        this.bind(CTRL | SHIFT, Key.Equals, actions.EQUALIZE);
+        this.bind(CTRL | ALT, Key.Left, actions.FOCUS_LEFT);
+        this.bind(CTRL | ALT, Key.Right, actions.FOCUS_RIGHT);
+        this.bind(CTRL | ALT, Key.Up, actions.FOCUS_UP);
+        this.bind(CTRL | ALT, Key.Down, actions.FOCUS_DOWN);
+        this.bind(CTRL, Key.Equals, actions.ZOOM_IN);
+        this.bind(CTRL, Key.Minus, actions.ZOOM_OUT);
+        this.bind(CTRL, Key.Num0, actions.ZOOM_RESET);
+        this.bind(CTRL, Key.Tab, actions.NEXT_ISLAND);
+        this.bind(CTRL | SHIFT, Key.Tab, actions.PREV_ISLAND);
+        this.bind(CTRL | SHIFT, Key.F, actions.SEARCH);
+        this.bind(CTRL | SHIFT, Key.H, actions.SEARCH_ALL);
+        this.bind(CTRL | SHIFT, Key.Y, actions.COPY_OUTPUT);
+        this.bind(CTRL | SHIFT, Key.Enter, actions.ZOOM_PANE);
+        this.bind(CTRL | SHIFT, Key.I, actions.BROADCAST);
+        this.bind(CTRL | SHIFT, Key.Q, actions.QUIT);
+    }
+
+    // The action whose combo was pressed this frame, or `actions.NONE`.
+    fn poll(this: &Keymap): int {
+        let m = mods.held();
+        for i in 0..this.list.len {
+            let b = this.list.items[i];
+            if b.mods == m && keyPressedRaw(b.key) { return b.action; }
+        }
+        return actions.NONE;
+    }
+}
+
+pub fn create(mem: &Arena): Keymap {
+    let k = Keymap { list: List<Binding>.new(mem) };
+    k.reset();
+    return k;
+}
+
+// The last combo bound to `action` (a config keybind over the default) into `out`, for people
+// (`Ctrl+Shift+O`) or in config syntax (`ctrl+shift+o`); nothing if unbound.
+pub fn hint(k: &Keymap, names: &KeyNames, action: int, out: &Text, people: bool) {
+    let i = k.list.len - 1;
+    while i >= 0 {
+        let b = k.list.items[i];
+        if b.action == action {
+            if people { keynames.describe(names, b.mods, b.key, out); } else { keynames.format(names, b.mods, b.key, out); }
+            return;
+        }
+        i -= 1;
+    }
+}
+
+// Defaults, then each `combo=action` of the config over them (`action` may be `none`).
+pub fn load(k: &Keymap, binds: List<string>, names: &KeyNames) {
+    k.reset();
+    for i in 0..binds.len {
+        let b = binds.items[i];
+        let eq = find(b, "=");
+        let m = 0;
+        let key = Key.A;
+        if eq < 0 || !keynames.parseCombo(names, b[0..eq], &m, &key) {
+            printLn(`config: bad keybind "{b}"`);
+            continue;
+        }
+        k.bind(m, key, actions.byName(b[eq + 1..b.len]));
+    }
+}

@@ -1,0 +1,14 @@
+name = Lua
+ext = lua
+comment = --[[ ]]
+comment = --
+region = string [[ ]] multiline
+string = " " escape
+string = ' ' escape
+keyword = and function local not or
+control = break do else elseif end for goto if in repeat return then until while
+plain = variable
+constant = true false nil
+builtin = print pairs ipairs require type tostring tonumber table string math os io error assert pcall setmetatable getmetatable select
+after = function function
+call = true

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Drop the x-terminal-emulator registration when the package goes away (not on upgrade).
+set -e
+if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
+    update-alternatives --remove x-terminal-emulator /usr/bin/jzero
+fi

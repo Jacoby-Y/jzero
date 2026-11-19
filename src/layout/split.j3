@@ -1,0 +1,353 @@
+module jzero.layout.split;
+
+use j3.memory.{ Arena, List };
+use j3.math.Vec2;
+use j3.option.Option;
+use j3.text.Text;
+use j3.sys;
+use jzero.term.session.Session;
+use jzero.explorer.explorer.Explorer;
+
+pub const LEAF = 0;
+pub const RIGHT = 1;  // children side by side (a left, b right)
+pub const DOWN = 2;   // children stacked (a top, b bottom)
+
+// What a leaf shows.
+pub const TERMINAL = 0;
+pub const EXPLORER = 1;
+pub const EXT = 2;       // an extension (`ext/host.j3`); the node's `cwd` holds its name
+
+const MIN_RATIO: f32 = 0.05;
+
+// A node of an island's split tree: a leaf holds a shell, a split holds two children.
+// Nodes live in one list and are never moved; a removed node is marked dead (`alive`).
+pub struct Node {
+    kind: int;
+    ratio: f32 = 0.5;      // share of `a`
+    a: int = -1;
+    b: int = -1;
+    parent: int = -1;
+    alive: bool = true;
+    id: int = -1;          // leaf: stable pane id (its scrollback and history files)
+    cwd: Text;             // leaf: last known working directory, for reopening
+    cmds: Text;            // leaf: commands run (shell integration), newest last, `\n` each
+    pane: int = 0;         // leaf: TERMINAL, EXPLORER or EXT
+    term: Option<&Session>; // leaf: the running shell (None while the island is closed)
+    ex: Option<&Explorer>; // leaf: the explorer (None while the island is closed)
+    // Rect as fractions of the island (0..1), from `layout`.
+    x: f32 = 0.0;
+    y: f32 = 0.0;
+    w: f32 = 1.0;
+    h: f32 = 1.0;
+
+    fn hasExplorer(this: &Node): bool {
+        match this.ex {
+            Option.Some(_) { return true; }
+            Option.None { return false; }
+        }
+    }
+
+    // The explorer; only call after `hasExplorer`.
+    fn explorer(this: &Node): &Explorer {
+        match this.ex {
+            Option.Some(e) { return e; }
+            Option.None { sys.panic("Node.explorer: no explorer"); }
+        }
+        return 0 as ptr as &Explorer;
+    }
+
+    // The last `n` commands, newest last (a view of `cmds`).
+    fn recentCmds(this: &Node, n: int): string {
+        let s = this.cmds.str();
+        let i = s.len;
+        if i > 0 && s[i - 1] == 10 { i -= 1; }
+        let seen = 0;
+        while i > 0 {
+            if s[i - 1] == 10 { seen += 1; if seen == n { break; } }
+            i -= 1;
+        }
+        return s[i..s.len];
+    }
+
+    // Draw this leaf's shell into a `w` x `h` canvas (see `Session.draw`).
+    fn drawTerm(this: &Node, w: f32, h: f32, focused: bool, keys: bool, mouse: Vec2, pointer: bool, origin: Vec2) {
+        match this.term {
+            Option.Some(t) { t.draw(w, h, focused, keys, mouse, pointer, origin); }
+            Option.None {}
+        }
+    }
+
+    // The shell; only call after `hasTerm`.
+    fn session(this: &Node): &Session {
+        match this.term {
+            Option.Some(t) { return t; }
+            Option.None { sys.panic("Node.session: no shell"); }
+        }
+        return 0 as ptr as &Session;
+    }
+
+    fn hasTerm(this: &Node): bool {
+        match this.term {
+            Option.Some(_) { return true; }
+            Option.None { return false; }
+        }
+    }
+}
+
+pub struct Panes {
+    nodes: List<Node>;
+    root: int = -1;
+    focus: int = -1;   // the focused leaf
+    zoomed: int = -1;  // a leaf filling the island (the others keep running), -1 none
+
+    // Zoom the focused pane in, or back out.
+    fn toggleZoom(this: &Panes) {
+        if this.zoomed >= 0 || this.focus < 0 { this.zoomed = -1; return; }
+        this.zoomed = this.focus;
+    }
+
+    // Leaf `i` shows: no pane is zoomed, or it is the zoomed one.
+    fn shows(this: &Panes, i: int): bool { return this.zoomed < 0 || this.zoomed == i; }
+
+    // Exchange what leaves `a` and `b` hold (shell, explorer, files); the tree stays.
+    fn swap(this: &Panes, a: int, b: int) {
+        if a == b || !this.isLeaf(a) || !this.isLeaf(b) { return; }
+        let na = this.get(a);
+        let nb = this.get(b);
+        let t = Node { kind: LEAF, cwd: na.cwd, cmds: na.cmds, term: na.term, ex: na.ex, id: na.id, pane: na.pane };
+        na.cwd = nb.cwd; na.cmds = nb.cmds; na.term = nb.term; na.ex = nb.ex; na.id = nb.id; na.pane = nb.pane;
+        nb.cwd = t.cwd; nb.cmds = t.cmds; nb.term = t.term; nb.ex = t.ex; nb.id = t.id; nb.pane = t.pane;
+    }
+
+    fn all(this: &Panes): []Node { return this.nodes.items[0..this.nodes.len]; }
+    fn get(this: &Panes, i: int): &Node { return &this.nodes.items[i]; }
+    fn empty(this: &Panes): bool { return this.root < 0; }
+
+    // The focused leaf's shell, if any.
+    fn focusedTerm(this: &Panes): Option<&Session> {
+        if this.focus < 0 { return Option.None; }
+        return this.get(this.focus).term;
+    }
+
+    // A new node: a closed one reused (its texts emptied), else appended.
+    fn addNode(this: &Panes, kind: int): int {
+        for i in 0..this.nodes.len {
+            let n = this.get(i);
+            if n.alive { continue; }
+            n.cwd.clear();
+            n.cmds.clear();
+            *n = Node { kind: kind, cwd: n.cwd, cmds: n.cmds, term: Option.None, ex: Option.None };
+            return i;
+        }
+        this.nodes.push(Node { kind: kind, cwd: Text.new(this.nodes.arena), cmds: Text.new(this.nodes.arena), term: Option.None, ex: Option.None });
+        return this.nodes.len - 1;
+    }
+
+    fn addLeaf(this: &Panes, term: Option<&Session>, id: int): int {
+        let i = this.addNode(LEAF);
+        this.get(i).term = term;
+        this.get(i).id = id;
+        return i;
+    }
+
+    // First pane of an empty tree.
+    fn start(this: &Panes, term: Option<&Session>, id: int) {
+        this.root = this.addLeaf(term, id);
+        this.focus = this.root;
+        this.layout();
+    }
+
+    // Split the focused leaf in `dir` (RIGHT or DOWN); the new leaf gets `term` and focus.
+    fn split(this: &Panes, dir: int, term: Option<&Session>, id: int) {
+        this.zoomed = -1;
+        let old = this.focus;
+        if old < 0 { return; }
+        let leaf = this.addLeaf(term, id);
+        let s = this.addNode(dir);
+        this.get(s).a = old;
+        this.get(s).b = leaf;
+        this.replaceChild(this.get(old).parent, old, s);
+        this.get(old).parent = s;
+        this.get(leaf).parent = s;
+        this.focus = leaf;
+        this.layout();
+    }
+
+    // Remove leaf `i` (its sibling takes the space) and return its shell for the caller to
+    // close (its explorer, if any, must be closed first).
+    fn close(this: &Panes, i: int): Option<&Session> {
+        this.zoomed = -1;
+        let n = this.get(i);
+        let term = n.term;
+        n.alive = false;
+        n.term = Option.None;
+        n.ex = Option.None;
+        let p = n.parent;
+        if p < 0 {
+            this.root = -1;
+            this.focus = -1;
+            return term;
+        }
+        let pn = this.get(p);
+        let sib = pn.a;
+        if sib == i { sib = pn.b; }
+        pn.alive = false;
+        this.replaceChild(pn.parent, p, sib);
+        if this.focus == i { this.focus = this.firstLeaf(sib); }
+        this.layout();
+        return term;
+    }
+
+    // Point `parent`'s link at `from` to `to` (parent -1: `to` becomes the root).
+    fn replaceChild(this: &Panes, parent: int, from: int, to: int) {
+        this.get(to).parent = parent;
+        if parent < 0 { this.root = to; return; }
+        let p = this.get(parent);
+        if p.a == from { p.a = to; } else { p.b = to; }
+    }
+
+    fn firstLeaf(this: &Panes, i: int): int {
+        let n = i;
+        while this.get(n).kind != LEAF { n = this.get(n).a; }
+        return n;
+    }
+
+    fn setRatio(this: &Panes, i: int, r: f32) {
+        let v = r;
+        if v < MIN_RATIO { v = MIN_RATIO; }
+        if v > 1.0 - MIN_RATIO { v = 1.0 - MIN_RATIO; }
+        this.get(i).ratio = v;
+        this.layout();
+    }
+
+    // Every pane the same size along each split's axis.
+    fn equalize(this: &Panes) {
+        if this.root >= 0 { this.equalizeAt(this.root); }
+        this.layout();
+    }
+
+    // Leaves along `dir` under `i` (a split of another direction counts as one).
+    fn equalizeAt(this: &Panes, i: int): int {
+        let n = this.get(i);
+        if n.kind == LEAF { return 1; }
+        let a = this.equalizeAt(n.a);
+        let b = this.equalizeAt(n.b);
+        n.ratio = f32(this.span(n.a, n.kind)) / f32(this.span(n.a, n.kind) + this.span(n.b, n.kind));
+        return a + b;
+    }
+
+    fn span(this: &Panes, i: int, dir: int): int {
+        let n = this.get(i);
+        if n.kind != dir { return 1; }
+        return this.span(n.a, dir) + this.span(n.b, dir);
+    }
+
+    // Recompute every live node's rect from the root down.
+    fn layout(this: &Panes) {
+        if this.root >= 0 { this.place(this.root, 0.0, 0.0, 1.0, 1.0); }
+    }
+
+    fn place(this: &Panes, i: int, x: f32, y: f32, w: f32, h: f32) {
+        let n = this.get(i);
+        n.x = x;
+        n.y = y;
+        n.w = w;
+        n.h = h;
+        if n.kind == RIGHT {
+            let wa = w * n.ratio;
+            this.place(n.a, x, y, wa, h);
+            this.place(n.b, x + wa, y, w - wa, h);
+        } else if n.kind == DOWN {
+            let ha = h * n.ratio;
+            this.place(n.a, x, y, w, ha);
+            this.place(n.b, x, y + ha, w, h - ha);
+        }
+    }
+
+    // Focus the nearest leaf in direction (dx, dy) whose edge touches the focused one.
+    fn focusDir(this: &Panes, dx: int, dy: int) {
+        if this.focus < 0 || this.zoomed >= 0 { return; }
+        let f = this.get(this.focus);
+        let cx = f.x + f.w * 0.5;
+        let cy = f.y + f.h * 0.5;
+        let best = -1;
+        let bestD: f32 = 10.0;
+        for i in 0..this.nodes.len {
+            let n = this.get(i);
+            if !n.alive || n.kind != LEAF || i == this.focus { continue; }
+            if !touches(f, n, dx, dy) { continue; }
+            let ox = n.x + n.w * 0.5 - cx;
+            let oy = n.y + n.h * 0.5 - cy;
+            let d = ox * ox + oy * oy;
+            if d < bestD { bestD = d; best = i; }
+        }
+        if best >= 0 { this.focus = best; }
+    }
+
+    // Forget every node (shells must be closed already); `addNode` reuses them.
+    fn clear(this: &Panes) {
+        this.zoomed = -1;
+        for i in 0..this.nodes.len { this.get(i).alive = false; }
+        this.root = -1;
+        this.focus = -1;
+    }
+
+    // Node `i` is a live pane.
+    fn isLeaf(this: &Panes, i: int): bool {
+        let n = this.get(i);
+        return n.alive && n.kind == LEAF;
+    }
+}
+
+const EDGE_EPS: f32 = 0.001;
+
+// `n` lies on the (dx, dy) side of `f`, sharing that edge and overlapping along it.
+fn touches(f: &Node, n: &Node, dx: int, dy: int): bool {
+    if dx > 0 { return near(n.x, f.x + f.w) && overlap(f.y, f.h, n.y, n.h); }
+    if dx < 0 { return near(n.x + n.w, f.x) && overlap(f.y, f.h, n.y, n.h); }
+    if dy > 0 { return near(n.y, f.y + f.h) && overlap(f.x, f.w, n.x, n.w); }
+    return near(n.y + n.h, f.y) && overlap(f.x, f.w, n.x, n.w);
+}
+
+fn near(a: f32, b: f32): bool { return a - b < EDGE_EPS && b - a < EDGE_EPS; }
+
+fn overlap(a: f32, aw: f32, b: f32, bw: f32): bool { return a < b + bw - EDGE_EPS && b < a + aw - EDGE_EPS; }
+
+pub fn create(mem: &Arena): Panes {
+    return Panes { nodes: List<Node>.new(mem) };
+}
+
+// Self-check: split right, split down, close, equalize, directional focus.
+pub fn selfTest(mem: &Arena) {
+    let p = create(mem);
+    p.start(Option.None, 0);           // 0
+    p.split(RIGHT, Option.None, 1);    // leaf 1, split 2
+    p.split(DOWN, Option.None, 2);     // leaf 3, split 4 (under right half)
+    check(p.focus == 3, "p.focus == 3");
+    check(p.get(3).x == 0.5 && p.get(3).y == 0.5, "p.get(3).x == 0.5 && p.get(3).y == 0.5");
+    p.focusDir(-1, 0);
+    check(p.focus == 0, "p.focus == 0");
+    p.focusDir(1, 0);
+    check(p.focus == 1 || p.focus == 3, "p.focus == 1 || p.focus == 3");
+    p.split(RIGHT, Option.None, 3);    // under focus
+    p.equalize();
+    p.close(3);
+    check(p.get(p.root).kind == RIGHT, "p.get(p.root).kind == RIGHT");
+    p.close(0);
+    p.close(1);
+    check(!p.empty(), "!p.empty()");
+    let q = create(mem);
+    q.start(Option.None, 10);
+    q.split(RIGHT, Option.None, 11);
+    q.get(0).cwd.pushStr("/a");
+    q.swap(0, 1);
+    check(q.get(0).id == 11 && q.get(1).id == 10 && q.get(1).cwd.str() == "/a", "swap");
+    q.toggleZoom();
+    check(q.zoomed == 1 && q.shows(1) && !q.shows(0), "zoom");
+    q.focusDir(-1, 0);
+    check(q.focus == 1, "no focus move while zoomed");
+    q.toggleZoom();
+    check(q.zoomed == -1 && q.shows(0), "unzoom");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`split selfTest: {what}`); } }

@@ -1,0 +1,66 @@
+<script>
+    // Rendered markdown of the open file (`ex.doc`); task boxes toggle and save.
+    use jzero.explorer.explorer.Explorer;
+    use jzero.explorer.mddoc;
+    props { ex: &Explorer; }
+</script>
+
+<div class="md">
+    <div class="page">
+    {#each ex.doc.blocks.items[0..ex.doc.blocks.len] as &b}
+        {#match b.kind}
+        {:case mddoc.B_HEADING}
+            {#match b.level}
+            {:case 1}<h1 class:center={b.center}><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></h1>
+            {:case 2}<h2 class:center={b.center}><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></h2>
+            {:case 3}<h3 class:center={b.center}><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></h3>
+            {:else}<h4 class:center={b.center}><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></h4>
+            {/match}
+        {:case mddoc.B_ITEM}
+            <div class="li" style:padding-left="{f32(b.level) * 1.5}em">
+                {#if b.check >= 0}
+                    <span class="box" class:done={b.check == 1} on:click={ex.toggleTask(b.checkAt)}><icon name={if b.check == 1 { "check-square" } else { "square" }} /></span>
+                {:else}
+                    <span class="mk">{b.marker}</span>
+                {/if}
+                <p class="lt" class:done={b.check == 1}><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></p>
+            </div>
+        {:case mddoc.B_QUOTE}<p class="quote"><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></p>
+        {:case mddoc.B_CODE}<pre class="code"><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></pre>
+        {:case mddoc.B_RULE}<hr />
+        {:case mddoc.B_ROW}
+            <div class="tr" class:th={b.head}>
+                {#each ex.doc.rowCells(b) as c}
+                    <p class="td" class:mid={c.align == mddoc.CENTER} class:end={c.align == mddoc.RIGHT}><explorer.MdRuns ex={ex} runs={ex.doc.cellRuns(c)} /></p>
+                {/each}
+            </div>
+        {:else}<p class:center={b.center}><explorer.MdRuns ex={ex} runs={ex.doc.blockRuns(b)} /></p>
+        {/match}
+    {/each}
+    </div>
+</div>
+
+<style>
+    .md { flex: 1; min-height: 0; overflow-y: auto; background: var(--term-bg); color: var(--term-fg); }
+    .page { padding: 0.857em 1.143em 2em 1.143em; max-width: 52em; }
+    p { margin: 0 0 0.571em 0; line-height: 1.5; }
+    h1, h2, h3, h4 { margin: 0.571em 0 0.429em 0; font-weight: bold; color: var(--c-bright-white); }
+    h1 { font-size: 1.714em; }
+    h2 { font-size: 1.429em; }
+    h3 { font-size: 1.214em; }
+    h4 { font-size: 1em; }
+    .li { display: flex; flex-direction: row; gap: 0.429em; }
+    .mk { flex-shrink: 0; min-width: 1em; color: var(--c-bright-black); line-height: 1.5; }
+    .box { flex-shrink: 0; cursor: pointer; color: var(--c-bright-black); line-height: 1.5; }
+    .box.done { color: var(--c-bright-green); }
+    .lt { flex: 1; min-width: 0; margin-bottom: 0.143em; }
+    .lt.done { color: var(--c-bright-black); text-decoration: line-through; }
+    .quote { padding-left: 0.857em; color: var(--c-bright-black); font-style: italic; background: var(--chrome-bg); }
+    .code { margin: 0 0 0.571em 0; padding: 0.571em 0.714em; font-family: "Mono"; font-size: 0.929em; white-space: pre; overflow-x: auto; background: var(--chrome-bg); }
+    hr { height: 1px; margin: 0.714em 0; background: var(--chrome-hover); border: none; }
+    .tr { display: flex; flex-direction: row; }
+    .tr.th { font-weight: bold; color: var(--c-bright-white); background: var(--chrome-bg); }
+    .td { flex: 1; min-width: 0; margin: 0; padding: 0.214em 0.571em; }
+    .td.mid, .center { text-align: center; }
+    .td.end { text-align: right; }
+</style>

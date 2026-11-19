@@ -1,0 +1,385 @@
+module jzero.config.config;
+
+use j3.io;
+use j3.io.printLn;
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use jzero.platform.os;
+use jzero.config.parse;
+use jzero.config.parse.{ Entry, trim };
+use jzero.theme.files;
+
+pub const FONT_MIN = 6;
+pub const FONT_MAX = 48;
+
+pub const CURSOR_BLOCK = 0;
+pub const CURSOR_BAR = 1;
+pub const CURSOR_UNDERLINE = 2;
+const CURSOR_NAMES: [3]string = ["block", "bar", "underline"];
+
+// Typed settings from `~/.config/jzero/config`. Missing keys keep their defaults (`reset`).
+// Strings are views into the load arena, valid until the next load.
+pub struct Config {
+    fontSize: int = 14;
+    fontFamily: string = "";  // a family (`fc-match`) or a font file path; "" the bundled font
+    fontLigatures: bool = true; // `->`, `!=` draw as the font's ligatures (needs SDL_ttf with HarfBuzz)
+    lineHeight: int = 100;    // percent of the font's line
+    padX: int = 10;           // px around the text
+    padY: int = 5;
+    themeName: string = "tango";
+    theme: int = 0;           // index of `themeName` (set by State: custom themes load with it)
+    colors: List<int>;        // color overrides: slot, color, slot, color, ... (`files.colorEntry`)
+    scrollback: int = 10000;
+    shell: Text;              // empty: $SHELL
+    shellIntegration: bool = true;
+    keybinds: List<string>;   // `ctrl+shift+o=split_right`, applied over the defaults
+    quickKey: string = "";    // global show/hide combo (`ctrl+grave`), X11; "" none
+    cursorStyle: int = 0;     // CURSOR_*: when the program has not picked one
+    cursorBlink: bool = true;
+    unfocusedOpacity: int = 100; // percent: unfocused splits are dimmed toward the background
+    backgroundOpacity: int = 100; // percent: terminal background; below 100 at startup opens a see-through window
+    clipboardWrite: bool = true; // OSC 52: programs may set the clipboard
+    notifications: bool = true;  // OSC 9 / 777 and long-command notices
+    visualBell: bool = true;
+    confirmClose: bool = true;   // ask before closing a pane that runs a program
+    notifyAfter: int = 10;       // s: a longer command that finishes out of sight notifies (0 off)
+    explorerHidden: bool = false; // explorer shows dotfiles
+    notesDir: string = "";   // notes folder; "" the data dir's notes/
+    mtime: int = -1;          // of the file last loaded (-1: none)
+    themesMtime: int = -1;    // of the themes folder
+    checkedAt: int = 0;       // ms of the last mtime check
+}
+
+pub fn create(mem: &Arena): Config {
+    return Config { shell: Text.new(mem), keybinds: List<string>.new(mem), colors: List<int>.new(mem) };
+}
+
+// The cursor shape to draw when the program set none (DECSCUSR: 2 block, 4 underline, 6 bar; one less blinks).
+pub fn cursorShape(c: &Config): int {
+    let want = 2;
+    if c.cursorStyle == CURSOR_BAR { want = 6; }
+    if c.cursorStyle == CURSOR_UNDERLINE { want = 4; }
+    if c.cursorBlink { want -= 1; }
+    return want;
+}
+
+pub fn cursorName(i: int): string { return CURSOR_NAMES[i]; }
+pub fn cursorByName(name: string): int {
+    for i in 0..3 { if CURSOR_NAMES[i] == name { return i; } }
+    return -1;
+}
+
+// The config folder: `~/.config/jzero`; Windows `%APPDATA%/jzero/config` (`platform/os.j3`).
+pub fn dir(): Text { return *os.configDir(); }
+
+pub fn path(): string {
+    let t = dir();
+    t.pushStr("/config");
+    return t.str();
+}
+
+// Folder of custom theme files (`theme/files.j3`).
+pub fn themesDir(): string {
+    let t = dir();
+    t.pushStr("/themes");
+    return t.str();
+}
+
+// Defaults, then the file (if any). `mem` holds the file text and every string until the next
+// load (the caller rewinds it).
+pub fn load(c: &Config, mem: &Arena) {
+    reset(c, mem);
+    c.themesMtime = mtimeOf(themesDir());
+    c.mtime = mtimeOf(path());
+    if c.mtime == -1 { return; }
+    match io.readFile(path(), mem) {
+        Result.Ok(bytes) { apply(c, parse.parse(bytes as string, mem)); }
+        Result.Err(_) {}
+    }
+}
+
+// Read before the window opens: whether it should be see-through (`background-opacity` below 100).
+// ponytail: decided once; changing it across 100 needs a restart, changes below 100 apply live.
+pub fn seeThrough(): bool {
+    let mem = Arena.create(65536);
+    let c = Config { shell: Text.new(&mem), keybinds: List<string>.new(&mem), colors: List<int>.new(&mem) };
+    load(&c, &mem);
+    let on = c.backgroundOpacity < 100;
+    mem.destroy();
+    return on;
+}
+
+fn reset(c: &Config, mem: &Arena) {
+    let shell = c.shell;
+    shell.clear();
+    *c = Config { shell: shell, keybinds: List<string>.new(mem), colors: List<int>.new(mem), checkedAt: c.checkedAt };
+}
+
+fn apply(c: &Config, entries: List<Entry>) {
+    for i in 0..entries.len {
+        let e = entries.items[i];
+        let k = e.key;
+        let v = e.value;
+        let slot = 0;
+        let color = 0;
+        if k == "font-size" { c.fontSize = clampI(toInt(v, c.fontSize), FONT_MIN, FONT_MAX); }
+        else if k == "font-family" { c.fontFamily = v; }
+        else if k == "font-ligatures" { c.fontLigatures = v != "false"; }
+        else if k == "line-height" { c.lineHeight = clampI(toPercent(v, c.lineHeight), 100, 300); }
+        else if k == "padding" { padding(c, v); }
+        else if k == "theme" { c.themeName = v; }
+        else if files.colorEntry(k, v, &slot, &color) { c.colors.push(slot); c.colors.push(color); }
+        else if k == "scrollback" { c.scrollback = clampI(toInt(v, c.scrollback), 0, 1000000); }
+        else if k == "shell" { c.shell.clear(); c.shell.pushStr(v); }
+        else if k == "shell-integration" { c.shellIntegration = v != "false"; }
+        else if k == "keybind" { c.keybinds.push(v); }
+        else if k == "quick-terminal-key" { c.quickKey = v; }
+        else if k == "cursor-style" { c.cursorStyle = enumOr(cursorByName(v), c.cursorStyle, e); }
+        else if k == "cursor-blink" { c.cursorBlink = v != "false"; }
+        else if k == "unfocused-split-opacity" { c.unfocusedOpacity = clampI(toPercent(v, c.unfocusedOpacity), 15, 100); }
+        else if k == "background-opacity" { c.backgroundOpacity = clampI(toPercent(v, c.backgroundOpacity), 10, 100); }
+        else if k == "clipboard-write" { c.clipboardWrite = v != "false"; }
+        else if k == "desktop-notifications" { c.notifications = v != "false"; }
+        else if k == "visual-bell" { c.visualBell = v != "false"; }
+        else if k == "confirm-close" { c.confirmClose = v != "false"; }
+        else if k == "notify-after" { c.notifyAfter = clampI(toInt(v, c.notifyAfter), 0, 86400); }
+        else if k == "explorer-hidden" { c.explorerHidden = v == "true"; }
+        else if k == "notes-dir" { c.notesDir = v; }
+        else { printLn(`config:{e.line}: unknown key "{k}"`); }
+    }
+}
+
+// `padding = 10` (both sides 10, top and bottom half) or `padding = 10,4` (x, y).
+fn padding(c: &Config, v: string) {
+    let comma = -1;
+    for i in 0..v.len { if v[i] == 44 { comma = i; } }
+    if comma < 0 {
+        c.padX = clampI(toInt(v, c.padX), 0, 200);
+        c.padY = c.padX / 2;
+        return;
+    }
+    c.padX = clampI(toInt(trim(v[0..comma]), c.padX), 0, 200);
+    c.padY = clampI(toInt(trim(v[comma + 1..v.len]), c.padY), 0, 200);
+}
+
+fn enumOr(i: int, fallback: int, e: Entry): int {
+    if i < 0 { printLn(`config:{e.line}: bad value "{e.value}" for {e.key}`); return fallback; }
+    return i;
+}
+
+fn mtimeOf(p: string): int {
+    match io.stat(p) {
+        Result.Ok(e) { return e.mtime; }
+        Result.Err(_) { return -1; }
+    }
+}
+
+// The file or the themes folder changed since `load` (checked at most once a second).
+pub fn changed(c: &Config, nowMs: int): bool {
+    if nowMs - c.checkedAt < 1000 { return false; }
+    c.checkedAt = nowMs;
+    return mtimeOf(path()) != c.mtime || mtimeOf(themesDir()) != c.themesMtime;
+}
+
+// Every key the settings screen owns: on save their lines are replaced by the current values.
+const OWNED: [27]string = [
+    "font-size", "font-family", "font-ligatures", "line-height", "padding", "theme",
+    "palette", "background", "foreground", "cursor-color", "selection-background",
+    "scrollback", "shell", "shell-integration", "keybind", "quick-terminal-key",
+    "cursor-style", "cursor-blink", "unfocused-split-opacity", "background-opacity",
+    "clipboard-write", "desktop-notifications", "visual-bell", "confirm-close", "notify-after",
+    "explorer-hidden", "notes-dir",
+];
+
+// Write `c` into the file: each owned key that differs from its default, in place of its old
+// lines (a key back at its default is dropped). Comments and other lines are kept.
+pub fn save(c: &Config, mem: &Arena): bool {
+    let src = "";
+    match io.readFile(path(), mem) {
+        Result.Ok(bytes) { src = bytes as string; }
+        Result.Err(_) {}
+    }
+    let keys = List<string>.new(mem);
+    let vals = List<string>.new(mem);
+    changedPairs(c, mem, &keys, &vals);
+    let out = Text.new(mem);
+    setKeys(src, OWNED[:], keys.items[0..keys.len], vals.items[0..vals.len], &out);
+    io.makeDirs(dir().str());
+    match io.writeFile(path(), out.bytes[0..out.len()]) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
+}
+
+// `c`'s key/value pairs that a default config does not have.
+fn changedPairs(c: &Config, mem: &Arena, keys: &List<string>, vals: &List<string>) {
+    let ck = List<string>.new(mem);
+    let cv = List<string>.new(mem);
+    pairs(c, mem, &ck, &cv);
+    let d = create(mem);
+    let dk = List<string>.new(mem);
+    let dv = List<string>.new(mem);
+    pairs(&d, mem, &dk, &dv);
+    for i in 0..ck.len {
+        let same = false;
+        for j in 0..dk.len { if dk.items[j] == ck.items[i] && dv.items[j] == cv.items[i] { same = true; } }
+        if !same { keys.push(ck.items[i]); vals.push(cv.items[i]); }
+    }
+}
+
+// Every owned key of `c` as config text, repeatable keys (palette, keybind) once per value.
+fn pairs(c: &Config, mem: &Arena, keys: &List<string>, vals: &List<string>) {
+    kv(keys, vals, "font-size", num(c.fontSize, mem));
+    kv(keys, vals, "font-family", c.fontFamily);
+    kv(keys, vals, "font-ligatures", yes(c.fontLigatures));
+    kv(keys, vals, "line-height", num(c.lineHeight, mem));
+    let pad = Text.new(mem);
+    pad.pushInt(c.padX); pad.push(44); pad.pushInt(c.padY);
+    kv(keys, vals, "padding", pad.str());
+    kv(keys, vals, "theme", c.themeName);
+    let o = 0;
+    while o + 1 < c.colors.len {
+        let t = Text.new(mem);
+        let slot = c.colors.items[o];
+        if slot < 16 { t.pushInt(slot); t.push(61); }
+        files.pushHex(&t, c.colors.items[o + 1]);
+        kv(keys, vals, files.colorKey(slot), t.str());
+        o += 2;
+    }
+    kv(keys, vals, "scrollback", num(c.scrollback, mem));
+    kv(keys, vals, "shell", c.shell.str());
+    kv(keys, vals, "shell-integration", yes(c.shellIntegration));
+    for i in 0..c.keybinds.len { kv(keys, vals, "keybind", c.keybinds.items[i]); }
+    kv(keys, vals, "quick-terminal-key", c.quickKey);
+    kv(keys, vals, "cursor-style", cursorName(c.cursorStyle));
+    kv(keys, vals, "cursor-blink", yes(c.cursorBlink));
+    kv(keys, vals, "unfocused-split-opacity", num(c.unfocusedOpacity, mem));
+    kv(keys, vals, "background-opacity", num(c.backgroundOpacity, mem));
+    kv(keys, vals, "clipboard-write", yes(c.clipboardWrite));
+    kv(keys, vals, "desktop-notifications", yes(c.notifications));
+    kv(keys, vals, "visual-bell", yes(c.visualBell));
+    kv(keys, vals, "confirm-close", yes(c.confirmClose));
+    kv(keys, vals, "notify-after", num(c.notifyAfter, mem));
+    kv(keys, vals, "explorer-hidden", yes(c.explorerHidden));
+    kv(keys, vals, "notes-dir", c.notesDir);
+}
+
+fn kv(keys: &List<string>, vals: &List<string>, k: string, v: string) { keys.push(k); vals.push(v); }
+
+fn num(v: int, mem: &Arena): string {
+    let t = Text.new(mem);
+    t.pushInt(v);
+    return t.str();
+}
+
+fn yes(b: bool): string {
+    if b { return "true"; }
+    return "false";
+}
+
+// `src` with the lines of each `owned` key replaced by its `keys[j] = values[j]` pairs, written
+// where its first line was (appended when it had none), into `out`. Other lines are kept.
+pub fn setKeys(src: string, owned: []string, keys: []string, values: []string, out: &Text) {
+    let done = 0;  // bit per owned key
+    let start = 0;
+    while start < src.len {
+        let end = start;
+        while end < src.len && src[end] != 10 { end += 1; }
+        let line = src[start..end];
+        start = end + 1;
+        let o = indexOf(owned, keyOf(line));
+        if o < 0 {
+            out.pushStr(line);
+            out.push(10);
+            continue;
+        }
+        if (done & (1 << o)) == 0 { writeAll(out, owned[o], keys, values); }
+        done |= 1 << o;
+    }
+    for o in 0..owned.len { if (done & (1 << o)) == 0 { writeAll(out, owned[o], keys, values); } }
+}
+
+fn indexOf(list: []string, s: string): int {
+    if s.len == 0 { return -1; }
+    for i in 0..list.len { if list[i] == s { return i; } }
+    return -1;
+}
+
+fn writeAll(out: &Text, key: string, keys: []string, values: []string) {
+    for j in 0..keys.len { if keys[j] == key { writeLine(out, key, values[j]); } }
+}
+
+fn writeLine(out: &Text, key: string, value: string) {
+    out.pushStr(key);
+    out.pushStr(" = ");
+    out.pushStr(value);
+    out.push(10);
+}
+
+fn keyOf(line: string): string {
+    let t = trim(line);
+    if t.len == 0 || t[0] == 35 { return ""; }
+    for i in 0..t.len { if t[i] == 61 { return trim(t[0..i]); } }
+    return "";
+}
+
+fn toInt(s: string, fallback: int): int {
+    if s.len == 0 { return fallback; }
+    let v = 0;
+    for i in 0..s.len {
+        if s[i] < 48 || s[i] > 57 { return fallback; }
+        v = v * 10 + int(s[i] - 48);
+    }
+    return v;
+}
+
+// `1.2` -> 120, `0.7` -> 70, `85` -> 85 (already a percent when over 10).
+fn toPercent(s: string, fallback: int): int {
+    let whole = 0;
+    let frac = 0;
+    let digits = 0;
+    let dot = false;
+    if s.len == 0 { return fallback; }
+    for i in 0..s.len {
+        let ch = s[i];
+        if ch == 46 && !dot { dot = true; continue; }
+        if ch < 48 || ch > 57 { return fallback; }
+        if !dot { whole = whole * 10 + int(ch - 48); }
+        else if digits < 2 { frac = frac * 10 + int(ch - 48); digits += 1; }
+    }
+    if digits == 1 { frac *= 10; }
+    if !dot && whole > 10 { return whole; }
+    return whole * 100 + frac;
+}
+
+fn clampI(v: int, lo: int, hi: int): int {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+// Self-check: parse, unknown values fall back, setKey replaces and appends.
+pub fn selfTest(mem: &Arena) {
+    let c = create(mem);
+    apply(&c, parse.parse("# hi\nfont-size = 18\ntheme = gruvbox-dark\nscrollback = x\nkeybind = ctrl+t=new_island\nline-height = 1.25\npadding = 8,2\npalette = 3=#010203\nunfocused-split-opacity = 0.7\ncursor-style = bar\nbackground-opacity = 0.85\n", mem));
+    check(c.fontSize == 18 && c.themeName == "gruvbox-dark" && c.scrollback == 10000 && c.keybinds.len == 1, "apply");
+    check(c.lineHeight == 125 && c.padX == 8 && c.padY == 2 && c.unfocusedOpacity == 70 && c.cursorStyle == CURSOR_BAR && c.backgroundOpacity == 85, "apply look");
+    check(c.colors.len == 2 && c.colors.items[0] == 3 && c.colors.items[1] == 0x010203, "colors");
+    let out = Text.new(mem);
+    let own: [3]string = ["font-size", "theme", "keybind"];
+    let k: [3]string = ["font-size", "theme", "theme"];
+    let v: [3]string = ["12", "tango", "x"];
+    setKeys("# c\nfont-size = 9\nkeybind = a=b\nother = 1\n", own[:], k[:], v[:], &out);
+    check(out.str() == "# c\nfont-size = 12\nother = 1\ntheme = tango\ntheme = x\n", out.str());
+    let d = create(mem);
+    let dk = List<string>.new(mem);
+    let dv = List<string>.new(mem);
+    changedPairs(&d, mem, &dk, &dv);
+    check(dk.len == 0, "defaults write nothing");
+    changedPairs(&c, mem, &dk, &dv);
+    check(dk.len == 9, "changed pairs");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`config selfTest: {what}`); } }

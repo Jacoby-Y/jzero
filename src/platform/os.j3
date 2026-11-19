@@ -1,0 +1,202 @@
+module jzero.platform.os;
+
+use j3.io;
+use j3.sys;
+use j3.text.{ Text, cstr };
+
+// The one place that knows which OS this is. Callers ask for a path, a shell or an opener
+// (`platform/*.j3`) and never test the platform themselves.
+//
+// Paths inside JZero always use `/`, on Windows too (`C:/Users/me`): Win32 takes them, and
+// every path helper in the app splits on `/`. `slashes` brings an outside path in (an
+// environment variable, an argument, what a shell reports); `native` turns one back for the
+// few programs that insist on `\`.
+pub fn windows(): bool { return sys.PLATFORM == sys.PLATFORM_WINDOWS; }
+
+// `path` with `\` as `/` on Windows (frame scratch when changed; itself elsewhere).
+pub fn slashes(path: string): string {
+    if !windows() { return path; }
+    let t = Text.scratch();
+    for i in 0..path.len { t.push(if path[i] == 92 { u8(47) } else { path[i] }); }
+    return t.str();
+}
+
+// `path` with `/` as `\` on Windows (frame scratch), for programs that need native paths.
+pub fn native(path: string): string {
+    if !windows() { return path; }
+    let t = Text.scratch();
+    for i in 0..path.len { t.push(if path[i] == 47 { u8(92) } else { path[i] }); }
+    return t.str();
+}
+
+// A directory a shell reported (OSC 7) as a path of this OS. On Windows `/C:/x` (a file URI),
+// `/c/x` (Git Bash) and `/mnt/c/x` (WSL) all become `C:/x`.
+pub fn fromShell(path: string): string {
+    if !windows() { return path; }
+    let p = slashes(path);
+    if p.len >= 3 && p[0] == 47 && isLetter(p[1]) && p[2] == 58 { return p[1..p.len]; }
+    if p.len >= 6 && p[0..5] == "/mnt/" { p = p[4..p.len]; }
+    if p.len >= 2 && p[0] == 47 && isLetter(p[1]) && (p.len == 2 || p[2] == 47) {
+        let t = Text.scratch();
+        t.push(upper(p[1]));
+        t.push(58);
+        t.push(47);
+        if p.len > 3 { t.pushStr(p[3..p.len]); }
+        return t.str();
+    }
+    return p;
+}
+
+// `path` (a `C:/x` one on Windows) as Git Bash spells it (`/c/x`); itself elsewhere.
+pub fn toMsys(path: string): string {
+    if !windows() || rootLen(path) != 3 { return path; }
+    let t = Text.scratch();
+    t.push(47);
+    t.push(lower(path[0]));
+    t.pushStr(path[2..path.len]);
+    return t.str();
+}
+
+// Length of the root at the start of an absolute path: 1 for `/x`, 3 for `C:/x`, else 0.
+pub fn rootLen(path: string): int {
+    if path.len > 0 && path[0] == 47 { return 1; }
+    if windows() && path.len >= 3 && isLetter(path[0]) && path[1] == 58 && path[2] == 47 { return 3; }
+    return 0;
+}
+
+pub fn isAbs(path: string): bool { return rootLen(path) > 0; }
+
+// `path` is a root (`/`, `C:/`): it has no parent.
+pub fn isRoot(path: string): bool { return path.len > 0 && rootLen(path) == path.len; }
+
+// The folder holding `path` (its root when it is directly under one; "" for a bare name).
+pub fn parent(path: string): string {
+    let root = rootLen(path);
+    let k = path.len;
+    while k > root && path[k - 1] == 47 { k -= 1; }
+    while k > root && path[k - 1] != 47 { k -= 1; }
+    if k > root { k -= 1; }
+    return path[0..k];
+}
+
+// The last part of `path`.
+pub fn baseName(path: string): string {
+    let k = path.len;
+    while k > 0 && path[k - 1] != 47 && !(windows() && path[k - 1] == 92) { k -= 1; }
+    return path[k..path.len];
+}
+
+// A character no file name of this OS may hold.
+pub fn badNameChar(c: u8): bool {
+    if c == 47 { return true; }
+    if !windows() { return false; }
+    return c == 92 || c == 58 || c == 42 || c == 63 || c == 34 || c == 60 || c == 62 || c == 124 || c < 32;
+}
+
+// The user's home folder (frame scratch on Windows).
+pub fn home(): string {
+    if windows() { return slashes(sys.env("USERPROFILE")); }
+    return sys.env("HOME");
+}
+
+// Where app state lives, without the `/jzero` (`session/paths.j3`). Frame scratch.
+pub fn dataBase(): &Text {
+    let t = Text.scratch();
+    if windows() { t.pushStr(slashes(sys.env("APPDATA"))); return t; }
+    let xdg = sys.env("XDG_DATA_HOME");
+    if xdg.len > 0 { t.pushStr(xdg); } else { t.pushStr(sys.env("HOME")); t.pushStr("/.local/share"); }
+    return t;
+}
+
+// The config folder (`config/config.j3`): `~/.config/jzero`, `%APPDATA%/jzero/config`. Frame scratch.
+pub fn configDir(): &Text {
+    let t = Text.scratch();
+    if windows() { t.pushStr(slashes(sys.env("APPDATA"))); t.pushStr("/jzero/config"); return t; }
+    let xdg = sys.env("XDG_CONFIG_HOME");
+    if xdg.len > 0 { t.pushStr(xdg); } else { t.pushStr(sys.env("HOME")); t.pushStr("/.config"); }
+    t.pushStr("/jzero");
+    return t;
+}
+
+// The running JZero binary (frame scratch).
+pub fn exe(): string {
+    let t = Text.scratch();
+    t.pushStr(slashes(sys.exeDir()));
+    t.pushStr(if windows() { "/jzero.exe" } else { "/jzero" });
+    return t.str();
+}
+
+// The folder for temp files (frame scratch on Windows).
+pub fn tempDir(): string {
+    if windows() { return slashes(sys.env("TEMP")); }
+    return io.tempRoot();
+}
+
+// A folder name of its own under the temp folder for self-check `name`, appended to `out`
+// (not created). Random: Windows reuses process ids from run to run.
+pub fn testDir(name: string, out: &Text) {
+    let r: [4]u8 = [0, 0, 0, 0];
+    random(r[:]);
+    out.add(tempDir()).add("/jzero-").add(name).add("-test-").pushInt(sys.getpid());
+    for b in r { out.push(45); out.pushInt(int(b)); }
+}
+
+// Fill `out` with random bytes from the OS. False when it has none to give.
+pub fn random(out: []u8): bool {
+    if windows() { return winRandom(out); }
+    let fd = sys.open(cstr("/dev/urandom") as ptr, sys.O_RDONLY);
+    if fd < 0 { return false; }
+    let n = sys.read(fd, &out[0] as ptr, out.len);
+    sys.close(fd);
+    return n == out.len;
+}
+
+// `RtlGenRandom` (exported by advapi32 as SystemFunction036).
+fn winRandom(out: []u8): bool {
+    let dll = sys.dlopen("advapi32.dll");
+    if dll == 0 as ptr { return false; }
+    let f = sys.dlsym(dll, "SystemFunction036");
+    if f == 0 as ptr { return false; }
+    let gen = f as fn(ptr, u32): u8;
+    return gen(&out[0] as ptr, u32(out.len)) != 0;
+}
+
+// Before the app's window opens. Windows only: the zip has no launcher, so run from the
+// program's folder when the assets are not here (started from a shortcut or `PATH`); and a
+// console of our own (started from Explorer, not from a shell) is closed.
+pub fn appStart() {
+    if !windows() { return; }
+    if !io.exists("assets") { sys.chdir(cstr(sys.exeDir()) as ptr); }
+    let k32 = sys.dlopen("kernel32.dll");
+    if k32 == 0 as ptr { return; }
+    let count = sys.dlsym(k32, "GetConsoleProcessList");
+    let free = sys.dlsym(k32, "FreeConsole");
+    if count == 0 as ptr || free == 0 as ptr { return; }
+    let pids: [4]u32 = [0, 0, 0, 0];
+    let countFn = count as fn(ptr, u32): u32;
+    let freeFn = free as fn(): i32;
+    if countFn(&pids[0] as ptr, 4) == 1 { freeFn(); }
+}
+
+fn isLetter(c: u8): bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
+fn upper(c: u8): u8 { if c >= 97 && c <= 122 { return c - 32; } return c; }
+fn lower(c: u8): u8 { if c >= 65 && c <= 90 { return c + 32; } return c; }
+
+// Self-check: the path helpers of this OS.
+pub fn selfTest() {
+    check(parent("/home/a/b") == "/home/a" && parent("/home") == "/" && parent("/") == "/", "parent");
+    check(baseName("/a/b.txt") == "b.txt" && isRoot("/") && !isRoot("/a") && isAbs("/a") && !isAbs("a/b"), "names");
+    check(home().len > 0 && io.exists(home()), "home");
+    let r: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let r2: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    check(random(r[:]) && random(r2[:]) && r[:] as string != r2[:] as string, "random");
+    check(sys.monotonicMs() > 0, "clock");
+    if !windows() { return; }
+    check(slashes("C:\\Users\\me") == "C:/Users/me" && native("C:/a/b") == "C:\\a\\b", "slashes");
+    check(fromShell("/C:/Users/a") == "C:/Users/a" && fromShell("/c/Users/a") == "C:/Users/a" && fromShell("/mnt/d") == "D:/", "fromShell");
+    check(fromShell("C:\\x") == "C:/x" && toMsys("C:/Users/a") == "/c/Users/a", "msys");
+    check(parent("C:/a/b") == "C:/a" && parent("C:/a") == "C:/" && parent("C:/") == "C:/" && isRoot("C:/") && isAbs("C:/x"), "drive");
+    check(badNameChar(58) && badNameChar(92) && !badNameChar(97), "names");
+}
+
+fn check(ok: bool, what: string) { if !ok { sys.panic(`os selfTest: {what}`); } }

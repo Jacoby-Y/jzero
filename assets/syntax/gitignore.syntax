@@ -1,0 +1,5 @@
+name = Ignore files
+ext = gitignore dockerignore ignore
+file = .gitignore .dockerignore .ignore .npmignore
+comment = # start
+prefix = keyword !

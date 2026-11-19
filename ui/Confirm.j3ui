@@ -1,0 +1,30 @@
+<script>
+    use jzero.state.{ State, ASK_PANE, ASK_ISLAND, ASK_EXPLORER, ASK_NOTE };
+    props { state: &State; }
+
+    fn question(): string {
+        if state.ask == ASK_PANE { return "Close this pane?"; }
+        if state.ask == ASK_ISLAND { return "Close this island?"; }
+        if state.ask == ASK_EXPLORER { return "Turn this pane into an explorer?"; }
+        if state.ask == ASK_NOTE { return "Turn this pane into a note?"; }
+        return "Quit JZero?";
+    }
+</script>
+
+<dialog modal class="confirm" on:close={state.ask = 0}>
+    <h2>{question()}</h2>
+    <p><b>{state.askWhat.str()}</b> is still running and will be stopped.</p>
+    <div class="acts">
+        <button class="small" on:click={state.ask = 0}>Cancel</button>
+        <button class="small danger" default on:click={state.confirmAsk()}>{if state.ask == 3 { "Quit" } else if state.ask == ASK_EXPLORER || state.ask == ASK_NOTE { "Turn" } else { "Close" }}</button>
+    </div>
+</dialog>
+
+<style>
+    .confirm { width: 360px; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--chrome-bg); color: var(--chrome-fg); }
+    h2 { font-size: 16px; color: var(--c-bright-white); }
+    b { color: var(--c-bright-white); }
+    .acts { display: flex; flex-direction: row; justify-content: flex-end; gap: 8px; }
+    .small { height: 30px; padding: 0 14px; background: var(--chrome-hover); }
+    .danger { background: var(--chrome-danger); color: var(--c-bright-white); }
+</style>

@@ -1,0 +1,44 @@
+module jzero.state;
+
+// State part: the Git UI (right-click a pane → "Open Git UI"), a modal on the focused pane's
+// folder. What it reads and runs is `git/repo.j3`.
+
+extend State {
+    fn openGit(this: &State) {
+        let dir = this.focusedDir();
+        if dir.len == 0 { return; }
+        this.git.open(dir);
+        this.gitOpen = true;
+    }
+
+    // The focused pane's folder, full path: an explorer's root, a shell's cwd ("" otherwise).
+    fn focusedDir(this: &State): string {
+        if this.active == OCEAN { return ""; }
+        let p = &this.islands.get(this.active).panes;
+        if p.focus < 0 { return ""; }
+        let n = p.get(p.focus);
+        if n.hasExplorer() { return n.explorer().root.str(); }
+        match n.term {
+            Option.Some(t) {
+                if t.ext { return ""; }
+                this.syncPane(n, t);
+                return n.cwd.str();
+            }
+            Option.None { return ""; }
+        }
+    }
+
+    // `gh` is not logged in: run `gh auth login` in a split beside the pane (reopen the Git UI after).
+    fn gitLogin(this: &State) {
+        this.gitOpen = false;
+        match this.current() {
+            Option.Some(isl) {
+                if isl.panes.focus < 0 { return; }
+                let argv: [3]string = ["gh", "auth", "login"];
+                let id = this.newPaneId();
+                isl.panes.split(split.RIGHT, this.openCommand(isl, id, this.git.dir.str(), argv[:]), id);
+            }
+            Option.None {}
+        }
+    }
+}

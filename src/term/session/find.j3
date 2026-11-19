@@ -1,0 +1,47 @@
+module jzero.term.session;
+
+// Session part: search in scrollback (`term/search.j3` finds, this scrolls and refreshes).
+
+extend Session {
+    // Search: open the box (the query is kept from last time).
+    fn openSearch(this: &Session) {
+        this.find.open = true;
+        this.searchAt = 0;
+    }
+
+    fn closeSearch(this: &Session) {
+        this.find.close();
+        this.view.snap();
+    }
+
+    // Next (`dir` 1) or previous (-1) match, scrolled into view.
+    fn searchStep(this: &Session, dir: int) {
+        this.refreshSearch();
+        this.find.step(dir);
+        this.showMatch();
+    }
+
+    // Run the search again when the query changed, or (throttled) when output came.
+    fn refreshSearch(this: &Session) {
+        let now = game.ticks();
+        let changed = this.find.stale();
+        if !changed && (now - this.searchAt < SEARCH_EVERY_MS || now - this.activeAt > SEARCH_EVERY_MS * 2) { return; }
+        this.searchAt = now;
+        let near = this.find.curLine();
+        if changed { near = -1; }
+        this.find.run(&this.grid, near);
+        if changed { this.showMatch(); }
+    }
+
+    // Scroll so the current match is on screen (centered when it was off it).
+    fn showMatch(this: &Session) {
+        let l = this.find.curLine();
+        if l < 0 { return; }
+        let top = this.topLine();
+        let rows = this.grid.rows();
+        if l >= top && l < top + rows { return; }
+        let wantTop = l - rows / 2;
+        let off = this.grid.scrollbackLen() - wantTop;
+        this.view.scroll(&this.grid, off - this.view.off(&this.grid));
+    }
+}

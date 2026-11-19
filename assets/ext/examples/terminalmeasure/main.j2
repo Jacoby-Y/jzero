@@ -1,0 +1,15 @@
+// TerminalMeasure: a centered "#" cross and the pane's size in cells, live. Copy this folder to
+// ~/.config/jzero/extensions/terminalmeasure, then Command palette → "Extension: TerminalMeasure".
+pub let title = "TerminalMeasure";
+
+// `draw` runs after every `resize`, so no state is needed.
+pub fn draw(pane) {
+    clear();
+    let cx = pane.cols / 2;
+    let cy = pane.rows / 2;
+    for x in 0..pane.cols { at(x, cy); write("#"); }
+    for y in 0..pane.rows { at(cx, y); write("#"); }
+    let label = " " + str(pane.cols) + " x " + str(pane.rows) + " ";
+    at(cx + 2, cy + 1);
+    write(label);
+}

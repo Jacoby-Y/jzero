@@ -1,0 +1,7 @@
+# Written by j3c: the commit each git dependency builds from. Commit this file.
+# `j3c update [name]` moves deps to the newest commit of their tag/branch.
+
+[qr]
+git = "https://github.com/jacoby-y/j3-qr"
+ref = "tag:v0.1.0"
+commit = "fd1e722480db81a3fb303aadbcce75d86544fb89"
